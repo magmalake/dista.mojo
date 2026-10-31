@@ -35,7 +35,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: magmalake/arrow-mlake.mojo
-          ref: ac5079f422578199e6070a17d129eca7ffc6b3bc
+          ref: 928a2435371c82395879779225df284e581dfb21
           path: arrow-mlake.mojo
 
       - uses: prefix-dev/setup-pixi@v0.10.2
@@ -68,7 +68,7 @@ jobs:
       - uses: actions/checkout@v4
         with: {repository: magmalake/memory-region.mojo, ref: 91ff4418b44a89f9354e7d32633e9b11ad365dfd, path: memory-region.mojo}
       - uses: actions/checkout@v4
-        with: {repository: magmalake/arrow-mlake.mojo, ref: ac5079f422578199e6070a17d129eca7ffc6b3bc, path: arrow-mlake.mojo}
+        with: {repository: magmalake/arrow-mlake.mojo, ref: 928a2435371c82395879779225df284e581dfb21, path: arrow-mlake.mojo}
       - uses: actions/checkout@v4
         with: {repository: magmalake/parquet.mojo, ref: 9a596283d3612d1ebeca199f9e48f1c1a7eaab51, path: parquet.mojo}
       - uses: actions/checkout@v4

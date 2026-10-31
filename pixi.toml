@@ -32,7 +32,7 @@ name = "dista"
 
 [package.host-dependencies]
 mojo-compiler = "==1.2.0"
-arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "ac5079f422578199e6070a17d129eca7ffc6b3bc" }
+arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "928a2435371c82395879779225df284e581dfb21" }
 memory-region-mojo = { git = "https://github.com/magmalake/memory-region.mojo", rev = "91ff4418b44a89f9354e7d32633e9b11ad365dfd" }
 
 [package.build-dependencies]
@@ -40,7 +40,7 @@ mojo-compiler = "==1.2.0"
 
 [package.run-dependencies]
 mojo-compiler = ">=1.2.0,<2"
-arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "ac5079f422578199e6070a17d129eca7ffc6b3bc" }
+arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "928a2435371c82395879779225df284e581dfb21" }
 memory-region-mojo = { git = "https://github.com/magmalake/memory-region.mojo", rev = "91ff4418b44a89f9354e7d32633e9b11ad365dfd" }
 
 # Stable is the default: dista targets Mojo 1.2.0. The nightly environment
@@ -52,9 +52,9 @@ mojo-compiler = "==1.2.0"
 # at the revision mojoshelf published (memory-region-mojo 0.1.0).
 memory-region-mojo = { git = "https://github.com/magmalake/memory-region.mojo", rev = "91ff4418b44a89f9354e7d32633e9b11ad365dfd" }
 # arrow-mlake carries columnar results: a task can take or return a
-# RecordBatch, and it travels as an Arrow IPC stream. Pinned at the merge that
-# added IPC.
-arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "ac5079f422578199e6070a17d129eca7ffc6b3bc" }
+# RecordBatch, and it travels as an Arrow IPC stream. Pinned at the revision
+# mojoshelf published as arrow-mlake-mojo 0.2.0.
+arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "928a2435371c82395879779225df284e581dfb21" }
 
 # A precompiled package only loads in the compiler that built it, and this one
 # is 1.2.0's, so the nightly compiles memory-region and arrow-mlake from
