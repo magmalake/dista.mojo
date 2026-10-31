@@ -27,8 +27,10 @@ mkdir -p "$results"
   echo "table: $metadata"
   echo "passes: $passes"
   echo "slots per node: $slots"
-  kubectl get nodes -L dista-bench/role,dista-bench/rank,node.kubernetes.io/instance-type \
-    -o custom-columns='NODE:.metadata.name,ROLE:.metadata.labels.dista-bench/role,RANK:.metadata.labels.dista-bench/rank,TYPE:.metadata.labels.node\.kubernetes\.io/instance-type,KUBELET:.status.nodeInfo.kubeletVersion,KERNEL:.status.nodeInfo.kernelVersion'
+  echo "instances: $(aws ec2 describe-instances --filters Name=tag-key,Values=dista-bench \
+    Name=instance-state-name,Values=running --query 'Reservations[].Instances[].InstanceType' \
+    --output text | tr '\t' '\n' | sort | uniq -c | xargs)"
+  kubectl get nodes -o wide -L dista-bench/role,dista-bench/rank,node.kubernetes.io/instance-type
 } > "$results/meta.txt"
 
 for nodes in ${NODES:-3 6 12}; do
