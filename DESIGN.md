@@ -178,7 +178,9 @@ ThreadSanitizer fails on allocating threaded Mojo programs today, so the runtime
 
 ## Phase 2 plan
 
-Phase 2 takes dista from one machine to a cluster. Its gate, from the vision: a distributed Iceberg scan of the taxi data on a 3-node cluster returns the same answer as one machine. It lands as stacked PRs of at most about 2,000 lines, each with its own gate, in two tracks that can run in parallel.
+Phase 2 takes dista from one machine to a cluster. Its gate, from the vision: a distributed Iceberg scan of the taxi data on a 3-node cluster returns the same answer as one machine.
+
+**The gate passed on 2026-10-31.** `tests/kind_taxi.sh` runs `deploy/taxi.mojo` on a kind cluster of three worker nodes (colima on Apple silicon, arm64), with the 1.3 GB taxibench table copied to each node. All eight taxibench queries over 77.9 million trips, run one task per data file, equal the same scans run in one process: counts exactly, sums to 1e-9 relative. A ninth run returns the quarter's `total_amount` as Arrow batches, and 86.6 MB of them crossed nodes over sockets. Tasks ran on all three nodes. The distributed run took 2.0 s in total and the single process 3.9 s; it's one VM, so that measures parallelism, not a network. The table is too big for CI, so the script is run by hand. It lands as stacked PRs of at most about 2,000 lines, each with its own gate, in two tracks that can run in parallel.
 
 **Runtime track** (dista.mojo, in order):
 

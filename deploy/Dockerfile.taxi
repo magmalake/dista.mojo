@@ -1,0 +1,31 @@
+# The image for the taxi gate (deploy/taxi.mojo): dista plus parquet.mojo,
+# iceberg.mojo and their siblings, built in the `data` environment. The build
+# context is a directory holding dista.mojo and those siblings side by side,
+# which tests/kind_taxi.sh stages:
+#
+#     docker build -f deploy/Dockerfile.taxi -t dista:taxi <staged dir>
+FROM ghcr.io/prefix-dev/pixi:0.78.0 AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc g++ libc6-dev git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY . /src
+WORKDIR /src/dista.mojo
+RUN pixi install --locked -e data
+RUN mkdir -p /out && pixi run -e data bash -c \
+    'mojo build -I src $DEP_INC deploy/taxi.mojo -o /out/dista'
+# The binary links the Mojo runtime, and dlopens the codec, object-store and
+# SQL shims from $CONDA_PREFIX/lib at run time. Take those, and what they
+# link, out of the pixi environment.
+RUN set -e; env=/src/dista.mojo/.pixi/envs/data; mkdir -p /out/lib; \
+    roots="/out/dista $(ls $env/lib/lib*mojo*.so $env/lib/libsqlite3.so* $env/lib/libpq.so* 2>/dev/null)"; \
+    for f in $roots; do \
+        case "$f" in /out/*) ;; *) cp -L "$f" /out/lib/ ;; esac; \
+        ldd "$f" | awk '/=> \// {print $3}' | grep "^$env" | xargs -r cp -L -t /out/lib; \
+    done
+
+FROM debian:bookworm-slim
+COPY --from=build /out/lib /opt/dista/lib
+COPY --from=build /out/dista /opt/dista/bin/dista
+# The shims are found as $CONDA_PREFIX/lib/<name>.
+ENV LD_LIBRARY_PATH=/opt/dista/lib CONDA_PREFIX=/opt/dista
+ENTRYPOINT ["/opt/dista/bin/dista"]
