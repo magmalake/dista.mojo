@@ -120,7 +120,7 @@ up() {
     cat > "$state/head-init.sh" <<EOF
 #!/bin/bash
 shutdown -P +$ttl
-apt-get update && apt-get install -y docker.io rsync
+apt-get update && apt-get install -y docker.io docker-buildx rsync
 usermod -aG docker ubuntu
 pub=\$(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' | \
   xargs -I{} curl -s -H 'X-aws-ec2-metadata-token: {}' http://169.254.169.254/latest/meta-data/public-ipv4)

@@ -13,5 +13,9 @@ COPY src src
 RUN touch src/main.rs && cargo build --release --locked
 
 FROM debian:bookworm-slim
+# rustls verifies S3's certificate against the system's roots, which slim
+# images leave out.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/taxi-rs /usr/local/bin/taxi-rs
 ENTRYPOINT ["/usr/local/bin/taxi-rs"]

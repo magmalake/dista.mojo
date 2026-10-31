@@ -93,7 +93,9 @@ for image in $images; do
   deps_s=$(step_s "$deps" "$log")
   compile_s=-
   [ -n "$compile" ] && compile_s=$(step_s "$compile" "$log")
-  disk=$(on_head "docker image inspect $tagname --format '{{.Size}}'")
+  # The image as an uncompressed tar: with BuildKit's image store, `docker
+  # image inspect` reports the compressed size instead.
+  disk=$(on_head "docker save $tagname | wc -c")
   gz=$(on_head "docker save $tagname | gzip -1 | wc -c")
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$image" "$total" "$deps_s" "$compile_s" \
     "$((disk / 1000000))" "$((gz / 1000000))" "$instance" | tee -a "$out"
