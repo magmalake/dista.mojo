@@ -53,10 +53,12 @@ jobs:
       - name: Tests
         run: pixi run -e ${{ matrix.env }} test
 
-  # Tasks that read Parquet: parquet.mojo and its siblings compile from
-  # source, at the revisions parquet-mojo 0.11.4 was published with, and
-  # arrow-mlake at dista's pin. See the data environment in pixi.toml.
-  parquet:
+  # Tasks over Parquet and Iceberg. parquet.mojo, iceberg.mojo and their
+  # siblings compile from source, at the revisions iceberg-mojo 0.8.2 was
+  # published with; arrow-mlake at dista's pin; memory-region at the fix that
+  # lets it share a binary with the standard library's file seek. See the
+  # data environment in pixi.toml.
+  data:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -66,11 +68,13 @@ jobs:
         with:
           path: dista.mojo
       - uses: actions/checkout@v4
-        with: {repository: magmalake/memory-region.mojo, ref: 91ff4418b44a89f9354e7d32633e9b11ad365dfd, path: memory-region.mojo}
+        with: {repository: magmalake/memory-region.mojo, ref: 09bec66f0438d36a8af5a037a2e744ae1b3e288e, path: memory-region.mojo}
       - uses: actions/checkout@v4
         with: {repository: magmalake/arrow-mlake.mojo, ref: 928a2435371c82395879779225df284e581dfb21, path: arrow-mlake.mojo}
       - uses: actions/checkout@v4
         with: {repository: magmalake/parquet.mojo, ref: 9a596283d3612d1ebeca199f9e48f1c1a7eaab51, path: parquet.mojo}
+      - uses: actions/checkout@v4
+        with: {repository: magmalake/iceberg.mojo, ref: 4f47bb609dd4e9a8a8f2f5dda3f62acb921e653c, path: iceberg.mojo}
       - uses: actions/checkout@v4
         with: {repository: magmalake/threads.mojo, ref: f45e780a8de77278c140cee36904e46e93e0ca1c, path: threads.mojo}
       - uses: actions/checkout@v4
@@ -81,6 +85,22 @@ jobs:
         with: {repository: magmalake/snappy.mojo, ref: b8172ed0a4ef13911cc225d46e26676a5b8f1ccd, path: snappy.mojo}
       - uses: actions/checkout@v4
         with: {repository: magmalake/deflate.mojo, ref: aeb571e54ac736b97c826a23f44501715fddc656, path: deflate.mojo}
+      - uses: actions/checkout@v4
+        with: {repository: magmalake/avro.mojo, ref: 479c9d390b5c12c2497e05f84b64bf690a8cfea3, path: avro.mojo}
+      - uses: actions/checkout@v4
+        with: {repository: magmalake/roaring.mojo, ref: a90a7bd30cf1c21403a29059282072e93fbeeee2, path: roaring.mojo}
+      - uses: actions/checkout@v4
+        with: {repository: magmalake/objectstore.mojo, ref: 4e409ca4d07f44c2fe7673f104af75b0bb69954c, path: objectstore.mojo}
+      - uses: actions/checkout@v4
+        with: {repository: magmalake/zstd.mojo, ref: 53655623ca8585fd5b36b1239842913ec308ae69, path: zstd.mojo}
+      - uses: actions/checkout@v4
+        with: {repository: magmalake/lz4.mojo, ref: 64502eeeabed37515cd479bc421fc2920504cac5, path: lz4.mojo}
+      - uses: actions/checkout@v4
+        with: {repository: magmalake/brotli.mojo, ref: aa6d14985baf82ad4b934f14136b95a291b55faf, path: brotli.mojo}
+      - uses: actions/checkout@v4
+        with: {repository: magmalake/sqlite.mojo, ref: 53b819cd395b1b0afe8772dfbb43489da6ce939e, path: sqlite.mojo}
+      - uses: actions/checkout@v4
+        with: {repository: magmalake/postgres.mojo, ref: bfe9b94ae97e3e184dc6d118b0684818927a5da8, path: postgres.mojo}
       - uses: prefix-dev/setup-pixi@v0.10.2
         with:
           pixi-version: v0.78.0
@@ -88,6 +108,8 @@ jobs:
           manifest-path: dista.mojo/pixi.toml
       - name: Tasks over Parquet row groups
         run: pixi run -e data test-parquet
+      - name: A distributed Iceberg scan equals a local one
+        run: pixi run -e data test-iceberg
 
   # The image builds the program with pixi itself, so this job needs only
   # docker, kubectl (both on the runner) and kind.
