@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 iceberg = "0.10.1"
+iceberg-storage-opendal = { version = "0.10.1", default-features = false, features = ["opendal-fs", "opendal-s3"] }
 arrow = { version = "58", default-features = false, features = ["ipc"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
 futures = "0.3"

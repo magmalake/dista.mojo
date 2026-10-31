@@ -1,0 +1,28 @@
+# Loads the benchmark table into S3 from the head node: PyIceberg on a plain
+# Python image, bench/cloud/load_table.py from a ConfigMap, the TLC downloads
+# in scratch space that goes away with the pod. bench/cloud/data.sh fills in
+# the @...@ values.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: load
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector: {dista-bench/role: head}
+      volumes:
+        - name: script
+          configMap: {name: load-table}
+        - name: scratch
+          emptyDir: {}
+      containers:
+        - name: load
+          image: python:3.12-slim-bookworm
+          command: [sh, -c, "pip install --quiet --no-cache-dir 'pyiceberg[pyarrow,sql-sqlite]==0.11.1' && python /script/load_table.py @WAREHOUSE@ --years @YEARS@ --scratch /scratch"]
+          envFrom:
+            - secretRef: {name: aws}
+          volumeMounts:
+            - {name: script, mountPath: /script}
+            - {name: scratch, mountPath: /scratch}

@@ -3,15 +3,20 @@ distributed one task per data file, against the same scans in one process.
 
 79.5 million trips, 24 monthly data files. For each query the driver plans
 the scan, sends one task per surviving file, and adds the tasks' partial
-results together. Then it runs the same scan itself, in this process, and
+results together. A task carries its planned file, so a worker reads the
+table's metadata and that file and nothing else: no manifests. Then it runs the same scan itself, in this process, and
 checks the answers agree: counts exactly, sums to 1e-9 relative (a sum's
 rounding depends on the order its terms are added in). One more query sends
 whole Arrow batches back instead of partial sums, so columnar data crosses
 nodes too.
 
-    TAXI_METADATA   the table's metadata location, as the table names it
+    TAXI_METADATA   the table's metadata location, as the table names it;
+                    `s3://` reads with the `AWS_*` environment
     TAXI_PREFIX     the warehouse location the table was written at
     TAXI_ROOT       where that warehouse is mounted here (default: the same)
+    TAXI_PASSES     distributed runs of each query (default 1); the first is
+                    checked against one process, the rest against the first,
+                    and each prints `TIME <query> <pass> <ms>`
 
 `tests/kind_taxi.sh` runs it on a 3-node kind cluster.
 """
@@ -20,7 +25,8 @@ from std.os import getenv
 from std.time import perf_counter_ns
 
 from arrow_mlake import RecordBatch
-from iceberg import FileIO, ScanOptions, TableScan
+from iceberg import DataFile, FileIO, FileScanTask, ScanOptions, TableScan
+from iceberg.manifest import CONTENT_DATA
 from iceberg.catalog.filesystem import read_metadata_file
 
 from dista import ObjectRef, Runtime, Seq, Task
@@ -44,11 +50,80 @@ struct Query(Copyable, Movable):
 
 
 @fieldwise_init
+struct PlannedFile(Copyable, Movable):
+    """What the driver planned for one data file, so the worker doesn't plan
+    again. The taxi table has no delete files and no identity partitions,
+    which is what lets this leave out the deletes and the partition values."""
+
+    var path: String
+    var format: String
+    var size: Int64
+    var records: Int64
+    var residual: String
+    var start: Int64
+    var length: Int64
+    var spec_id: Int
+    var sequence: Int64
+
+    @staticmethod
+    def of(t: FileScanTask) raises -> PlannedFile:
+        if len(t.delete_files) > 0:
+            raise Error(t.data_file.file_path, " has deletes")
+        ref f = t.data_file
+        return PlannedFile(
+            f.file_path.copy(),
+            f.file_format.copy(),
+            f.file_size_in_bytes,
+            f.record_count,
+            t.residual.copy(),
+            t.start,
+            t.length,
+            t.spec_id,
+            t.data_sequence_number,
+        )
+
+    def task(self) -> FileScanTask:
+        var f = DataFile(
+            CONTENT_DATA,
+            self.path.copy(),
+            self.format.copy(),
+            [],
+            self.records,
+            self.size,
+            [],
+            [],
+            [],
+            False,
+            [],
+            [],
+            0,
+            False,
+            0,
+            False,
+            String(),
+            False,
+            0,
+            False,
+            0,
+            False,
+        )
+        return FileScanTask(
+            f^,
+            [],
+            self.residual.copy(),
+            self.start,
+            self.length,
+            self.spec_id,
+            self.sequence,
+        )
+
+
+@fieldwise_init
 struct FileQuery(Copyable, Movable):
-    """One query over one data file."""
+    """One query over one planned data file."""
 
     var query: Query
-    var path: String
+    var file: PlannedFile
 
 
 @fieldwise_init
@@ -150,9 +225,9 @@ def _node() -> String:
 
 def fold_file(t: FileQuery) raises -> Partial:
     """Task: one query over one data file, folded where it was read."""
-    var paths: List[String] = [t.path.copy()]
+    var tasks: List[FileScanTask] = [t.file.task()]
     var p = Partial.zero()
-    for b in _scan(t.query).to_batches_for_paths(paths):
+    for b in _scan(t.query).to_batches_for_tasks(tasks^):
         fold(p, t.query, b)
     p.node = _node()
     return p^
@@ -160,8 +235,8 @@ def fold_file(t: FileQuery) raises -> Partial:
 
 def read_file(t: FileQuery) raises -> Seq[RecordBatch]:
     """Task: one query over one data file, returned as Arrow batches."""
-    var paths: List[String] = [t.path.copy()]
-    return Seq[RecordBatch](_scan(t.query).to_batches_for_paths(paths))
+    var tasks: List[FileScanTask] = [t.file.task()]
+    return Seq[RecordBatch](_scan(t.query).to_batches_for_tasks(tasks^))
 
 
 comptime FoldFile = Task[FileQuery, Partial, fold_file]
@@ -287,28 +362,35 @@ def _ms(t0: Int) -> Int:
     return (Int(perf_counter_ns()) - t0) // 1_000_000
 
 
+def _distributed(
+    mut rt: Runtime[FoldFile, ReadFile], q: Query, mut nodes: List[String]
+) raises -> Tuple[Partial, Int]:
+    """Query `q` as one task per planned file; the answer and how many files."""
+    var tasks = _scan(q).plan_files()
+    var refs = List[ObjectRef[Partial]]()
+    for t in tasks:
+        refs.append(rt.remote[FoldFile](FileQuery(q.copy(), PlannedFile.of(t))))
+    var got = Partial.zero()
+    for r in refs:
+        var part = rt.get(r)
+        if part.node not in nodes:
+            nodes.append(part.node.copy())
+        got.add(part)
+    return (got^, len(tasks))
+
+
 def main() raises:
     var rt = Runtime[FoldFile, ReadFile](workers=4)
+    var passes = Int(getenv("TAXI_PASSES", "1"))
     var nodes = List[String]()
     var total_dist = 0
     var total_local = 0
     for q in queries():
         var t0 = Int(perf_counter_ns())
-        var tasks = _scan(q).plan_files()
-        var refs = List[ObjectRef[Partial]]()
-        for t in tasks:
-            refs.append(
-                rt.remote[FoldFile](
-                    FileQuery(q.copy(), t.data_file.file_path.copy())
-                )
-            )
-        var got = Partial.zero()
-        for r in refs:
-            var part = rt.get(r)
-            if part.node not in nodes:
-                nodes.append(part.node.copy())
-            got.add(part)
+        var first = _distributed(rt, q, nodes)
         var dist_ms = _ms(t0)
+        ref got = first[0]
+        print("TIME", q.name, 1, dist_ms)
 
         var t1 = Int(perf_counter_ns())
         var want = Partial.zero()
@@ -321,12 +403,17 @@ def main() raises:
         reader.raise_if_failed()
         var local_ms = _ms(t1)
         _check(q.name, got, want)
+        for k in range(2, passes + 1):
+            var t = Int(perf_counter_ns())
+            var again = _distributed(rt, q, nodes)
+            print("TIME", q.name, k, _ms(t))
+            _check(q.name, again[0], got)
         total_dist += dist_ms
         total_local += local_ms
         print(
             q.name,
             ":",
-            len(tasks),
+            first[1],
             "files,",
             got.rows,
             "rows, sum",
@@ -343,11 +430,7 @@ def main() raises:
     var t2 = Int(perf_counter_ns())
     var refs = List[ObjectRef[Seq[RecordBatch]]]()
     for t in _scan(q).plan_files():
-        refs.append(
-            rt.remote[ReadFile](
-                FileQuery(q.copy(), t.data_file.file_path.copy())
-            )
-        )
+        refs.append(rt.remote[ReadFile](FileQuery(q.copy(), PlannedFile.of(t))))
     var got = Partial.zero()
     for r in refs:
         var bs = rt.get(r)

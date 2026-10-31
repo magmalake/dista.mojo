@@ -6,8 +6,11 @@
 FROM rust:1.94-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+# The dependencies first, against a stub crate, so the build's two costs are
+# separate steps: bench/cloud/build.sh times them apart.
+RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release --locked
 COPY src src
-RUN cargo build --release --locked
+RUN touch src/main.rs && cargo build --release --locked
 
 FROM debian:bookworm-slim
 COPY --from=build /src/target/release/taxi-rs /usr/local/bin/taxi-rs

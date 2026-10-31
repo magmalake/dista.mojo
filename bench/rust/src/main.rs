@@ -6,23 +6,34 @@
 //! One binary, two roles, like dista:
 //!
 //! * `TAXI_ROLE=worker` listens on `TAXI_PORT` (default 7400) and serves one
-//!   task at a time: open the table, plan the scan, read only the named file
-//!   with iceberg-rust, fold it, and send back the partial (or the batches as
-//!   Arrow IPC).
+//!   task at a time: read the `FileScanTask` it was sent with iceberg-rust,
+//!   fold it, and send back the partial (or the batches as Arrow IPC). A
+//!   worker never opens the table or plans; it holds only a FileIO.
 //! * Otherwise it's the driver. `TAXI_WORKERS` is `host:port`; a name that
 //!   resolves to several addresses (a headless Kubernetes Service) is one
 //!   worker per address. With no `TAXI_WORKERS` it starts four local workers
 //!   itself.
 //!
+//! The driver plans each query once and ships the planned tasks as JSON,
+//! without their partition, partition spec and name mapping (iceberg-rust
+//! can't serialize those). That's safe for this table: it's partitioned by
+//! month, not by identity, and its files carry field ids.
+//!
 //! The driver keeps one task in flight per worker and hands the next file to
 //! whichever worker finishes first. There's no head: workers are addressed
 //! directly, which is less machinery than dista or Ray carry.
 //!
-//! `TAXI_METADATA` is the table's metadata location. The warehouse must be
-//! at the path the table was written at: iceberg-rust reads manifests by
-//! their absolute locations, as PyIceberg does. `TAXI_THREADS=1`
-//! runs each process on a single-threaded runtime with every iceberg-rust
-//! concurrency limit at 1.
+//! `TAXI_METADATA` is the table's metadata location, `file://` or `s3://`.
+//! A local warehouse must be at the path the table was written at:
+//! iceberg-rust reads manifests by their absolute locations, as PyIceberg
+//! does. S3 is configured from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+//! `AWS_SESSION_TOKEN`, `AWS_REGION` (or `AWS_DEFAULT_REGION`) and
+//! `AWS_ENDPOINT_URL` (a custom endpoint, path style, for MinIO).
+//! `TAXI_THREADS=1` runs each process on a single-threaded runtime with every
+//! iceberg-rust concurrency limit at 1. `TAXI_PASSES` (default 1) runs each
+//! query's distributed part that many times, printing `TIME <query> <pass>
+//! <ms>` after each; pass 1 is checked against one process, later passes
+//! against pass 1.
 
 mod filter;
 
@@ -37,10 +48,12 @@ use arrow::datatypes::{DataType, Float64Type, Int64Type};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use futures::{StreamExt, TryStreamExt};
-use iceberg::io::{FileIOBuilder, LocalFsStorageFactory};
+use iceberg::arrow::ArrowReaderBuilder;
+use iceberg::io::{FileIO, FileIOBuilder};
 use iceberg::scan::{FileScanTask, TableScan};
 use iceberg::table::{StaticTable, Table};
-use iceberg::TableIdent;
+use iceberg::{Runtime, TableIdent};
+use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -212,8 +225,33 @@ fn single_threaded() -> bool {
     env::var("TAXI_THREADS").map(|v| v == "1").unwrap_or(false)
 }
 
+/// A FileIO for `file://` and `s3://`, with S3 configured from the `AWS_*`
+/// environment.
+fn file_io() -> FileIO {
+    let mut props = Vec::new();
+    for (key, var) in [
+        ("s3.access-key-id", "AWS_ACCESS_KEY_ID"),
+        ("s3.secret-access-key", "AWS_SECRET_ACCESS_KEY"),
+        ("s3.session-token", "AWS_SESSION_TOKEN"),
+    ] {
+        if let Ok(v) = env::var(var) {
+            props.push((key, v));
+        }
+    }
+    if let Ok(v) = env::var("AWS_REGION").or_else(|_| env::var("AWS_DEFAULT_REGION")) {
+        props.push(("s3.region", v));
+    }
+    if let Ok(v) = env::var("AWS_ENDPOINT_URL") {
+        props.push(("s3.endpoint", v));
+        props.push(("s3.path-style-access", "true".into()));
+    }
+    FileIOBuilder::new(Arc::new(OpenDalResolvingStorageFactory::new()))
+        .with_props(props)
+        .build()
+}
+
 async fn open_table() -> R<Table> {
-    let file_io = FileIOBuilder::new(Arc::new(LocalFsStorageFactory)).build();
+    let file_io = file_io();
     let metadata = env::var("TAXI_METADATA")?;
     let ident = TableIdent::from_strs(["taxi", "trips"])?;
     Ok(StaticTable::from_metadata_file(&metadata, ident, file_io)
@@ -239,13 +277,26 @@ async fn plan(scan: &TableScan) -> R<Vec<FileScanTask>> {
     Ok(scan.plan_files().await?.try_collect().await?)
 }
 
-async fn read(table: &Table, tasks: Vec<FileScanTask>) -> R<Vec<RecordBatch>> {
-    let mut reader = table.reader_builder();
+/// A planned task as it's sent to a worker: without the fields iceberg-rust
+/// refuses to serialize.
+fn shippable(mut t: FileScanTask) -> FileScanTask {
+    t.partition = None;
+    t.partition_spec = None;
+    t.name_mapping = None;
+    t
+}
+
+fn reader(file_io: &FileIO) -> ArrowReaderBuilder {
+    let mut reader = ArrowReaderBuilder::new(file_io.clone(), Runtime::current());
     if single_threaded() {
         reader = reader.with_data_file_concurrency_limit(1);
     }
+    reader
+}
+
+async fn read(file_io: &FileIO, tasks: Vec<FileScanTask>) -> R<Vec<RecordBatch>> {
     let stream = futures::stream::iter(tasks.into_iter().map(Ok)).boxed();
-    Ok(reader.build().read(stream)?.stream().try_collect().await?)
+    Ok(reader(file_io).build().read(stream)?.stream().try_collect().await?)
 }
 
 // ── worker ─────────────────────────────────────────────────────────────────
@@ -253,8 +304,8 @@ async fn read(table: &Table, tasks: Vec<FileScanTask>) -> R<Vec<RecordBatch>> {
 #[derive(Serialize, Deserialize)]
 struct Request {
     query: usize,
-    /// The data file, as the table names it.
-    path: String,
+    /// One data file, as the driver planned it.
+    task: FileScanTask,
     batches: bool,
 }
 
@@ -274,15 +325,9 @@ async fn recv(s: &mut BufReader<TcpStream>) -> R<Option<Vec<u8>>> {
     Ok(Some(buf))
 }
 
-async fn serve_one(table: &Table, req: &Request) -> R<Vec<u8>> {
+async fn serve_one(file_io: &FileIO, req: Request) -> R<Vec<u8>> {
     let q = &QUERIES[req.query];
-    let scan = build_scan(table, q)?;
-    let tasks: Vec<_> = plan(&scan)
-        .await?
-        .into_iter()
-        .filter(|t| t.data_file_path == req.path)
-        .collect();
-    let batches = read(table, tasks).await?;
+    let batches = read(file_io, vec![req.task]).await?;
     if req.batches {
         let mut out = Vec::new();
         if let Some(first) = batches.first() {
@@ -312,16 +357,16 @@ fn hostname() -> String {
 async fn worker() -> R<()> {
     let port = env::var("TAXI_PORT").unwrap_or_else(|_| "7400".into());
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
-    let table = Arc::new(open_table().await?);
+    let file_io = file_io();
     loop {
         let (sock, _) = listener.accept().await?;
         sock.set_nodelay(true)?;
-        let table = table.clone();
+        let file_io = file_io.clone();
         tokio::spawn(async move {
             let mut sock = BufReader::new(sock);
             while let Ok(Some(msg)) = recv(&mut sock).await {
                 let reply = match serde_json::from_slice::<Request>(&msg) {
-                    Ok(req) => serve_one(&table, &req).await.map_err(|e| e.to_string()),
+                    Ok(req) => serve_one(&file_io, req).await.map_err(|e| e.to_string()),
                     Err(e) => Err(e.to_string()),
                 };
                 let bytes = match reply {
@@ -381,15 +426,15 @@ async fn connect_all() -> R<Vec<BufReader<TcpStream>>> {
     Ok(conns)
 }
 
-/// Runs `paths` across the workers, one in flight per worker; returns the
+/// Runs `tasks` across the workers, one in flight per worker; returns the
 /// replies in completion order.
 async fn run_tasks(
     conns: &mut [BufReader<TcpStream>],
     query: usize,
-    paths: Vec<String>,
+    tasks: Vec<FileScanTask>,
     batches: bool,
 ) -> R<Vec<Vec<u8>>> {
-    let queue = Arc::new(Mutex::new(VecDeque::from(paths)));
+    let queue = Arc::new(Mutex::new(VecDeque::from(tasks)));
     let results = Arc::new(Mutex::new(Vec::new()));
     let mut jobs = Vec::new();
     for conn in conns.iter_mut() {
@@ -397,12 +442,12 @@ async fn run_tasks(
         let results = results.clone();
         jobs.push(async move {
             loop {
-                let Some(path) = queue.lock().unwrap().pop_front() else {
+                let Some(task) = queue.lock().unwrap().pop_front() else {
                     return Ok::<(), Box<dyn std::error::Error + Send + Sync>>(());
                 };
                 let req = serde_json::to_vec(&Request {
                     query,
-                    path,
+                    task,
                     batches,
                 })?;
                 send(conn.get_mut(), &req).await?;
@@ -447,12 +492,8 @@ fn check(name: &str, got: &Partial, want: &Partial) -> R<()> {
 async fn local_fold(table: &Table, q: &Query) -> R<Partial> {
     let scan = build_scan(table, q)?;
     let tasks = plan(&scan).await?;
-    let mut reader = table.reader_builder();
-    if single_threaded() {
-        reader = reader.with_data_file_concurrency_limit(1);
-    }
     let stream = futures::stream::iter(tasks.into_iter().map(Ok)).boxed();
-    let mut batches = reader.build().read(stream)?.stream();
+    let mut batches = reader(table.file_io()).build().read(stream)?.stream();
     let mut p = Partial::zero();
     while let Some(b) = batches.next().await {
         fold(&mut p, q, &b?)?;
@@ -493,27 +534,36 @@ async fn driver() -> R<()> {
 async fn drive() -> R<()> {
     let mut conns = connect_all().await?;
     let table = open_table().await?;
+    let passes: usize = env::var("TAXI_PASSES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+        .max(1);
     let mut nodes: Vec<String> = Vec::new();
     let (mut total_dist, mut total_local) = (0u128, 0u128);
     for (qi, q) in QUERIES.iter().enumerate() {
-        let t0 = Instant::now();
-        let scan = build_scan(&table, q)?;
-        let files: Vec<String> = scan
-            .plan_files()
-            .await?
-            .map_ok(|t| t.data_file_path)
-            .try_collect()
-            .await?;
-        let n_files = files.len();
-        let mut got = Partial::zero();
-        for reply in run_tasks(&mut conns, qi, files, false).await? {
-            let p: Partial = serde_json::from_slice(&reply)?;
-            if !nodes.contains(&p.node) {
-                nodes.push(p.node.clone());
+        let mut first: Option<(Partial, usize, u128)> = None;
+        for pass in 1..=passes {
+            let t0 = Instant::now();
+            let scan = build_scan(&table, q)?;
+            let tasks: Vec<FileScanTask> = plan(&scan).await?.into_iter().map(shippable).collect();
+            let n_files = tasks.len();
+            let mut got = Partial::zero();
+            for reply in run_tasks(&mut conns, qi, tasks, false).await? {
+                let p: Partial = serde_json::from_slice(&reply)?;
+                if !nodes.contains(&p.node) {
+                    nodes.push(p.node.clone());
+                }
+                got.add(&p);
             }
-            got.add(&p);
+            let dist = t0.elapsed().as_millis();
+            println!("TIME {} {} {}", q.name, pass, dist);
+            match &first {
+                Some((want, _, _)) => check(q.name, &got, want)?,
+                None => first = Some((got, n_files, dist)),
+            }
         }
-        let dist = t0.elapsed().as_millis();
+        let (got, n_files, dist) = first.unwrap();
         let t1 = Instant::now();
         let want = local_fold(&table, q).await?;
         let local = t1.elapsed().as_millis();
@@ -530,15 +580,10 @@ async fn drive() -> R<()> {
     let q = &QUERIES[1];
     let t2 = Instant::now();
     let scan = build_scan(&table, q)?;
-    let files: Vec<String> = scan
-        .plan_files()
-        .await?
-        .map_ok(|t| t.data_file_path)
-        .try_collect()
-        .await?;
+    let tasks: Vec<FileScanTask> = plan(&scan).await?.into_iter().map(shippable).collect();
     let mut got = Partial::zero();
     let mut bytes = 0usize;
-    for reply in run_tasks(&mut conns, 1, files, true).await? {
+    for reply in run_tasks(&mut conns, 1, tasks, true).await? {
         bytes += reply.len();
         if reply.is_empty() {
             continue;

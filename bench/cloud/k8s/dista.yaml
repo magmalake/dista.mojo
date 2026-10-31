@@ -1,0 +1,100 @@
+# dista on the EC2 cluster: the head and the driver on the head node, and
+# @SLOTS@ single-threaded workers on each of the first @NODES@ worker nodes.
+# bench/cloud/run.sh fills in the @...@ values; the `aws` Secret holds the
+# AWS_* variables the S3 reads use.
+apiVersion: v1
+kind: Service
+metadata:
+  name: dista-head
+spec:
+  clusterIP: None
+  selector: {app: dista-taxi, role: head}
+  ports:
+    - {name: dista, port: 6390}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dista-head
+spec:
+  serviceName: dista-head
+  replicas: 1
+  selector:
+    matchLabels: {app: dista-taxi, role: head}
+  template:
+    metadata:
+      labels: {app: dista-taxi, role: head}
+    spec:
+      nodeSelector: {dista-bench/role: head}
+      containers:
+        - name: head
+          image: dista:taxi
+          imagePullPolicy: Never
+          env:
+            - {name: DISTA_ROLE, value: head}
+          readinessProbe:
+            tcpSocket: {port: 6390}
+            periodSeconds: 2
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dista-worker
+spec:
+  replicas: @REPLICAS@
+  selector:
+    matchLabels: {app: dista-taxi, role: worker}
+  template:
+    metadata:
+      labels: {app: dista-taxi, role: worker}
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: dista-bench/rank, operator: Lt, values: ["@NODES@"]}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {app: dista-taxi, role: worker}
+      containers:
+        - name: worker
+          image: dista:taxi
+          imagePullPolicy: Never
+          envFrom:
+            - secretRef: {name: aws}
+          env:
+            - {name: DISTA_ROLE, value: worker}
+            - {name: DISTA_HEAD, value: "dista-head:6390"}
+            - {name: TAXI_METADATA, value: "@TAXI_METADATA@"}
+            - name: DISTA_ADVERTISE
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: taxi
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {app: dista-taxi, role: driver}
+    spec:
+      restartPolicy: Never
+      nodeSelector: {dista-bench/role: head}
+      containers:
+        - name: driver
+          image: dista:taxi
+          imagePullPolicy: Never
+          envFrom:
+            - secretRef: {name: aws}
+          env:
+            - {name: DISTA_HEAD, value: "dista-head:6390"}
+            - {name: DISTA_EXPECT_NODES, value: "@NODES@"}
+            - {name: TAXI_METADATA, value: "@TAXI_METADATA@"}
+            - {name: TAXI_PASSES, value: "@PASSES@"}
