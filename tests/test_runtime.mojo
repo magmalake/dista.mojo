@@ -10,6 +10,7 @@ from std.testing import (
 from std.time import perf_counter_ns, sleep
 
 from dista import ObjectRef, Runtime, Seq, Task
+from dista.socket import exit_now
 
 
 def square(x: Int) -> Int:
@@ -68,7 +69,13 @@ def describe(p: Point) -> String:
     return String(p.label, "@", Int(p.x), ",", Int(p.y))
 
 
+def die(x: Int) -> Int:
+    exit_now(9)
+    return x
+
+
 comptime Total = Task[Seq[Int], Int, total]
+comptime Die = Task[Int, Int, die]
 comptime Increment = Task[Int, Int, increment]
 comptime Describe = Task[Point, String, describe]
 comptime TextLength = Task[String, Int, text_length]
@@ -198,6 +205,15 @@ def test_failed_input_fails_dependents() raises:
 def test_seq_argument_directly() raises:
     var rt = Runtime[Total](workers=1)
     assert_equal(rt.get(rt.remote[Total](Seq[Int]([1, 2, 3, 4]))), 10)
+
+
+def test_worker_death_fails_its_task() raises:
+    """A worker that dies fails its in-flight task; the others carry on."""
+    var rt = Runtime[Square, Die](workers=2, pipeline=1)
+    var doomed = rt.remote[Die](1)
+    with assert_raises(contains="worker lost"):
+        _ = rt.get(doomed)
+    assert_equal(rt.get(rt.remote[Square](12)), 144)
 
 
 def main() raises:

@@ -81,28 +81,49 @@ Columnar data does **not** go through `Serializable`. The one columnar type is a
 
 ## Processes and transport
 
-### Phase 1: one machine
+### Roles and the head
 
-- **The driver is the head.** `Runtime(...)` binds a TCP listener on `127.0.0.1` with an OS-assigned port, then forks the workers. Forking before any thread exists is safe, and it means a worker has the registry without an exec.
-- **A worker** connects back, then loops: read a task frame, dispatch, write a result frame. It exits on end-of-file.
-- **Scheduling** is a FIFO queue. `remote` only enqueues. `get` pumps: hand queued tasks to workers round-robin, up to `pipeline` in flight each (default 2), then `poll` the busy workers and take whichever results have arrived. Results arrive in any order, so a short task doesn't wait behind a long one. No threads.
-- **No write deadlock.** The driver's writes block, so a busy worker only gets another task whose arguments fit in its receive buffer (16 KiB). Larger arguments wait for an idle worker.
-- **Transport** is loopback TCP over libc (`socket`, `bind`, `connect`, `send`, `recv`) in `src/dista/socket.mojo`, with `TCP_NODELAY` set. dista has no dependencies. flare's TCP would work from source, but it brings flare's native shims and its threads and json dependencies for something a hundred lines of libc covers.
-- **Frames** are a 4-byte little-endian length, then a fixed 17-byte header and a payload:
+Since phase 2's PR 3, scheduling lives in one place: a head process. Every program is one binary, and `Runtime(...)` picks its role from the environment:
+
+| Environment | Role |
+|---|---|
+| `DISTA_ROLE=head` | runs the head on `DISTA_PORT` (default 6390; 0 lets the OS pick, and the head prints it) |
+| `DISTA_ROLE=worker` | serves the head at `DISTA_HEAD=host:port` |
+| `DISTA_HEAD=host:port` | a driver that submits to that head |
+| neither | local mode: fork a head and `workers` workers, then drive them over loopback |
+
+- **Local mode runs the cluster path.** The forked head is the same code a cluster runs, so every test exercises it. The extra hop costs about 1.4 µs per task.
+- **Hello and registry hash.** Every driver and worker opens with a hello carrying its role and a hash of its registry, the task names in order. The head refuses a mismatch, so a cluster can't mix builds. Drivers get a number, which fills the top 24 bits of every object ID they create. That tells the head which driver owns a result.
+- **The head's event loop** `poll`s the listener and every connection. Each connection is a `Conn`: reads and writes use `MSG_DONTWAIT`, input accumulates until frames are whole, and output queues until the socket takes it. A slow peer never blocks anyone else, so the phase-1 rule limiting pipelined argument size is gone.
+- **Why `MSG_DONTWAIT` rather than `O_NONBLOCK`:** `fcntl` is variadic, and Apple's arm64 ABI passes variadic arguments on the stack. `external_call` puts them in registers, so `F_SETFL` silently set nothing, and the head hung in its second `recv`. Any variadic libc call has the same trap.
+- **Scheduling:** tasks queue in arrival order. Tasks waiting on inputs are held aside until every input exists. Queued tasks go to workers round-robin, up to `pipeline` in flight each (default 2). Each result or error goes back to the driver that owns it.
+- **The head keeps every result**, because a later task may take it as input. PR 4 moves results onto the workers that made them.
+- **A worker that dies** fails the tasks it had in flight, with `worker lost while running this task`. The other workers carry on.
+- **Drivers and workers use blocking sockets.** Each has one peer, the head, and the head always drains its sockets.
+- **Transport** is IPv4 TCP over libc in `src/dista/socket.mojo`: `getaddrinfo` for host names, and `TCP_NODELAY`. dista has no dependencies. flare's TCP works from source, but it brings native shims and its threads and json dependencies for something a few hundred lines of libc covers.
+
+**Frames** are a 4-byte little-endian length, then a fixed 17-byte header and a payload:
 
 | Offset | Field |
 |---|---|
-| 0 | kind: 1 task, 2 result, 3 error |
+| 0 | kind |
 | 1 | object ID, u64 |
-| 9 | task ID, u64 (0 except on a task frame) |
-| 17 | payload: the encoded argument, the encoded result, or a UTF-8 error message |
+| 9 | task ID, u64 (0 unless the kind uses it) |
+| 17 | payload |
 
-- **Measured** on an M4 MacBook with 4 workers (`pixi run bench`, 10,000 tasks of `square`): 7.8 µs per task with no pipelining, 3.9 µs at depth 2, 3.1 µs at depth 4. Start-up takes 2.4 ms. That's well under the vision's 1 ms per-task target. The phase-1 gate test passes on both Mojo 1.2.0 and the 1.3 nightly.
+| Kind | Sent by | Payload |
+|---|---|---|
+| 1 task | driver to head, head to worker | the encoded argument |
+| 2 result | worker to head, head to driver | the encoded result |
+| 3 error | worker to head, head to driver | a UTF-8 message |
+| 4 hello | driver or worker to head | role byte, then the registry hash, u64 |
+| 5 welcome | head to driver | the driver's number, u64 |
+| 6 task-after | driver to head | gather byte, count u64, then that many object IDs |
 
-### Phase 2: a cluster
+**Measured** on an M4 MacBook, local mode with 4 workers (`pixi run bench`, 10,000 tasks of `square`): 10.2 µs per task with no pipelining, 5.3 µs at depth 2, 4.4 µs at depth 4. All tests pass on Mojo 1.2.0 and the 1.3 nightly. `tests/cluster.sh` runs a head, 4 workers and a driver as separate processes found by host name, and checks that a build with different tasks is refused.
 
-- **A separate head process** (a Kubernetes StatefulSet) owns membership, the task queue and the object directory. Workers (a Deployment) find it through `DISTA_HEAD=host:port`; the same binary acts as head, worker or driver depending on its environment.
-- **The scheduler moves onto a `poll` event loop**, over the same libc socket layer, so the head serves many workers without blocking on one, and so tasks can be pipelined per worker.
+### Still to come in phase 2
+
 - **Ownership** follows Ray: the submitter owns a result and holds its location. The head knows where objects live but never holds their bytes.
 - **Locality:** a task goes to the node that holds the most bytes of its arguments, falling back to the least-loaded node.
 
@@ -112,7 +133,7 @@ A `poll` event loop, plus threads where work must overlap inside one process, no
 
 ## Failure handling
 
-- **Phase 1:** a worker that dies closes its socket. `get` on any of its in-flight tasks raises. No retry.
+- **Now:** a worker that dies fails the tasks it had in flight; `get` raises `worker lost while running this task`. No retry.
 - **Phase 4:** lost objects are rebuilt by re-running the tasks that produced them (lineage), and actors restart from checkpoints or through restate.mojo.
 
 ## Testing
@@ -134,7 +155,10 @@ ThreadSanitizer fails on allocating threaded Mojo programs today, so the runtime
 | `src/dista/task.mojo` | `Task`, `TaskLike`, task IDs, `dispatch` |
 | `src/dista/frame.mojo` | frame encoding and decoding |
 | `src/dista/socket.mojo` | loopback TCP, `fork`, `waitpid`, `_exit` over libc |
-| `src/dista/runtime.mojo` | `Runtime`, `ObjectRef`, the worker loop |
+| `src/dista/runtime.mojo` | `Runtime`, `ObjectRef`, roles, the driver and worker loops |
+| `src/dista/head.mojo` | the head's event loop and scheduler (phase 2) |
+| `src/dista/conn.mojo` | non-blocking framed connections for the head (phase 2) |
+| `src/dista/seq.mojo` | `Seq[T]` (phase 2) |
 | `tests/` | codec, dispatch, and process tests |
 
 ## Phase 2 plan

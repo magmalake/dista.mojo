@@ -1,4 +1,4 @@
-"""The phase-1 runtime: one driver and its forked workers on one machine.
+"""The runtime: one binary that runs as driver, head or worker.
 
 ```mojo
 comptime Square = Task[Int, Int, square]
@@ -9,41 +9,42 @@ def main() raises:
     print(rt.get(r))  # 49
 ```
 
-`Runtime(...)` binds a loopback listener, forks the workers and waits for each
-to connect back. Forking happens before any thread exists, and gives each
-worker the registry without an exec: the registry is the runtime's parameter
-list, so a worker dispatches with a `comptime for` over it.
+`Runtime(...)` reads the environment to decide what this process is:
 
-Scheduling is a FIFO queue. `remote` only enqueues; `get` pumps. A pump hands
-queued tasks to workers, round-robin, until each has `pipeline` tasks in
-flight, then `poll`s the workers it's waiting on and takes whichever results
-have arrived. A worker runs its tasks in order, but results from different
-workers arrive in any order, so a short task's `get` doesn't wait behind a
-long one elsewhere. Pipelining hides the round trip between tasks on a
-worker.
+| Environment | Role |
+|---|---|
+| `DISTA_ROLE=head` | runs the head on `DISTA_PORT` (default 6390) and never returns |
+| `DISTA_ROLE=worker` | serves the head at `DISTA_HEAD=host:port` and never returns |
+| `DISTA_HEAD=host:port` | a driver that submits to that head |
+| neither | local mode: forks a head and `workers` workers, then drives them |
 
-A task can take another task's result: pass an `ObjectRef[A]` instead of an
-`A`, or a `List[ObjectRef[X]]` to a task that takes a `Seq[X]`. Such a task
-waits until every input exists, then its argument is assembled from the
-inputs' encoded bytes, without decoding them. If an input failed, the task
-fails with that error and never runs.
+So a cluster runs one image everywhere, and the same program runs on a laptop
+unchanged. The registry is the runtime's parameter list: workers dispatch
+with a `comptime for` over it, and every process's hello carries a hash of it
+so the head refuses a mismatched build.
 
-The driver's writes block, so they must never wait on a worker that is itself
-blocked writing a result back. A busy worker therefore only gets another
-task whose arguments fit in its receive buffer (`PIPELINE_ARG_LIMIT`); a task
-with larger arguments waits until its worker is idle.
+A driver sends tasks to the head and reads results back. A task can take
+another task's result: pass an `ObjectRef[A]` instead of an `A`, or a
+`List[ObjectRef[X]]` to a task that takes a `Seq[X]`. The head runs it once
+every input exists, and fails it if an input failed.
 """
 
-from std.ffi import c_int
+from std.os import getenv
 
-from dista.codec import decode, encode, put_scalar
+from dista.codec import decode, encode, get_scalar, put_scalar
 from dista.frame import (
     KIND_ERROR,
+    KIND_HELLO,
     KIND_RESULT,
     KIND_TASK,
+    KIND_TASK_AFTER,
+    KIND_WELCOME,
+    ROLE_DRIVER,
+    ROLE_WORKER,
     read_frame,
     write_frame,
 )
+from dista.head import DRIVER_SHIFT, Head
 from dista.socket import (
     Listener,
     Stream,
@@ -52,11 +53,9 @@ from dista.socket import (
     poll_readable,
     wait_child,
 )
-from dista.task import TaskLike
+from dista.task import TaskLike, fnv1a64
 
-
-comptime PIPELINE_ARG_LIMIT = 16 * 1024
-"""The largest argument payload queued on a worker that is already busy."""
+comptime DEFAULT_PORT = 6390
 
 
 struct ObjectRef[T: AnyType](ImplicitlyCopyable, Movable, Writable):
@@ -71,95 +70,112 @@ struct ObjectRef[T: AnyType](ImplicitlyCopyable, Movable, Writable):
         writer.write("ObjectRef(", self.id, ")")
 
 
-struct _Pending(Copyable, Movable):
-    var object_id: UInt64
-    var task_id: UInt64
-    var args: List[UInt8]
-    var deps: List[UInt64]
-    """Results this task's argument is built from, once they all exist."""
-    var gather: Bool
-    """Build a `Seq` from `deps` rather than use the single dep as is."""
-
-    def __init__(
-        out self,
-        object_id: UInt64,
-        task_id: UInt64,
-        var args: List[UInt8],
-        var deps: List[UInt64] = List[UInt64](),
-        gather: Bool = False,
-    ):
-        self.object_id = object_id
-        self.task_id = task_id
-        self.args = args^
-        self.deps = deps^
-        self.gather = gather
+def parse_host_port(addr: String) raises -> Tuple[String, Int]:
+    """Splits `host:port`."""
+    var parts = addr.split(":")
+    if len(parts) != 2:
+        raise Error("expected host:port, got ", addr)
+    return (String(parts[0]), Int(parts[1]))
 
 
 struct Runtime[*Ts: TaskLike](Movable):
-    """A driver with `workers` forked worker processes, serving tasks `Ts`."""
+    """A driver for tasks `Ts`, or a head or worker if the environment says so.
+    """
 
-    var _workers: List[Stream]
+    var _head: Stream
+    var _driver: UInt64
+    var _counter: UInt64
     var _pids: List[Int]
-    var _queue: List[_Pending]
-    var _waiting: List[_Pending]
-    """Tasks whose inputs don't all exist yet."""
-    var _queue_head: Int
-    var _inflight: List[Int]
-    """Tasks sent to each worker and not yet answered."""
-    var _pipeline: Int
     var _results: Dict[UInt64, List[UInt8]]
     var _errors: Dict[UInt64, String]
-    var _next_id: UInt64
 
     def __init__(out self, workers: Int = 4, pipeline: Int = 2) raises:
-        """Starts `workers` worker processes and connects to each.
+        """Starts this process in the role its environment names.
 
         Args:
-            workers: How many worker processes to fork.
-            pipeline: How many tasks each worker may have in flight at once.
+            workers: Workers to fork in local mode; ignored otherwise.
+            pipeline: Tasks in flight per worker, if this process runs a head.
         """
-        if workers < 1:
-            raise Error("need at least one worker")
+        Self._check_registry()
         if pipeline < 1:
             raise Error("pipeline must be at least 1")
-        Self._check_registry()
-        var listener = Listener()
+        var role = getenv("DISTA_ROLE")
+        if role == "head":
+            var port = Int(getenv("DISTA_PORT", String(DEFAULT_PORT)))
+            var listener = Listener(port, any_interface=True)
+            print("dista head listening on port", listener.port)
+            var head = Head(listener^, Self._registry_hash(), pipeline, False)
+            head.run()
+            exit_now(0)
+        if role == "worker":
+            var hp = parse_host_port(getenv("DISTA_HEAD"))
+            Self._serve(Stream.connect(hp[0], hp[1]))
+            exit_now(0)
+        if role != "":
+            raise Error("DISTA_ROLE must be head or worker, got ", role)
+
         var pids = List[Int]()
-        for _ in range(workers):
+        var head_addr = getenv("DISTA_HEAD")
+        var stream: Stream
+        if head_addr != "":
+            var hp = parse_host_port(head_addr)
+            stream = Stream.connect(hp[0], hp[1])
+        else:
+            if workers < 1:
+                raise Error("need at least one worker")
+            var listener = Listener()
+            var port = listener.port
             var pid = fork()
             if pid == 0:
-                listener.close()
                 var code = 0
                 try:
-                    Self._serve(listener.port)
+                    var head = Head(
+                        listener^, Self._registry_hash(), pipeline, True
+                    )
+                    head.run()
                 except e:
-                    print("dista worker:", e)
+                    print("dista head:", e)
                     code = 1
                 exit_now(code)
+            else:
+                # The head child has its own copy of the listening socket.
+                var mine = listener^
+                mine.close()
             pids.append(pid)
-        var streams = List[Stream]()
-        for _ in range(workers):
-            streams.append(listener.accept())
-        self._workers = streams^
+            for _ in range(workers):
+                pid = fork()
+                if pid == 0:
+                    var code = 0
+                    try:
+                        Self._serve(Stream.connect(port))
+                    except e:
+                        print("dista worker:", e)
+                        code = 1
+                    exit_now(code)
+                pids.append(pid)
+            stream = Stream.connect(port)
+        self._head = stream^
         self._pids = pids^
-        self._queue = List[_Pending]()
-        self._waiting = List[_Pending]()
-        self._queue_head = 0
-        self._inflight = List[Int](length=workers, fill=0)
-        self._pipeline = pipeline
+        self._driver = Self._hello(self._head)
+        self._counter = 0
         self._results = Dict[UInt64, List[UInt8]]()
         self._errors = Dict[UInt64, String]()
-        self._next_id = 1
 
     def __deinit__(deinit self):
-        # Closing a worker's socket is its signal to exit.
-        for i in range(len(self._workers)):
-            self._workers[i].close()
+        # In local mode the head exits once its only driver leaves, and closes
+        # the workers' connections, which is their signal to exit.
+        self._head.close()
         for pid in self._pids:
             _ = wait_child(pid)
 
-    def num_workers(self) -> Int:
-        return len(self._workers)
+    @staticmethod
+    def _registry_hash() -> UInt64:
+        """A hash of every registered task's name, in order."""
+        var all = String()
+        comptime for i in range(Self.Ts.length):
+            all += Self.Ts[i].name()
+            all += "\n"
+        return fnv1a64(all)
 
     @staticmethod
     def _check_registry() raises:
@@ -176,6 +192,30 @@ struct Runtime[*Ts: TaskLike](Movable):
                     )
 
     @staticmethod
+    def _hello_payload(role: UInt8) -> List[UInt8]:
+        var body: List[UInt8] = [role]
+        put_scalar[DType.uint64](body, Self._registry_hash())
+        return body^
+
+    @staticmethod
+    def _hello(s: Stream) raises -> UInt64:
+        """Introduces a driver to the head and returns its driver number."""
+        write_frame(s, KIND_HELLO, 0, 0, Self._hello_payload(ROLE_DRIVER))
+        var f = read_frame(s)
+        if not f:
+            raise Error("the head closed the connection")
+        ref frame = f.value()
+        if frame.kind == KIND_ERROR:
+            raise Error(
+                "the head refused this driver: ",
+                String(unsafe_from_utf8=frame.payload),
+            )
+        if frame.kind != KIND_WELCOME:
+            raise Error("expected welcome, got frame kind ", Int(frame.kind))
+        var pos = 0
+        return get_scalar[DType.uint64](frame.payload, pos)
+
+    @staticmethod
     def _dispatch(
         task_id: UInt64, args: Span[UInt8, _], mut out: List[UInt8]
     ) raises:
@@ -186,14 +226,19 @@ struct Runtime[*Ts: TaskLike](Movable):
         raise Error("unknown task ID ", task_id)
 
     @staticmethod
-    def _serve(port: Int) raises:
-        """A worker's loop: run tasks until the driver hangs up."""
-        var s = Stream.connect(port)
+    def _serve(var s: Stream) raises:
+        """A worker's loop: run tasks until the head hangs up."""
+        write_frame(s, KIND_HELLO, 0, 0, Self._hello_payload(ROLE_WORKER))
         while True:
             var f = read_frame(s)
             if not f:
                 return
             ref frame = f.value()
+            if frame.kind == KIND_ERROR:
+                raise Error(
+                    "the head refused this worker: ",
+                    String(unsafe_from_utf8=frame.payload),
+                )
             if frame.kind != KIND_TASK:
                 raise Error("worker got frame kind ", Int(frame.kind))
             var out = List[UInt8]()
@@ -214,34 +259,29 @@ struct Runtime[*Ts: TaskLike](Movable):
         raise Error(T.name(), " is not registered with this runtime")
 
     def _new_id(mut self) -> UInt64:
-        var id = self._next_id
-        self._next_id += 1
-        return id
+        self._counter += 1
+        return (self._driver << DRIVER_SHIFT) | self._counter
 
     def remote[T: TaskLike](mut self, arg: T.A) raises -> ObjectRef[T.R]:
-        """Queues task `T` on `arg` and returns a handle to its result."""
+        """Submits task `T` on `arg` and returns a handle to its result."""
         Self._check_registered[T]()
         var args = List[UInt8]()
         encode(arg, args)
         var id = self._new_id()
-        self._queue.append(_Pending(id, T.id(), args^))
+        write_frame(self._head, KIND_TASK, id, T.id(), args)
         return ObjectRef[T.R](id)
 
     def remote[
         T: TaskLike
     ](mut self, arg: ObjectRef[T.A]) raises -> ObjectRef[T.R]:
-        """Queues task `T` to run on another task's result, once it exists."""
+        """Submits task `T` to run on another task's result, once it exists."""
         Self._check_registered[T]()
-        var id = self._new_id()
-        self._waiting.append(
-            _Pending(id, T.id(), List[UInt8](), deps=[arg.id], gather=False)
-        )
-        return ObjectRef[T.R](id)
+        return self._submit_after[T.R](T.id(), [arg.id], False)
 
     def remote[
         X: AnyType, //, T: TaskLike
     ](mut self, args: List[ObjectRef[X]]) raises -> ObjectRef[T.R]:
-        """Queues task `T`, which takes a `Seq[X]`, to run on these results.
+        """Submits task `T`, which takes a `Seq[X]`, to run on these results.
 
         The task runs once every result exists, and receives them in order.
         """
@@ -252,119 +292,51 @@ struct Runtime[*Ts: TaskLike](Movable):
         var deps = List[UInt64](capacity=len(args))
         for r in args:
             deps.append(r.id)
-        var id = self._new_id()
-        self._waiting.append(
-            _Pending(id, T.id(), List[UInt8](), deps=deps^, gather=True)
-        )
-        return ObjectRef[T.R](id)
+        return self._submit_after[T.R](T.id(), deps, True)
 
-    def _release_waiting(mut self):
-        """Moves every waiting task whose inputs are all settled to the queue.
-        """
-        if len(self._waiting) == 0:
-            return
-        var still = List[_Pending]()
-        for i in range(len(self._waiting)):
-            ref p = self._waiting[i]
-            var failed = String()
-            var settled = True
-            for d in p.deps:
-                if d in self._errors:
-                    failed = self._errors.get(d, String())
-                elif d not in self._results:
-                    settled = False
-            if failed:
-                self._errors[p.object_id] = String("input failed: ", failed)
-            elif not settled:
-                still.append(self._waiting[i].copy())
-            else:
-                var args = List[UInt8]()
-                if p.gather:
-                    put_scalar[DType.int64](args, Int64(len(p.deps)))
-                for d in p.deps:
-                    args.extend(self._results.get(d, List[UInt8]()))
-                self._queue.append(_Pending(p.object_id, p.task_id, args^))
-        self._waiting = still^
+    def _submit_after[
+        R: AnyType
+    ](
+        mut self, task_id: UInt64, deps: List[UInt64], gather: Bool
+    ) raises -> ObjectRef[R]:
+        var body: List[UInt8] = [UInt8(1) if gather else UInt8(0)]
+        put_scalar[DType.uint64](body, UInt64(len(deps)))
+        for d in deps:
+            put_scalar[DType.uint64](body, d)
+        var id = self._new_id()
+        write_frame(self._head, KIND_TASK_AFTER, id, task_id, body)
+        return ObjectRef[R](id)
+
+    def _settled(self, id: UInt64) -> Bool:
+        return id in self._results or id in self._errors
+
+    def _read_one(mut self) raises:
+        var f = read_frame(self._head)
+        if not f:
+            raise Error("the head closed the connection")
+        ref frame = f.value()
+        if frame.kind == KIND_RESULT:
+            self._results[frame.object_id] = frame.payload.copy()
+        elif frame.kind == KIND_ERROR:
+            self._errors[frame.object_id] = String(
+                unsafe_from_utf8=frame.payload
+            )
+        else:
+            raise Error("driver got frame kind ", Int(frame.kind))
 
     def ready[R: AnyType](mut self, r: ObjectRef[R]) raises -> Bool:
         """Returns whether `r`'s task has finished, without waiting for it."""
-        if r.id in self._results or r.id in self._errors:
-            return True
-        self._release_waiting()
-        self._dispatch_queued()
-        self._collect(timeout_ms=0)
-        self._release_waiting()
-        return r.id in self._results or r.id in self._errors
+        while not self._settled(r.id):
+            if not poll_readable([self._head.fd], 0)[0]:
+                return False
+            self._read_one()
+        return True
 
     def get[R: Movable](mut self, r: ObjectRef[R]) raises -> R:
         """Waits for `r`'s task and returns its result, or raises its error."""
-        while r.id not in self._results and r.id not in self._errors:
-            self._pump()
-            self._release_waiting()
+        while not self._settled(r.id):
+            self._read_one()
         if r.id in self._errors:
             raise Error(self._errors[r.id])
         var pos = 0
         return decode[R](self._results[r.id], pos)
-
-    def _queued(self) -> Int:
-        return len(self._queue) - self._queue_head
-
-    def _pump(mut self) raises:
-        self._release_waiting()
-        self._dispatch_queued()
-        var waiting = False
-        for n in self._inflight:
-            if n > 0:
-                waiting = True
-        if not waiting:
-            raise Error("get: no such object in this runtime")
-        self._collect(timeout_ms=-1)
-
-    def _dispatch_queued(mut self) raises:
-        """Sends queued tasks to workers, one round per pipeline slot."""
-        for depth in range(self._pipeline):
-            for w in range(len(self._workers)):
-                if self._queued() == 0:
-                    break
-                if self._inflight[w] != depth:
-                    continue
-                ref p = self._queue[self._queue_head]
-                if depth > 0 and len(p.args) > PIPELINE_ARG_LIMIT:
-                    continue
-                write_frame(
-                    self._workers[w], KIND_TASK, p.object_id, p.task_id, p.args
-                )
-                self._queue_head += 1
-                self._inflight[w] += 1
-        if self._queue_head == len(self._queue):
-            self._queue.clear()
-            self._queue_head = 0
-
-    def _collect(mut self, timeout_ms: Int) raises:
-        """Reads every result that has arrived from a worker with tasks out."""
-        var fds = List[c_int]()
-        var which = List[Int]()
-        for w in range(len(self._workers)):
-            if self._inflight[w] > 0:
-                fds.append(self._workers[w].fd)
-                which.append(w)
-        if len(fds) == 0:
-            return
-        var ready = poll_readable(fds, timeout_ms)
-        for i in range(len(ready)):
-            if not ready[i]:
-                continue
-            var w = which[i]
-            var f = read_frame(self._workers[w])
-            if not f:
-                raise Error("worker ", w, " exited with a task in flight")
-            self._inflight[w] -= 1
-            ref frame = f.value()
-            if frame.kind == KIND_RESULT:
-                self._results[frame.object_id] = frame.payload.copy()
-            elif frame.kind == KIND_ERROR:
-                self._errors[frame.object_id] = String(
-                    unsafe_from_utf8=frame.payload
-                )
-            else:
-                raise Error("driver got frame kind ", Int(frame.kind))

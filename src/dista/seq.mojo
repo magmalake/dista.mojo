@@ -22,7 +22,7 @@ each result's bytes as they arrived, without decoding them.
 from dista.codec import Codec, decode, encode, get_scalar, put_scalar
 
 
-struct Seq[T: Copyable & Movable & Deinitable](Codec, Copyable, Movable, Sized):
+struct Seq[T: Copyable & Deinitable](Codec, Copyable, Sized):
     """A list of `T` that tasks can take and return."""
 
     var items: List[Self.T]
