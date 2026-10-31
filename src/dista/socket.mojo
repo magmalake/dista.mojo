@@ -203,6 +203,42 @@ struct Listener(Movable):
             _ = external_call["close", c_int](self.fd)
 
 
+comptime POLLIN: Int16 = 0x1
+comptime POLLERR: Int16 = 0x8
+comptime POLLHUP: Int16 = 0x10
+comptime POLLFD_SIZE = 8  # struct pollfd { int fd; short events; short revents; }
+
+
+def poll_readable(fds: List[c_int], timeout_ms: Int = -1) raises -> List[Bool]:
+    """Waits until at least one of `fds` is readable, or `timeout_ms` passes.
+
+    A closed or failed socket counts as readable, so the read that follows
+    reports it. A timeout of -1 waits indefinitely.
+    """
+    var n = len(fds)
+    var buf = List[UInt8](length=n * POLLFD_SIZE, fill=0)
+    var base = buf.unsafe_ptr()
+    for i in range(n):
+        var at = base.unsafe_offset(i * POLLFD_SIZE)
+        at.unsafe_bitcast[Int32]().unsafe_write(Int32(fds[i]))
+        at.unsafe_offset(4).unsafe_bitcast[Int16]().unsafe_write(POLLIN)
+    while True:
+        var r = external_call["poll", c_int](
+            base.unsafe_bitcast[NoneType](), c_uint(n), c_int(timeout_ms)
+        )
+        if r >= 0:
+            break
+        if get_errno().value != EINTR:
+            _fail("poll")
+    var ready = List[Bool](length=n, fill=False)
+    for i in range(n):
+        var revents = base.unsafe_offset(i * POLLFD_SIZE + 6).unsafe_bitcast[
+            Int16
+        ]()[]
+        ready[i] = (revents & (POLLIN | POLLERR | POLLHUP)) != 0
+    return ready^
+
+
 def fork() raises -> Int:
     """Forks the process. Returns 0 in the child, the child's pid in the parent.
     """

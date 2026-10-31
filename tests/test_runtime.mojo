@@ -1,6 +1,13 @@
 """Runtime tests with real forked workers."""
 
-from std.testing import TestSuite, assert_equal, assert_raises
+from std.testing import (
+    TestSuite,
+    assert_equal,
+    assert_false,
+    assert_raises,
+    assert_true,
+)
+from std.time import perf_counter_ns, sleep
 
 from dista import ObjectRef, Runtime, Task
 
@@ -30,10 +37,21 @@ def not_registered(x: Int) -> Int:
     return x
 
 
+def nap(ms: Int) -> Int:
+    sleep(Float64(ms) / 1000.0)
+    return ms
+
+
+def text_length(s: String) -> Int:
+    return s.byte_length()
+
+
 comptime Square = Task[Int, Int, square]
 comptime FailOnOdd = Task[Int, Int, fail_on_odd]
 comptime Mirror = Task[Point, Point, mirror]
 comptime NotRegistered = Task[Int, Int, not_registered]
+comptime Nap = Task[Int, Int, nap]
+comptime TextLength = Task[String, Int, text_length]
 
 
 def test_fan_out_and_gather_1000_tasks() raises:
@@ -81,6 +99,45 @@ def test_unregistered_task_raises() raises:
     var rt = Runtime[Square](workers=1)
     with assert_raises(contains="not registered"):
         _ = rt.remote[NotRegistered](1)
+
+
+def test_fast_task_not_blocked_by_slow_one() raises:
+    """Results arrive in any order: a short task doesn't wait behind a long one.
+    """
+    var rt = Runtime[Nap](workers=2, pipeline=1)
+    var slow = rt.remote[Nap](600)
+    var fast = rt.remote[Nap](0)
+    var t0 = perf_counter_ns()
+    assert_equal(rt.get(fast), 0)
+    var waited_ms = Float64(perf_counter_ns() - t0) / 1e6
+    assert_true(waited_ms < 300, "fast task waited behind the slow one")
+    assert_false(rt.ready(slow))
+    assert_equal(rt.get(slow), 600)
+    assert_true(rt.ready(slow))
+
+
+def test_pipeline_depths() raises:
+    for depth in [1, 2, 4]:
+        var rt = Runtime[Square](workers=3, pipeline=depth)
+        var refs = List[ObjectRef[Int]]()
+        for i in range(300):
+            refs.append(rt.remote[Square](i))
+        var total = 0
+        for r in refs:
+            total += rt.get(r)
+        assert_equal(total, 8955050)  # sum of squares 0..299
+
+
+def test_large_arguments_with_pipelining() raises:
+    """Arguments bigger than a socket buffer don't deadlock a pipelined worker.
+    """
+    var rt = Runtime[TextLength](workers=2, pipeline=4)
+    var big = String("x") * (1 << 20)
+    var refs = List[ObjectRef[Int]]()
+    for _ in range(12):
+        refs.append(rt.remote[TextLength](big))
+    for r in refs:
+        assert_equal(rt.get(r), 1 << 20)
 
 
 def main() raises:

@@ -84,7 +84,8 @@ Columnar data does **not** go through `Serializable`. The one columnar type is a
 
 - **The driver is the head.** `Runtime(...)` binds a TCP listener on `127.0.0.1` with an OS-assigned port, then forks the workers. Forking before any thread exists is safe, and it means a worker has the registry without an exec.
 - **A worker** connects back, then loops: read a task frame, dispatch, write a result frame. It exits on end-of-file.
-- **Scheduling** is a FIFO queue. `remote` only enqueues. `get` pumps: hand queued tasks to idle workers, then read the result of the oldest in-flight task. Workers compute in parallel while the driver waits on one of them, because finished results wait in socket buffers. No `poll` and no threads in phase 1.
+- **Scheduling** is a FIFO queue. `remote` only enqueues. `get` pumps: hand queued tasks to workers round-robin, up to `pipeline` in flight each (default 2), then `poll` the busy workers and take whichever results have arrived. Results arrive in any order, so a short task doesn't wait behind a long one. No threads.
+- **No write deadlock.** The driver's writes block, so a busy worker only gets another task whose arguments fit in its receive buffer (16 KiB). Larger arguments wait for an idle worker.
 - **Transport** is loopback TCP over libc (`socket`, `bind`, `connect`, `send`, `recv`) in `src/dista/socket.mojo`, with `TCP_NODELAY` set. dista has no dependencies. flare's TCP would work from source, but it brings flare's native shims and its threads and json dependencies for something a hundred lines of libc covers.
 - **Frames** are a 4-byte little-endian length, then a fixed 17-byte header and a payload:
 
@@ -95,7 +96,7 @@ Columnar data does **not** go through `Serializable`. The one columnar type is a
 | 9 | task ID, u64 (0 except on a task frame) |
 | 17 | payload: the encoded argument, the encoded result, or a UTF-8 error message |
 
-- **Measured** on an M4 MacBook with 4 workers: start-up 2.4 ms, one task round trip about 0.05 ms once warm, and 1,000 tasks of `square` in 10.8 ms, about 11 µs each. That's well under the vision's 1 ms per-task target. The phase-1 gate test passes on both Mojo 1.2.0 and the 1.3 nightly.
+- **Measured** on an M4 MacBook with 4 workers (`pixi run bench`, 10,000 tasks of `square`): 7.8 µs per task with no pipelining, 3.9 µs at depth 2, 3.1 µs at depth 4. Start-up takes 2.4 ms. That's well under the vision's 1 ms per-task target. The phase-1 gate test passes on both Mojo 1.2.0 and the 1.3 nightly.
 
 ### Phase 2: a cluster
 
