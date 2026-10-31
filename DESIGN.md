@@ -100,13 +100,13 @@ Columnar data does **not** go through `Serializable`. The one columnar type is a
 ### Phase 2: a cluster
 
 - **A separate head process** (a Kubernetes StatefulSet) owns membership, the task queue and the object directory. Workers (a Deployment) find it through `DISTA_HEAD=host:port`; the same binary acts as head, worker or driver depending on its environment.
-- **The scheduler moves onto an event loop** (`poll`, or flare's reactor) so the head serves many workers without blocking on one, and so tasks can be pipelined per worker.
+- **The scheduler moves onto a `poll` event loop**, over the same libc socket layer, so the head serves many workers without blocking on one, and so tasks can be pipelined per worker.
 - **Ownership** follows Ray: the submitter owns a result and holds its location. The head knows where objects live but never holds their bytes.
 - **Locality:** a task goes to the node that holds the most bytes of its arguments, falling back to the least-loaded node.
 
 ## Concurrency
 
-Threads plus flare's reactor, not async. Mojo's async is unfinished: on the 1.3 nightly, `async`/`await` were renamed `__async`/`__await` (modular `b1bb00ad53`, October 2, 2026) to mark them unstable, while the compiler's coroutine lowering is being rebuilt. Task execution stays behind dista's own interface, so coroutines can replace threads later without changing the user API.
+A `poll` event loop, plus threads where work must overlap inside one process, not async. Mojo's async is unfinished: on the 1.3 nightly, `async`/`await` were renamed `__async`/`__await` (modular `b1bb00ad53`, October 2, 2026) to mark them unstable, while the compiler's coroutine lowering is being rebuilt. Task execution stays behind dista's own interface, so coroutines can replace threads later without changing the user API.
 
 ## Failure handling
 
@@ -134,3 +134,28 @@ ThreadSanitizer fails on allocating threaded Mojo programs today, so the runtime
 | `src/dista/socket.mojo` | loopback TCP, `fork`, `waitpid`, `_exit` over libc |
 | `src/dista/runtime.mojo` | `Runtime`, `ObjectRef`, the worker loop |
 | `tests/` | codec, dispatch, and process tests |
+
+## Phase 2 plan
+
+Phase 2 takes dista from one machine to a cluster. Its gate, from the vision: a distributed Iceberg scan of the taxi data on a 3-node cluster returns the same answer as one machine. It lands as stacked PRs of at most about 2,000 lines, each with its own gate, in two tracks that can run in parallel.
+
+**Runtime track** (dista.mojo, in order):
+
+| # | PR | Gate | Size |
+|---|---|---|---|
+| 1 | **Event loop and pipelining.** `poll` over worker sockets, several tasks in flight per worker, results taken in any order. | A fast task's `get` returns while a slow task is still running. | ~400 |
+| 2 | **Object refs as arguments, and `Seq[T]`.** A task can take another task's `ObjectRef`; it runs once its input exists. `Seq[T]` carries a list through the codec, since `List` can't be reflected. | A map-reduce: 100 maps feed one reduce. | ~500 |
+| 3 | **A separate head, and roles.** One binary runs as head, worker or driver, chosen by environment. Workers and drivers reach the head over TCP by host name. A handshake checks that both sides share a registry. Local mode still forks everything. | Head, driver and 4 workers started as separate processes run the fan-out. | ~700 |
+| 4 | **Results stay on workers.** A result stays where it was computed; the head records where it is. A consumer fetches it straight from that worker. | Map outputs reach the reduce without passing through the head. | ~700 |
+| 5 | **A shared-memory store per node.** Workers on one node share results through memory-region instead of sockets. | Two workers on one node pass a 100 MB result without a socket copy. | ~600 |
+| 6 | **Kubernetes.** A container image, manifests (a head StatefulSet, a worker Deployment) and a smoke test on a kind cluster in CI. | The fan-out runs on a 3-node kind cluster. | ~400 |
+
+**Data track** (arrow-mlake.mojo, then dista.mojo):
+
+| # | PR | Gate | Size |
+|---|---|---|---|
+| 7 | **Arrow IPC in arrow-mlake.** Move the writer from flight.mojo, add a reader, and cover every `ArrayData` type, nested ones included. | pyarrow reads what it writes, and it reads what pyarrow writes. | ~1,500 |
+| 8 | **`RecordBatch` results in dista.** Columnar results travel as IPC, in the node store and between nodes. | A task returns a batch read by parquet.mojo, and another task consumes it. | ~500 |
+| 9 | **The Iceberg scan.** One task per data file, results gathered as Arrow. | Phase 2's gate. | ~400 |
+
+PR 7 changes a published tin, and needs your sign-off before it's merged.
