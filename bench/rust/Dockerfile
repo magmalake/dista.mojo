@@ -1,0 +1,14 @@
+# The Rust image for bench/rust: the release binary on the same
+# debian:bookworm-slim base dista's images use, so the sizes compare like
+# for like.
+#
+#     docker build -t dista-rust:taxi bench/rust
+FROM rust:1.94-slim-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src src
+RUN cargo build --release --locked
+
+FROM debian:bookworm-slim
+COPY --from=build /src/target/release/taxi-rs /usr/local/bin/taxi-rs
+ENTRYPOINT ["/usr/local/bin/taxi-rs"]

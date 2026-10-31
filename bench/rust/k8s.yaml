@@ -1,0 +1,79 @@
+# bench/rust on a cluster: three workers spread one per node behind a
+# headless Service, and a driver job that resolves it to one address per
+# worker. There's no head. The warehouse is mounted at the path the table was
+# written at: iceberg-rust reads manifests by their absolute locations, so
+# rewriting only the data files' paths isn't enough. bench/rust/run_kind.sh
+# fills in the @...@ values.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rust-workers
+spec:
+  clusterIP: None
+  selector: {app: rust-taxi, role: worker}
+  ports:
+    - {name: taxi, port: 7400}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rust-worker
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: rust-taxi, role: worker}
+  template:
+    metadata:
+      labels: {app: rust-taxi, role: worker}
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {app: rust-taxi, role: worker}
+      volumes:
+        - name: warehouse
+          hostPath: {path: /data/wh, type: Directory}
+      containers:
+        - name: worker
+          image: dista-rust:taxi
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - {name: warehouse, mountPath: "@WAREHOUSE@", readOnly: true}
+          env:
+            - {name: TAXI_ROLE, value: worker}
+            - {name: TAXI_THREADS, value: "@TAXI_THREADS@"}
+            - {name: TAXI_METADATA, value: "@TAXI_METADATA@"}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          readinessProbe:
+            tcpSocket: {port: 7400}
+            periodSeconds: 2
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rust-taxi
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {app: rust-taxi, role: driver}
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: warehouse
+          hostPath: {path: /data/wh, type: Directory}
+      containers:
+        - name: driver
+          image: dista-rust:taxi
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - {name: warehouse, mountPath: "@WAREHOUSE@", readOnly: true}
+          env:
+            - {name: TAXI_WORKERS, value: "rust-workers:7400"}
+            - {name: TAXI_EXPECT_WORKERS, value: "3"}
+            - {name: DISTA_EXPECT_NODES, value: "3"}
+            - {name: TAXI_THREADS, value: "@TAXI_THREADS@"}
+            - {name: TAXI_METADATA, value: "@TAXI_METADATA@"}
