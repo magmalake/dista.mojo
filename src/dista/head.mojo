@@ -11,8 +11,12 @@ workers round-robin up to `pipeline` in flight each, and forwards each result
 or error to the driver that owns it. Every socket is non-blocking with its
 own output queue (`Conn`), so a slow peer can't stall anyone else.
 
-The head keeps every result, because a task submitted later may take it as
-input. A worker that goes away fails the tasks it had in flight.
+Small results come through the head, which keeps them, because a task
+submitted later may take one as input. A large result stays on the worker
+that computed it: the head records where, tells the owning driver, and sends
+a task that needs it as task-inputs, so the worker running that task fetches
+it from its peer. A worker that goes away fails the tasks it had in flight
+and loses the results it held.
 """
 
 from std.ffi import c_int
@@ -20,11 +24,15 @@ from std.ffi import c_int
 from dista.codec import get_scalar, put_scalar
 from dista.conn import Conn
 from dista.frame import (
+    ADDR_SIZE,
     KIND_ERROR,
     KIND_HELLO,
+    KIND_LOCATED,
     KIND_RESULT,
+    KIND_STORED,
     KIND_TASK,
     KIND_TASK_AFTER,
+    KIND_TASK_INPUTS,
     KIND_WELCOME,
     ROLE_DRIVER,
     ROLE_WORKER,
@@ -49,6 +57,8 @@ struct _Task(Copyable, Movable):
     var args: List[UInt8]
     var deps: List[UInt64]
     var gather: Bool
+    var kind: UInt8
+    """`KIND_TASK` with the argument, or `KIND_TASK_INPUTS` with input specs."""
 
     def __init__(
         out self,
@@ -57,12 +67,14 @@ struct _Task(Copyable, Movable):
         var args: List[UInt8],
         var deps: List[UInt64] = List[UInt64](),
         gather: Bool = False,
+        kind: UInt8 = KIND_TASK,
     ):
         self.object_id = object_id
         self.task_id = task_id
         self.args = args^
         self.deps = deps^
         self.gather = gather
+        self.kind = kind
 
 
 struct Head(Movable):
@@ -82,6 +94,11 @@ struct Head(Movable):
     var _waiting: List[_Task]
     var _results: Dict[UInt64, List[UInt8]]
     var _errors: Dict[UInt64, String]
+    var _worker_addr: List[List[UInt8]]
+    """For a worker, its object server's address, as frames carry it."""
+    var _location: Dict[UInt64, Int]
+    """Results that stayed on a worker: object ID to that worker's connection.
+    """
 
     def __init__(
         out self,
@@ -113,6 +130,8 @@ struct Head(Movable):
         self._waiting = List[_Task]()
         self._results = Dict[UInt64, List[UInt8]]()
         self._errors = Dict[UInt64, String]()
+        self._worker_addr = List[List[UInt8]]()
+        self._location = Dict[UInt64, Int]()
 
     def run(mut self) raises:
         """Serves until the last driver leaves, in local mode; else forever."""
@@ -165,6 +184,7 @@ struct Head(Movable):
         self._conns.append(Conn(s^))
         self._roles.append(_ROLE_NONE)
         self._inflight.append(List[UInt64]())
+        self._worker_addr.append(List[UInt8]())
 
     def _handle(mut self, i: Int, var f: Frame) raises:
         var role = self._roles[i]
@@ -194,7 +214,11 @@ struct Head(Movable):
             else:
                 raise Error("driver sent frame kind ", Int(f.kind))
         elif role == ROLE_WORKER:
-            if f.kind != KIND_RESULT and f.kind != KIND_ERROR:
+            if (
+                f.kind != KIND_RESULT
+                and f.kind != KIND_ERROR
+                and f.kind != KIND_STORED
+            ):
                 raise Error("worker sent frame kind ", Int(f.kind))
             ref flight = self._inflight[i]
             for k in range(len(flight)):
@@ -203,12 +227,17 @@ struct Head(Movable):
                     break
             if f.kind == KIND_RESULT:
                 self._results[f.object_id] = f.payload.copy()
+                self._deliver(f.object_id, f.kind, f.payload)
+            elif f.kind == KIND_STORED:
+                self._location[f.object_id] = i
+                var addr = self._worker_addr[i].copy()
+                self._deliver(f.object_id, KIND_LOCATED, addr)
             else:
                 self._errors[f.object_id] = String(unsafe_from_utf8=f.payload)
-            self._deliver(f.object_id, f.kind, f.payload)
+                self._deliver(f.object_id, f.kind, f.payload)
 
     def _hello(mut self, i: Int, var f: Frame) raises:
-        if f.kind != KIND_HELLO or len(f.payload) != 9:
+        if f.kind != KIND_HELLO or len(f.payload) < 9:
             raise Error("expected a hello frame")
         var pos = 1
         var hash = get_scalar[DType.uint64](f.payload, pos)
@@ -230,7 +259,10 @@ struct Head(Movable):
             put_scalar[DType.uint64](body, n)
             self._conns[i].send(KIND_WELCOME, 0, 0, body)
         elif f.payload[0] == ROLE_WORKER:
+            if len(f.payload) != 9 + ADDR_SIZE:
+                raise Error("a worker's hello must carry its address")
             self._roles[i] = ROLE_WORKER
+            self._worker_addr[i] = List[UInt8](f.payload[9:])
         else:
             raise Error("unknown role ", Int(f.payload[0]))
 
@@ -272,6 +304,13 @@ struct Head(Movable):
             self._inflight[i].clear()
             for obj in lost:
                 self._fail(obj, String("worker lost while running this task"))
+            var held = List[UInt64]()
+            for entry in self._location.items():
+                if entry.value == i:
+                    held.append(entry.key)
+            for obj in held:
+                _ = self._location.pop(obj, -1)
+                self._fail(obj, String("result lost: its worker went away"))
 
     def _shutdown(mut self):
         for i in range(len(self._conns)):
@@ -287,22 +326,46 @@ struct Head(Movable):
             ref t = self._waiting[i]
             var failed = String()
             var settled = True
+            var remote = False
             for d in t.deps:
                 if d in self._errors:
                     failed = self._errors.get(d, String())
+                elif d in self._location:
+                    remote = True
                 elif d not in self._results:
                     settled = False
             if failed:
                 self._fail(t.object_id, String("input failed: ", failed))
             elif not settled:
                 still.append(t.copy())
-            else:
+            elif not remote:
                 var args = List[UInt8]()
                 if t.gather:
                     put_scalar[DType.int64](args, Int64(len(t.deps)))
                 for d in t.deps:
                     args.extend(self._results.get(d, List[UInt8]()))
                 self._queue.append(_Task(t.object_id, t.task_id, args^))
+            else:
+                # Some inputs live on workers: tell the worker that runs this
+                # task where to fetch them, and pass the rest inline.
+                var spec: List[UInt8] = [UInt8(1) if t.gather else UInt8(0)]
+                put_scalar[DType.uint64](spec, UInt64(len(t.deps)))
+                for d in t.deps:
+                    if d in self._location:
+                        spec.append(1)
+                        put_scalar[DType.uint64](spec, d)
+                        spec.extend(
+                            self._worker_addr[self._location.get(d, 0)].copy()
+                        )
+                    else:
+                        var r = self._results.get(d, List[UInt8]())
+                        spec.append(0)
+                        put_scalar[DType.uint64](spec, d)
+                        put_scalar[DType.uint64](spec, UInt64(len(r)))
+                        spec.extend(r^)
+                self._queue.append(
+                    _Task(t.object_id, t.task_id, spec^, kind=KIND_TASK_INPUTS)
+                )
         self._waiting = still^
 
     def _queued(self) -> Int:
@@ -322,9 +385,7 @@ struct Head(Movable):
                 self._queue_head += 1
                 self._inflight[i].append(t.object_id)
                 try:
-                    self._conns[i].send(
-                        KIND_TASK, t.object_id, t.task_id, t.args
-                    )
+                    self._conns[i].send(t.kind, t.object_id, t.task_id, t.args)
                 except e:
                     print("dista head: lost worker:", e)
                     self._drop(i)

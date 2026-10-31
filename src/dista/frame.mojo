@@ -14,12 +14,19 @@ Every frame is a 4-byte little-endian length, then that many bytes:
 | 1 task | driver to head, head to worker | the encoded argument |
 | 2 result | worker to head, head to driver | the encoded result |
 | 3 error | worker to head, head to driver | a UTF-8 message |
-| 4 hello | driver or worker to head | role byte (`ROLE_*`), then the registry hash, u64 |
+| 4 hello | driver or worker to head | role byte (`ROLE_*`), the registry hash u64; a worker adds its object server's address |
 | 5 welcome | head to driver | the driver's number, u64 |
 | 6 task-after | driver to head | gather byte, count u64, then that many object IDs |
+| 7 stored | worker to head | the result's size, u64: it stayed on the worker |
+| 8 located | head to driver | the address of the worker holding the result |
+| 9 fetch | driver or worker to a worker | none: send that object back as a result frame |
+| 10 task-inputs | head to worker | gather byte, count u64, then per input a tag byte: 0, a length u64 and the bytes; or 1, an address |
 
 A task-after frame queues a task whose argument is built from other results:
-the single result as is, or with gather set, a `Seq` of all of them.
+the single result as is, or with gather set, a `Seq` of all of them. When
+some of those results live on workers, the head sends the task as
+task-inputs, and the worker fetches them before it runs the task. An address
+is 12 bytes: the IPv4 address, then the port as a u64.
 """
 
 from std.memory import bitcast
@@ -33,6 +40,11 @@ comptime KIND_ERROR: UInt8 = 3
 comptime KIND_HELLO: UInt8 = 4
 comptime KIND_WELCOME: UInt8 = 5
 comptime KIND_TASK_AFTER: UInt8 = 6
+comptime KIND_STORED: UInt8 = 7
+comptime KIND_LOCATED: UInt8 = 8
+comptime KIND_FETCH: UInt8 = 9
+comptime KIND_TASK_INPUTS: UInt8 = 10
+comptime ADDR_SIZE = 12
 comptime ROLE_DRIVER: UInt8 = 1
 comptime ROLE_WORKER: UInt8 = 2
 comptime HEADER = 17
@@ -119,3 +131,26 @@ def read_frame(s: Stream) raises -> Optional[Frame]:
     if s.read_into(body.unsafe_ptr(), n) == 0:
         raise Error("connection closed mid-frame")
     return parse_body(body)
+
+
+def encode_addr(ip: Array[UInt8, 4], port: Int) -> List[UInt8]:
+    """An address as frames carry it: the IPv4 address, then the port, u64."""
+    var out = List[UInt8](capacity=ADDR_SIZE)
+    for i in range(4):
+        out.append(ip[i])
+    put_scalar[DType.uint64](out, UInt64(port))
+    return out^
+
+
+def decode_addr(
+    buf: Span[UInt8, _], mut pos: Int
+) raises -> Tuple[Array[UInt8, 4], Int]:
+    """Reads an address written by `encode_addr` and advances `pos`."""
+    if pos + ADDR_SIZE > len(buf):
+        raise Error("truncated address")
+    var ip = Array[UInt8, 4](fill=0)
+    for i in range(4):
+        ip[i] = buf[pos + i]
+    pos += 4
+    var port = Int(get_scalar[DType.uint64](buf, pos))
+    return (ip^, port)

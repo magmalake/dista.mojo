@@ -33,9 +33,10 @@ What works today:
 - **Arguments and results:** scalars, `String`, plain structs of those, `Seq[T]` lists, and types that implement `Codec`.
 - **Results feeding tasks:** a task can take another task's `ObjectRef`, or gather a list of them into a `Seq`, as in [examples/mapreduce.mojo](examples/mapreduce.mojo).
 - **Errors:** a task that raises re-raises in `get`, and a worker that dies fails only its own tasks.
-- **Speed:** small tasks cost about 5 µs each.
+- **Large results stay on the worker that made them**, and other workers or the driver fetch them directly. Small ones come back through the head.
+- **Speed:** small tasks cost about 6 µs each.
 
-Results kept on the workers that made them, a shared-memory store, Kubernetes, Arrow results and actors come next.
+A shared-memory store, Kubernetes, Arrow results and actors come next.
 
 - [VISION.md](VISION.md): what dista is for, its principles and phases.
 - [DESIGN.md](DESIGN.md): how it works, and what's verified on Mojo 1.2.0.

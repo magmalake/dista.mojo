@@ -74,6 +74,24 @@ def die(x: Int) -> Int:
     return x
 
 
+def blob(n: Int) -> String:
+    return String("x") * n
+
+
+def total_length(xs: Seq[String]) -> Int:
+    var t = 0
+    for i in range(len(xs)):
+        t += xs[i].byte_length()
+    return t
+
+
+def grow(s: String) -> String:
+    return s + String("y") * 1000
+
+
+comptime Blob = Task[Int, String, blob]
+comptime TotalLength = Task[Seq[String], Int, total_length]
+comptime Grow = Task[String, String, grow]
 comptime Total = Task[Seq[Int], Int, total]
 comptime Die = Task[Int, Int, die]
 comptime Increment = Task[Int, Int, increment]
@@ -214,6 +232,49 @@ def test_worker_death_fails_its_task() raises:
     with assert_raises(contains="worker lost"):
         _ = rt.get(doomed)
     assert_equal(rt.get(rt.remote[Square](12)), 144)
+
+
+def test_large_result_stays_on_its_worker() raises:
+    var rt = Runtime[Blob](workers=2)
+    var small = rt.remote[Blob](100)
+    var big = rt.remote[Blob](300_000)
+    assert_equal(rt.location(small), "")
+    assert_true(rt.location(big) != "", "a 300 KB result should stay put")
+    assert_equal(rt.get(big).byte_length(), 300_000)
+    assert_equal(rt.get(small).byte_length(), 100)
+
+
+def test_map_outputs_reach_reduce_peer_to_peer() raises:
+    """The PR-4 gate: large map outputs never pass through the head."""
+    var rt = Runtime[Blob, TotalLength](workers=4)
+    var maps = List[ObjectRef[String]]()
+    for i in range(12):
+        maps.append(rt.remote[Blob](200_000 + i))
+    var reduced = rt.remote[TotalLength](maps)
+    var expected = 12 * 200_000 + 66  # 0 + 1 + ... + 11
+    assert_equal(rt.get(reduced), expected)
+    for r in maps:
+        assert_true(rt.location(r) != "", "map output went through the head")
+
+
+def test_mixed_inline_and_stored_inputs() raises:
+    var rt = Runtime[Blob, TotalLength](workers=3)
+    var refs: List[ObjectRef[String]] = [
+        rt.remote[Blob](10),
+        rt.remote[Blob](150_000),
+        rt.remote[Blob](20),
+        rt.remote[Blob](250_000),
+    ]
+    assert_equal(rt.get(rt.remote[TotalLength](refs)), 400_030)
+
+
+def test_chain_of_large_results_across_workers() raises:
+    """Each step fetches the previous step's result from another worker."""
+    var rt = Runtime[Blob, Grow](workers=3, pipeline=1)
+    var r = rt.remote[Grow](rt.remote[Blob](100_000))
+    for _ in range(9):
+        r = rt.remote[Grow](r)
+    assert_equal(rt.get(r).byte_length(), 110_000)
 
 
 def main() raises:
