@@ -24,9 +24,10 @@ jobs:
           pixi-version: v0.78.0
           environments: ${{ matrix.env }}
 
-      # The frame tests run over real loopback sockets and fork. Linux is the
-      # leg that checks the socket layer's platform constants: sockaddr_in's
-      # first byte, SOL_SOCKET and MSG_NOSIGNAL all differ from macOS.
+      # The frame and runtime tests fork real processes and talk over
+      # loopback TCP. Linux is the leg that checks the socket layer's
+      # platform constants: sockaddr_in's first byte, SOL_SOCKET and
+      # MSG_NOSIGNAL all differ from macOS.
       - name: Tests
         run: pixi run -e ${{ matrix.env }} test
 
