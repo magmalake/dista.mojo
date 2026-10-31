@@ -68,7 +68,7 @@ jobs:
         with:
           path: dista.mojo
       - uses: actions/checkout@v4
-        with: {repository: magmalake/memory-region.mojo, ref: 09bec66f0438d36a8af5a037a2e744ae1b3e288e, path: memory-region.mojo}
+        with: {repository: magmalake/memory-region.mojo, ref: 9e299b82e3a866073a30ff9450c27f823513046f, path: memory-region.mojo}
       - uses: actions/checkout@v4
         with: {repository: magmalake/arrow-mlake.mojo, ref: 928a2435371c82395879779225df284e581dfb21, path: arrow-mlake.mojo}
       - uses: actions/checkout@v4
