@@ -4,6 +4,9 @@
 
 - built-in scalars, `Bool` and `String` have fixed encodings (little-endian
   fixed width; `String` is an 8-byte length then its UTF-8 bytes);
+- arrow-mlake's `RecordBatch` is an 8-byte length then one Arrow IPC stream
+  holding the schema and the batch, so columnar data crosses processes in
+  Arrow's own format;
 - a type that conforms to `Codec` encodes itself;
 - any other struct is encoded field by field, in declaration order, by
   reflection.
@@ -18,7 +21,10 @@ Both ends are the same binary, so there's no versioning or schema.
 
 from std.memory import bitcast
 from std.memory.alloc import unsafe_alloc
+from std.os import abort
 from std.sys import size_of
+
+from arrow_mlake import IpcWriter, RecordBatch, read_ipc_stream
 
 
 trait Codec:
@@ -97,6 +103,32 @@ def _scalar_dtype[name: StaticString]() -> DType:
         return _NOT_SCALAR
 
 
+def _encode_batch(batch: RecordBatch, mut out: List[UInt8]):
+    var stream: List[UInt8]
+    try:
+        var w = IpcWriter(batch)
+        w.write(batch)
+        stream = w^.finish()
+    except e:
+        # Only a malformed batch fails to write, such as one whose offsets
+        # don't cover its rows. `encode` can't raise; abort with the reason.
+        abort(String("dista: can't encode a RecordBatch: ", e))
+    put_scalar[DType.int64](out, Int64(len(stream)))
+    out.extend(Span(stream))
+
+
+def _decode_batch(buf: Span[UInt8, _], mut pos: Int) raises -> RecordBatch:
+    var n = Int(get_scalar[DType.int64](buf, pos))
+    _need(buf, pos, n)
+    var s = read_ipc_stream(buf[pos : pos + n])
+    pos += n
+    if len(s.batches) != 1:
+        raise Error(
+            "decode: a RecordBatch stream holds ", len(s.batches), " batches"
+        )
+    return s.batches.pop()
+
+
 def encode[T: AnyType](ref value: T, mut out: List[UInt8]):
     """Appends the bytes of `value` to `out`."""
     comptime name = reflect[T].name()
@@ -110,6 +142,8 @@ def encode[T: AnyType](ref value: T, mut out: List[UInt8]):
         put_scalar[DType.int64](out, Int64(s.byte_length()))
         for b in s.as_bytes():
             out.append(b)
+    elif name == "arrow_mlake.batch.RecordBatch":
+        _encode_batch(rebind[RecordBatch](value), out)
     elif conforms_to(T, Codec):
         comptime assert conforms_to(T, Codec)
         value.encode(out)
@@ -135,6 +169,8 @@ def decode[T: Movable](buf: Span[UInt8, _], mut pos: Int) raises -> T:
         var s = String(unsafe_from_utf8=buf[pos : pos + n])
         pos += n
         return rebind_var[T](s^)
+    elif name == "arrow_mlake.batch.RecordBatch":
+        return rebind_var[T](_decode_batch(buf, pos))
     elif conforms_to(T, Codec):
         comptime assert conforms_to(T, Codec)
         return T.decode(buf, pos)

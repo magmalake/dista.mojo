@@ -10,13 +10,14 @@ preview = ["pixi-build"]
 platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 
 [tasks]
-test-codec = { cmd = "mkdir -p build && mojo build -I src -I $MR_INC tests/test_codec.mojo -o build/test-codec && ./build/test-codec" }
-test-frame = { cmd = "mkdir -p build && mojo build -I src -I $MR_INC tests/test_frame.mojo -o build/test-frame && ./build/test-frame" }
-test-runtime = { cmd = "mkdir -p build && mojo build -I src -I $MR_INC tests/test_runtime.mojo -o build/test-runtime && ./build/test-runtime" }
+test-codec = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_codec.mojo -o build/test-codec && ./build/test-codec" }
+test-frame = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_frame.mojo -o build/test-frame && ./build/test-frame" }
+test-runtime = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_runtime.mojo -o build/test-runtime && ./build/test-runtime" }
+test-batches = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_batches.mojo -o build/test-batches && ./build/test-batches" }
 test-cluster = { cmd = "tests/cluster.sh" }
 test-kind = { cmd = "tests/kind.sh" }
-test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-cluster"] }
-bench = { cmd = "mkdir -p build && mojo build -I src -I $MR_INC bench/fanout.mojo -o build/bench-fanout && ./build/bench-fanout" }
+test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-batches", "test-cluster"] }
+bench = { cmd = "mkdir -p build && mojo build -I src $DEP_INC bench/fanout.mojo -o build/bench-fanout && ./build/bench-fanout" }
 
 [package]
 name = "dista-mojo"
@@ -31,6 +32,7 @@ name = "dista"
 
 [package.host-dependencies]
 mojo-compiler = "==1.2.0"
+arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "ac5079f422578199e6070a17d129eca7ffc6b3bc" }
 memory-region-mojo = { git = "https://github.com/magmalake/memory-region.mojo", rev = "91ff4418b44a89f9354e7d32633e9b11ad365dfd" }
 
 [package.build-dependencies]
@@ -38,6 +40,7 @@ mojo-compiler = "==1.2.0"
 
 [package.run-dependencies]
 mojo-compiler = ">=1.2.0,<2"
+arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "ac5079f422578199e6070a17d129eca7ffc6b3bc" }
 memory-region-mojo = { git = "https://github.com/magmalake/memory-region.mojo", rev = "91ff4418b44a89f9354e7d32633e9b11ad365dfd" }
 
 # Stable is the default: dista targets Mojo 1.2.0. The nightly environment
@@ -48,16 +51,21 @@ mojo-compiler = "==1.2.0"
 # shared mappings that other processes on the same host map by path. Pinned
 # at the revision mojoshelf published (memory-region-mojo 0.1.0).
 memory-region-mojo = { git = "https://github.com/magmalake/memory-region.mojo", rev = "91ff4418b44a89f9354e7d32633e9b11ad365dfd" }
+# arrow-mlake carries columnar results: a task can take or return a
+# RecordBatch, and it travels as an Arrow IPC stream. Pinned at the merge that
+# added IPC.
+arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "ac5079f422578199e6070a17d129eca7ffc6b3bc" }
 
 # A precompiled package only loads in the compiler that built it, and this one
-# is 1.2.0's, so the nightly compiles memory-region from a checkout next door
-# instead (CI lays one out). The package must not be installed there too: an
-# installed package wins over -I.
+# is 1.2.0's, so the nightly compiles memory-region and arrow-mlake from
+# checkouts next door instead (CI lays them out). The packages must not be
+# installed there too: an installed package wins over -I. DEP_INC holds the
+# include flags for whichever way the environment gets them.
 [feature.stable.activation.env]
-MR_INC = "src"
+DEP_INC = "-I src"
 
 [feature.nightly.activation.env]
-MR_INC = "../memory-region.mojo/src"
+DEP_INC = "-I ../memory-region.mojo/src -I ../arrow-mlake.mojo/src"
 
 [feature.nightly.dependencies]
 modular = ">=26.8.0.dev2026102305,<28"
@@ -73,7 +81,23 @@ modular = ">=26.8.0.dev2026102305,<28"
 fmt = { cmd = "mojo format src tests bench examples deploy" }
 format-check = { cmd = "mojo format src tests bench examples deploy && git diff --exit-code -- src tests bench examples deploy" }
 
+# The data environment runs dista tasks over parquet.mojo. parquet.mojo and
+# its siblings compile from checkouts next to this one, as parquet.mojo's own
+# tests do, rather than as packages: parquet-mojo's published package pins an
+# older arrow-mlake, and two builds of one package can't share an
+# environment. CI lays the checkouts out at the revisions parquet-mojo 0.11.4
+# was published with.
+[feature.data.dependencies]
+mojo-compiler = "==1.2.0"
+
+[feature.data.activation.env]
+DEP_INC = "-I ../memory-region.mojo/src -I ../arrow-mlake.mojo/src -I ../parquet.mojo/src -I ../threads.mojo/src -I ../threads.mojo/compat -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../deflate.mojo/src"
+
+[feature.data.tasks]
+test-parquet = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_parquet_tasks.mojo -o build/test-parquet && ./build/test-parquet" }
+
 [environments]
 default = ["stable"]
 nightly = ["nightly"]
 fmt = { features = ["fmt"], no-default-feature = true }
+data = { features = ["data"], no-default-feature = true }

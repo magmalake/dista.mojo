@@ -22,15 +22,21 @@ jobs:
         with:
           path: dista.mojo
 
-      # The nightly compiles memory-region from source, because its package
-      # is precompiled by 1.2.0 and a 1.3 compiler refuses it. The ref matches
-      # the pin in pixi.toml.
+      # The nightly compiles memory-region and arrow-mlake from source,
+      # because their packages are precompiled by 1.2.0 and a 1.3 compiler
+      # refuses them. The refs match the pins in pixi.toml.
       - if: matrix.env == 'nightly'
         uses: actions/checkout@v4
         with:
           repository: magmalake/memory-region.mojo
           ref: 91ff4418b44a89f9354e7d32633e9b11ad365dfd
           path: memory-region.mojo
+      - if: matrix.env == 'nightly'
+        uses: actions/checkout@v4
+        with:
+          repository: magmalake/arrow-mlake.mojo
+          ref: ac5079f422578199e6070a17d129eca7ffc6b3bc
+          path: arrow-mlake.mojo
 
       - uses: prefix-dev/setup-pixi@v0.10.2
         with:
@@ -46,6 +52,42 @@ jobs:
       # MSG_NOSIGNAL all differ from macOS.
       - name: Tests
         run: pixi run -e ${{ matrix.env }} test
+
+  # Tasks that read Parquet: parquet.mojo and its siblings compile from
+  # source, at the revisions parquet-mojo 0.11.4 was published with, and
+  # arrow-mlake at dista's pin. See the data environment in pixi.toml.
+  parquet:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dista.mojo
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: dista.mojo
+      - uses: actions/checkout@v4
+        with: {repository: magmalake/memory-region.mojo, ref: 91ff4418b44a89f9354e7d32633e9b11ad365dfd, path: memory-region.mojo}
+      - uses: actions/checkout@v4
+        with: {repository: magmalake/arrow-mlake.mojo, ref: ac5079f422578199e6070a17d129eca7ffc6b3bc, path: arrow-mlake.mojo}
+      - uses: actions/checkout@v4
+        with: {repository: magmalake/parquet.mojo, ref: 9a596283d3612d1ebeca199f9e48f1c1a7eaab51, path: parquet.mojo}
+      - uses: actions/checkout@v4
+        with: {repository: magmalake/threads.mojo, ref: f45e780a8de77278c140cee36904e46e93e0ca1c, path: threads.mojo}
+      - uses: actions/checkout@v4
+        with: {repository: magmalake/thrift.mojo, ref: 21cdbce67d22d72e88e88a60e2f168b05b4ef9fa, path: thrift.mojo}
+      - uses: actions/checkout@v4
+        with: {repository: magmalake/hashes.mojo, ref: 395aca597f9410bd0511df44d972f14b10a8b01d, path: hashes.mojo}
+      - uses: actions/checkout@v4
+        with: {repository: magmalake/snappy.mojo, ref: b8172ed0a4ef13911cc225d46e26676a5b8f1ccd, path: snappy.mojo}
+      - uses: actions/checkout@v4
+        with: {repository: magmalake/deflate.mojo, ref: aeb571e54ac736b97c826a23f44501715fddc656, path: deflate.mojo}
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          pixi-version: v0.78.0
+          environments: data
+          manifest-path: dista.mojo/pixi.toml
+      - name: Tasks over Parquet row groups
+        run: pixi run -e data test-parquet
 
   # The image builds the program with pixi itself, so this job needs only
   # docker, kubectl (both on the runner) and kind.
