@@ -1,0 +1,109 @@
+# bench/ray on a cluster: a Ray head that runs no tasks (like dista's head),
+# three single-CPU workers spread one per node (like dista's workers), and a
+# driver job that joins with no CPUs and runs taxi_ray.py. The warehouse is
+# mounted at the path the table was written at, since PyIceberg can't rebase
+# file locations. bench/ray/run_kind.sh fills in the @...@ values.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ray-head
+spec:
+  clusterIP: None
+  selector: {app: ray-taxi, role: head}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ray-head
+spec:
+  serviceName: ray-head
+  replicas: 1
+  selector:
+    matchLabels: {app: ray-taxi, role: head}
+  template:
+    metadata:
+      labels: {app: ray-taxi, role: head}
+    spec:
+      volumes:
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 2Gi}
+      containers:
+        - name: head
+          image: dista-ray:taxi
+          imagePullPolicy: IfNotPresent
+          command: [ray, start, --head, --port=6379, --num-cpus=0, --block, --disable-usage-stats, --include-dashboard=false]
+          env:
+            - {name: RAY_AUTH_MODE, value: disabled}
+          volumeMounts:
+            - {name: shm, mountPath: /dev/shm}
+          readinessProbe:
+            tcpSocket: {port: 6379}
+            periodSeconds: 2
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ray-worker
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: ray-taxi, role: worker}
+  template:
+    metadata:
+      labels: {app: ray-taxi, role: worker}
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {app: ray-taxi, role: worker}
+      volumes:
+        - name: warehouse
+          hostPath: {path: /data/wh, type: Directory}
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 2Gi}
+      containers:
+        - name: worker
+          image: dista-ray:taxi
+          imagePullPolicy: IfNotPresent
+          command: [sh, -c, "until ray start --address=ray-head:6379 --num-cpus=1 --block --disable-usage-stats; do sleep 1; done"]
+          env:
+            - {name: RAY_AUTH_MODE, value: disabled}
+            - {name: TAXI_THREADS, value: "@TAXI_THREADS@"}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          volumeMounts:
+            - {name: warehouse, mountPath: "@WAREHOUSE@", readOnly: true}
+            - {name: shm, mountPath: /dev/shm}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ray-taxi
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {app: ray-taxi, role: driver}
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: warehouse
+          hostPath: {path: /data/wh, type: Directory}
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 2Gi}
+      containers:
+        - name: driver
+          image: dista-ray:taxi
+          imagePullPolicy: IfNotPresent
+          command: [sh, -c, "until ray start --address=ray-head:6379 --num-cpus=0 --disable-usage-stats; do sleep 1; done && python /app/taxi_ray.py"]
+          env:
+            - {name: RAY_AUTH_MODE, value: disabled}
+            - {name: RAY_ADDRESS, value: auto}
+            - {name: DISTA_EXPECT_NODES, value: "3"}
+            - {name: TAXI_METADATA, value: "@TAXI_METADATA@"}
+            - {name: TAXI_THREADS, value: "@TAXI_THREADS@"}
+          volumeMounts:
+            - {name: warehouse, mountPath: "@WAREHOUSE@", readOnly: true}
+            - {name: shm, mountPath: /dev/shm}
