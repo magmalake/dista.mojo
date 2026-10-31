@@ -7,15 +7,13 @@ export KUBECONFIG=$state/kubeconfig
 account=$(aws sts get-caller-identity --query Account --output text)
 bucket=${BENCH_BUCKET:-dista-bench-$account-$AWS_REGION}
 
-# The pods read S3 with the static AWS_* variables every reader understands;
-# `aws login` credentials are temporary, so the Secret is refreshed per run.
+# The pods take S3 credentials from the node's IAM role (aws.sh's
+# dista-bench-node), so the `aws` Secret only names the Region. It used to
+# carry this machine's `aws login` credentials, which last 15 minutes: less
+# than a load or a run.
 aws_secret() {
-  aws configure export-credentials --format env-no-export \
-    | grep -E '^AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN)=' > "$state/aws.env"
-  echo "AWS_REGION=$AWS_REGION" >> "$state/aws.env"
-  kubectl create secret generic aws --from-env-file="$state/aws.env" \
+  kubectl create secret generic aws --from-literal="AWS_REGION=$AWS_REGION" \
     --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-  rm -f "$state/aws.env"
 }
 
 # Waits for job/$1 to finish and says whether it succeeded.

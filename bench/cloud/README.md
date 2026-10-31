@@ -73,10 +73,12 @@ bench/cloud/aws.sh down              # terminate everything but the bucket
 example, `NODES=3 FRAMEWORKS=dista PASSES=1 bench/cloud/run.sh` is a smoke
 test. `data.sh drop` deletes the bucket.
 
-The pods read S3 with the static `AWS_*` variables. run.sh copies this
-machine's current credentials into a Kubernetes Secret before each run, and
-`aws login` credentials last 12 hours. Instances have no IAM role:
-objectstore.mojo doesn't read instance credentials yet.
+The nodes read and write S3 with an IAM role, `dista-bench-node`, which
+aws.sh creates. It's allowed the benchmark bucket and nothing else. Each
+reader takes the role's credentials from the instance metadata service, as
+in a real deployment, so no keys are copied to the cluster. Containers reach
+the service because the instances allow two network hops to it. dista needs
+an objectstore.mojo with instance-role credentials for this.
 
 ## Reproducing a published run
 

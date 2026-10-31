@@ -39,6 +39,32 @@ head_ip() { instances | awk '$4=="head" {print $3}'; }
 
 head_ssh() { ssh "${ssh_opts[@]}" "ubuntu@$(head_ip)" "$@"; }
 
+# The nodes' IAM role: read and write the benchmark bucket, nothing else.
+# Every reader takes its credentials from the instance, as a real deployment
+# would, so no keys are copied anywhere.
+role() {
+  local account bucket
+  account=$(aws sts get-caller-identity --query Account --output text)
+  bucket=${BENCH_BUCKET:-$tag-$account-$AWS_REGION}
+  if ! aws iam get-role --role-name "$tag-node" >/dev/null 2>&1; then
+    aws iam create-role --role-name "$tag-node" --assume-role-policy-document \
+      '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}' >/dev/null
+  fi
+  aws iam put-role-policy --role-name "$tag-node" --policy-name bucket --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [
+      {\"Effect\": \"Allow\", \"Action\": [\"s3:ListBucket\", \"s3:GetBucketLocation\"],
+       \"Resource\": \"arn:aws:s3:::$bucket\"},
+      {\"Effect\": \"Allow\", \"Action\": [\"s3:GetObject\", \"s3:PutObject\", \"s3:DeleteObject\", \"s3:AbortMultipartUpload\"],
+       \"Resource\": \"arn:aws:s3:::$bucket/*\"}
+    ]}"
+  if ! aws iam get-instance-profile --instance-profile-name "$tag-node" >/dev/null 2>&1; then
+    aws iam create-instance-profile --instance-profile-name "$tag-node" >/dev/null
+    aws iam add-role-to-instance-profile --instance-profile-name "$tag-node" --role-name "$tag-node"
+    sleep 10  # a new profile takes a moment before EC2 accepts it
+  fi
+}
+
 network() {
   if ! aws ec2 describe-key-pairs --key-names "$tag" >/dev/null 2>&1; then
     aws ec2 create-key-pair --key-name "$tag" --key-type ed25519 \
@@ -77,13 +103,15 @@ launch() {  # role count user-data-file
     --key-name "$tag" --security-group-ids "$sg" --subnet-id "$subnet" \
     --instance-initiated-shutdown-behavior terminate ${market[@]+"${market[@]}"} \
     --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$([ "$1" = head ] && echo 200 || echo 40),VolumeType=gp3,DeleteOnTermination=true}" \
-    --metadata-options HttpTokens=required \
+    --iam-instance-profile "Name=$tag-node" \
+    --metadata-options HttpTokens=required,HttpPutResponseHopLimit=2 \
     --tag-specifications "ResourceType=instance,Tags=[{Key=$tag,Value=$1},{Key=Name,Value=$tag-$1}]" \
     --user-data "file://$3" --query 'Instances[].InstanceId' --output text
 }
 
 up() {
   local want=${1:?how many workers}
+  role
   network
   [ -f "$state/token" ] || openssl rand -hex 24 > "$state/token"
   local token
