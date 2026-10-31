@@ -284,24 +284,28 @@ def test_chain_of_large_results_across_workers() raises:
     assert_equal(rt.get(r).byte_length(), 110_000)
 
 
+def _pass_100mb_through_the_node_store() raises -> String:
+    """Runs the 100 MB exchange and returns the store file's path."""
+    var rt = Runtime[Blob, Length](workers=2)
+    var big = rt.remote[Blob](100_000_000)
+    var place = rt.location(big)
+    var parts = place.split(" ")
+    assert_equal(len(parts), 2, "expected a node-store file: " + place)
+    var path = String(parts[1])
+    assert_true(exists(path))
+    # Another worker takes it as input, and the driver reads it, both by
+    # mapping the file.
+    assert_equal(rt.get(rt.remote[Length](big)), 100_000_000)
+    assert_equal(rt.get(big).byte_length(), 100_000_000)
+    assert_equal(rt.bytes_fetched(), 0)
+    return path^
+
+
 def test_node_store_passes_100mb_without_sockets() raises:
     """The PR-5 gate: a 100 MB result crosses processes through shared memory.
     """
-    var path = String()
-    if True:
-        var rt = Runtime[Blob, Length](workers=2)
-        var big = rt.remote[Blob](100_000_000)
-        var place = rt.location(big)
-        var parts = place.split(" ")
-        assert_equal(len(parts), 2, "expected a node-store file: " + place)
-        path = String(parts[1])
-        assert_true(exists(path))
-        # Another worker takes it as input, and the driver reads it, both by
-        # mapping the file.
-        assert_equal(rt.get(rt.remote[Length](big)), 100_000_000)
-        assert_equal(rt.get(big).byte_length(), 100_000_000)
-        assert_equal(rt.bytes_fetched(), 0)
-    # The workers removed their files when they exited.
+    var path = _pass_100mb_through_the_node_store()
+    # The runtime has ended, and its workers removed their files as they exited.
     assert_false(exists(path), "node-store file outlived its worker")
 
 

@@ -2,14 +2,16 @@
 
 A worker writes each large result into a file in a node-local directory
 (`/dev/shm` on Linux, `$TMPDIR` on macOS, or `DISTA_STORE_DIR`) through
-memory-region's `MappedRegion`. A reader on the same host maps that file
+memory-region's `MappedRegion`. A reader that can see that file maps it
 read-only and reads the bytes where they lie: no socket, no copy through
-the kernel's network stack. A reader on another host fetches the result over
-a socket from the worker, as before.
+the kernel's network stack. A reader that can't fetches the result over a
+socket from the worker, as before.
 
-"Same host" means the same host name: processes that share a host name share
-a `/dev/shm`. In Kubernetes each pod has its own host name and its own
-`/dev/shm`, so pods fall back to sockets unless they share a volume.
+"Can see the file" is the test, not a matching host name: file names carry a
+random token per worker, so a file with the right name is the right file.
+That covers one machine, and Kubernetes pods that share a volume. (Host
+names turned out to be unreliable: on GitHub's macOS runners, processes on
+one machine reported different ones.)
 
 `DISTA_SHM=0` turns the store off; large results then stay in the worker's
 memory and are always fetched over sockets.
@@ -23,6 +25,7 @@ from std.ffi import c_int, c_size_t, external_call
 from std.memory import stack_allocation, unsafe_memcpy
 from std.os import getenv
 from std.sys.info import CompilationTarget
+from std.time import perf_counter_ns
 
 from memory_region import MappedRegion, SharedMapping
 
@@ -52,6 +55,19 @@ def node_name() -> String:
             unsafe_ptr=buf.unsafe_bitcast[UInt8](), length=n
         )
     )
+
+
+def worker_token() -> UInt64:
+    """A number naming one worker's files, so that no two workers, on this
+    host or another, write the same file name: a hash of the host name, the
+    process ID and a nanosecond clock."""
+    var pid = external_call["getpid", c_int]()
+    var seed = String(node_name(), "/", Int(pid), "/", Int(perf_counter_ns()))
+    var h: UInt64 = 0xCBF29CE484222325
+    for b in seed.as_bytes():
+        h ^= UInt64(b)
+        h *= 0x100000001B3
+    return h
 
 
 def _exists(path: String) -> Bool:
@@ -124,9 +140,9 @@ struct Location(Copyable, Movable):
         self.path = path^
         self.size = size
 
-    def is_local(self, node: String) -> Bool:
-        """Whether a process on `node` can map it instead of fetching it."""
-        return self.path != "" and self.node == node
+    def is_local(self) -> Bool:
+        """Whether this process can map it instead of fetching it."""
+        return self.path != "" and _exists(self.path)
 
     def encode(self) -> List[UInt8]:
         var out = encode_addr(self.ip, self.port)

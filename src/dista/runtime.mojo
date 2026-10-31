@@ -59,7 +59,7 @@ from dista.socket import (
     wait_child,
 )
 from dista.task import TaskLike, fnv1a64
-from dista.store import Location, node_name
+from dista.store import Location
 from dista.worker import Worker, addr_key
 from memory_region import SharedMapping
 
@@ -99,7 +99,6 @@ struct Runtime[*Ts: TaskLike](Movable):
     var _located: Dict[UInt64, List[UInt8]]
     """Results that stayed on a worker: object ID to that worker's address."""
     var _fetchers: List[Stream]
-    var _node: String
     var _socket_bytes: Int
     var _fetcher_index: Dict[String, Int]
 
@@ -176,7 +175,6 @@ struct Runtime[*Ts: TaskLike](Movable):
         self._errors = Dict[UInt64, String]()
         self._located = Dict[UInt64, List[UInt8]]()
         self._fetchers = List[Stream]()
-        self._node = node_name()
         self._socket_bytes = 0
         self._fetcher_index = Dict[String, Int]()
 
@@ -348,8 +346,8 @@ struct Runtime[*Ts: TaskLike](Movable):
         var pos = 0
         if r.id not in self._results:
             var loc = self._where(r.id)
-            if loc.is_local(self._node):
-                # Same host: decode straight from the node store's mapping.
+            if loc.is_local():
+                # The file is visible here: decode straight from the mapping.
                 var m = SharedMapping(loc.path)
                 if loc.size > m.size():
                     raise Error("shared object ", loc.path, " is truncated")

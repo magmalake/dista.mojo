@@ -35,6 +35,7 @@ from dista.frame import (
 from dista.store import (
     Location,
     node_name,
+    worker_token,
     read_shared,
     remove_file,
     store_dir,
@@ -134,6 +135,8 @@ struct Worker[dispatch: DispatchFn](Movable):
     """The node store's directory, or "" when results stay in memory."""
     var _files: Dict[UInt64, Location]
     """Results this worker wrote into the node store."""
+    var _token: UInt64
+    """Names this worker's node-store files: `dista-<token>-<object>`."""
 
     def __init__(out self, var head: Stream, registry_hash: UInt64) raises:
         """Starts the object server and says hello to the head on `head`."""
@@ -160,6 +163,7 @@ struct Worker[dispatch: DispatchFn](Movable):
         self._node = node_name()
         self._dir = store_dir()
         self._files = Dict[UInt64, Location]()
+        self._token = worker_token()
 
     def __deinit__(deinit self):
         # Results in the node store are files: remove them with the worker.
@@ -262,7 +266,7 @@ struct Worker[dispatch: DispatchFn](Movable):
                     pos += len
                 else:
                     var loc = Location.decode(f.payload, pos)
-                    if loc.is_local(self._node) and obj not in self._objects:
+                    if loc.is_local() and obj not in self._objects:
                         try:
                             self._objects[obj] = read_shared(loc.path, loc.size)
                         except e:
@@ -381,7 +385,7 @@ struct Worker[dispatch: DispatchFn](Movable):
             var path = String()
             if self._dir != "":
                 path = String(
-                    self._dir, "/dista-", self._port, "-", t.object_id
+                    self._dir, "/dista-", hex(self._token), "-", t.object_id
                 )
                 try:
                     write_shared(path, out)
