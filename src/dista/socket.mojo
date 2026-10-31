@@ -213,6 +213,53 @@ struct Stream(Movable):
             _fail(String("connect to ", host, ":", port))
         return Stream(fd)
 
+    @staticmethod
+    def connect(ip: Array[UInt8, 4], port: Int) raises -> Stream:
+        """Connects to `ip`:`port`."""
+        var fd = _new_socket()
+        var addr = _sockaddr(ip, port)
+        if (
+            external_call["connect", c_int](
+                fd,
+                addr.unsafe_ptr().unsafe_bitcast[NoneType](),
+                c_uint(SOCKADDR_IN_SIZE),
+            )
+            != 0
+        ):
+            _ = external_call["close", c_int](fd)
+            _fail(
+                String(
+                    "connect to ",
+                    Int(ip[0]),
+                    ".",
+                    Int(ip[1]),
+                    ".",
+                    Int(ip[2]),
+                    ".",
+                    Int(ip[3]),
+                    ":",
+                    port,
+                )
+            )
+        return Stream(fd)
+
+    def local_ip(self) raises -> Array[UInt8, 4]:
+        """The local IPv4 address this connection goes out from."""
+        var addr = Array[UInt8, SOCKADDR_IN_SIZE](fill=0)
+        var len = stack_allocation[1, c_uint]()
+        len[] = c_uint(SOCKADDR_IN_SIZE)
+        if (
+            external_call["getsockname", c_int](
+                self.fd, addr.unsafe_ptr().unsafe_bitcast[NoneType](), len
+            )
+            != 0
+        ):
+            _fail("getsockname")
+        var ip = Array[UInt8, 4](fill=0)
+        for i in range(4):
+            ip[i] = addr[4 + i]
+        return ip^
+
     def write_all(self, data: Span[UInt8, _]) raises:
         """Writes every byte of `data`."""
         var sent = 0

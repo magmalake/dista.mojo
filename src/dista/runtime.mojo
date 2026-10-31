@@ -23,7 +23,10 @@ unchanged. The registry is the runtime's parameter list: workers dispatch
 with a `comptime for` over it, and every process's hello carries a hash of it
 so the head refuses a mismatched build.
 
-A driver sends tasks to the head and reads results back. A task can take
+A driver sends tasks to the head and reads results back. Small results come
+with the reply; a large one stays on the worker that computed it. On the same
+host `get` maps it from the node store and decodes it in place; from another
+host it fetches it from that worker directly. A task can take
 another task's result: pass an `ObjectRef[A]` instead of an `A`, or a
 `List[ObjectRef[X]]` to a task that takes a `Seq[X]`. The head runs it once
 every input exists, and fails it if an input failed.
@@ -34,7 +37,9 @@ from std.os import getenv
 from dista.codec import decode, encode, get_scalar, put_scalar
 from dista.frame import (
     KIND_ERROR,
+    KIND_FETCH,
     KIND_HELLO,
+    KIND_LOCATED,
     KIND_RESULT,
     KIND_TASK,
     KIND_TASK_AFTER,
@@ -54,6 +59,9 @@ from dista.socket import (
     wait_child,
 )
 from dista.task import TaskLike, fnv1a64
+from dista.store import Location
+from dista.worker import Worker, addr_key
+from memory_region import SharedMapping
 
 comptime DEFAULT_PORT = 6390
 
@@ -88,6 +96,11 @@ struct Runtime[*Ts: TaskLike](Movable):
     var _pids: List[Int]
     var _results: Dict[UInt64, List[UInt8]]
     var _errors: Dict[UInt64, String]
+    var _located: Dict[UInt64, List[UInt8]]
+    """Results that stayed on a worker: object ID to that worker's address."""
+    var _fetchers: List[Stream]
+    var _socket_bytes: Int
+    var _fetcher_index: Dict[String, Int]
 
     def __init__(out self, workers: Int = 4, pipeline: Int = 2) raises:
         """Starts this process in the role its environment names.
@@ -109,7 +122,7 @@ struct Runtime[*Ts: TaskLike](Movable):
             exit_now(0)
         if role == "worker":
             var hp = parse_host_port(getenv("DISTA_HEAD"))
-            Self._serve(Stream.connect(hp[0], hp[1]))
+            Self._work(Stream.connect(hp[0], hp[1]))
             exit_now(0)
         if role != "":
             raise Error("DISTA_ROLE must be head or worker, got ", role)
@@ -147,7 +160,7 @@ struct Runtime[*Ts: TaskLike](Movable):
                 if pid == 0:
                     var code = 0
                     try:
-                        Self._serve(Stream.connect(port))
+                        Self._work(Stream.connect(port))
                     except e:
                         print("dista worker:", e)
                         code = 1
@@ -160,6 +173,10 @@ struct Runtime[*Ts: TaskLike](Movable):
         self._counter = 0
         self._results = Dict[UInt64, List[UInt8]]()
         self._errors = Dict[UInt64, String]()
+        self._located = Dict[UInt64, List[UInt8]]()
+        self._fetchers = List[Stream]()
+        self._socket_bytes = 0
+        self._fetcher_index = Dict[String, Int]()
 
     def __deinit__(deinit self):
         # In local mode the head exits once its only driver leaves, and closes
@@ -226,30 +243,16 @@ struct Runtime[*Ts: TaskLike](Movable):
         raise Error("unknown task ID ", task_id)
 
     @staticmethod
-    def _serve(var s: Stream) raises:
-        """A worker's loop: run tasks until the head hangs up."""
-        write_frame(s, KIND_HELLO, 0, 0, Self._hello_payload(ROLE_WORKER))
-        while True:
-            var f = read_frame(s)
-            if not f:
-                return
-            ref frame = f.value()
-            if frame.kind == KIND_ERROR:
-                raise Error(
-                    "the head refused this worker: ",
-                    String(unsafe_from_utf8=frame.payload),
-                )
-            if frame.kind != KIND_TASK:
-                raise Error("worker got frame kind ", Int(frame.kind))
-            var out = List[UInt8]()
-            try:
-                Self._dispatch(frame.task_id, frame.payload, out)
-            except e:
-                write_frame(
-                    s, KIND_ERROR, frame.object_id, 0, String(e).as_bytes()
-                )
-                continue
-            write_frame(s, KIND_RESULT, frame.object_id, 0, out)
+    def _dispatch_list(
+        task_id: UInt64, args: List[UInt8], mut out: List[UInt8]
+    ) raises:
+        Self._dispatch(task_id, args, out)
+
+    @staticmethod
+    def _work(var head: Stream) raises:
+        """A worker: run tasks and serve results until the head hangs up."""
+        var w = Worker[Self._dispatch_list](head^, Self._registry_hash())
+        w.run()
 
     @staticmethod
     def _check_registered[T: TaskLike]() raises:
@@ -308,7 +311,7 @@ struct Runtime[*Ts: TaskLike](Movable):
         return ObjectRef[R](id)
 
     def _settled(self, id: UInt64) -> Bool:
-        return id in self._results or id in self._errors
+        return id in self._results or id in self._errors or id in self._located
 
     def _read_one(mut self) raises:
         var f = read_frame(self._head)
@@ -317,6 +320,8 @@ struct Runtime[*Ts: TaskLike](Movable):
         ref frame = f.value()
         if frame.kind == KIND_RESULT:
             self._results[frame.object_id] = frame.payload.copy()
+        elif frame.kind == KIND_LOCATED:
+            self._located[frame.object_id] = frame.payload.copy()
         elif frame.kind == KIND_ERROR:
             self._errors[frame.object_id] = String(
                 unsafe_from_utf8=frame.payload
@@ -339,4 +344,54 @@ struct Runtime[*Ts: TaskLike](Movable):
         if r.id in self._errors:
             raise Error(self._errors[r.id])
         var pos = 0
+        if r.id not in self._results:
+            var loc = self._where(r.id)
+            if loc.is_local():
+                # The file is visible here: decode straight from the mapping.
+                var m = SharedMapping(loc.path)
+                if loc.size > m.size():
+                    raise Error("shared object ", loc.path, " is truncated")
+                return decode[R](m.bytes()[: loc.size], pos)
+            self._fetch(r.id, loc)
         return decode[R](self._results[r.id], pos)
+
+    def bytes_fetched(self) -> Int:
+        """How many result bytes this driver has fetched over sockets."""
+        return self._socket_bytes
+
+    def _where(self, id: UInt64) raises -> Location:
+        var pos = 0
+        return Location.decode(self._located[id], pos)
+
+    def location[R: AnyType](mut self, r: ObjectRef[R]) raises -> String:
+        """Where `r`'s result lives: a worker's `ip:port`, then its node-store
+        file if it has one; "" if it came back with the reply. Waits for the
+        task to finish.
+        """
+        while not self._settled(r.id):
+            self._read_one()
+        if r.id not in self._located:
+            return String()
+        var loc = self._where(r.id)
+        var place = addr_key(loc.ip, loc.port)
+        if loc.path != "":
+            place += " " + loc.path
+        return place
+
+    def _fetch(mut self, id: UInt64, loc: Location) raises:
+        """Copies a result from the worker holding it, over a socket."""
+        var key = addr_key(loc.ip, loc.port)
+        if key not in self._fetcher_index:
+            self._fetchers.append(Stream.connect(loc.ip, loc.port))
+            self._fetcher_index[key] = len(self._fetchers) - 1
+        var i = self._fetcher_index.get(key, -1)
+        write_frame(self._fetchers[i], KIND_FETCH, id, 0, List[UInt8]())
+        var f = read_frame(self._fetchers[i])
+        if not f:
+            raise Error("the worker holding object ", id, " hung up")
+        ref frame = f.value()
+        if frame.kind == KIND_RESULT:
+            self._socket_bytes += len(frame.payload)
+            self._results[id] = frame.payload.copy()
+        else:
+            raise Error(String(unsafe_from_utf8=frame.payload))
