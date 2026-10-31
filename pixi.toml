@@ -81,20 +81,32 @@ modular = ">=26.8.0.dev2026102305,<28"
 fmt = { cmd = "mojo format src tests bench examples deploy" }
 format-check = { cmd = "mojo format src tests bench examples deploy && git diff --exit-code -- src tests bench examples deploy" }
 
-# The data environment runs dista tasks over parquet.mojo. parquet.mojo and
-# its siblings compile from checkouts next to this one, as parquet.mojo's own
-# tests do, rather than as packages: parquet-mojo's published package pins an
-# older arrow-mlake, and two builds of one package can't share an
-# environment. CI lays the checkouts out at the revisions parquet-mojo 0.11.4
-# was published with.
+# The data environment runs dista tasks over parquet.mojo and iceberg.mojo.
+# Their Mojo sources compile from checkouts next to this one, as their own
+# tests do, rather than as packages: parquet-mojo and iceberg-mojo's published
+# packages pin an older arrow-mlake, and two builds of one package can't share
+# an environment. CI lays the checkouts out at the revisions iceberg-mojo
+# 0.8.2 was published with. The FFI tins are packages as well as checkouts:
+# the package is what installs the C shim each one links.
 [feature.data.dependencies]
 mojo-compiler = "==1.2.0"
+objectstore-mojo = { git = "https://github.com/magmalake/objectstore.mojo", rev = "4e409ca4d07f44c2fe7673f104af75b0bb69954c" }
+zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "53655623ca8585fd5b36b1239842913ec308ae69" }
+lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "64502eeeabed37515cd479bc421fc2920504cac5" }
+brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "aa6d14985baf82ad4b934f14136b95a291b55faf" }
+sqlite-mojo = { git = "https://github.com/magmalake/sqlite.mojo", rev = "53b819cd395b1b0afe8772dfbb43489da6ce939e" }
+postgres-mojo = { git = "https://github.com/magmalake/postgres.mojo", rev = "bfe9b94ae97e3e184dc6d118b0684818927a5da8" }
+libcurl = ">=8,<9"
+libsqlite = ">=3.45,<4"
+libpq = ">=16,<19"
 
 [feature.data.activation.env]
-DEP_INC = "-I ../memory-region.mojo/src -I ../arrow-mlake.mojo/src -I ../parquet.mojo/src -I ../threads.mojo/src -I ../threads.mojo/compat -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../deflate.mojo/src"
+DEP_INC = "-I ../memory-region.mojo/src -I ../arrow-mlake.mojo/src -I ../parquet.mojo/src -I ../parquet.mojo/full/src -I ../threads.mojo/src -I ../threads.mojo/compat -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../deflate.mojo/src -I ../avro.mojo/src -I ../roaring.mojo/src -I ../objectstore.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src -I ../sqlite.mojo -I ../postgres.mojo/src -I ../iceberg.mojo/src"
 
 [feature.data.tasks]
 test-parquet = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_parquet_tasks.mojo -o build/test-parquet && ./build/test-parquet" }
+test-iceberg = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_iceberg_scan.mojo -o build/test-iceberg && ./build/test-iceberg" }
+test-data = { depends-on = ["test-parquet", "test-iceberg"] }
 
 [environments]
 default = ["stable"]

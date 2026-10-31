@@ -38,8 +38,9 @@ What works today:
 - **Kubernetes:** one image for every role, and manifests for a head and workers, in [deploy/](deploy). CI runs a smoke test on a 3-node kind cluster.
 
 - **Parquet:** tasks can read row groups with parquet.mojo and hand them to other tasks as batches ([tests/test_parquet_tasks.mojo](tests/test_parquet_tasks.mojo)).
+- **Iceberg:** a scan planned by iceberg.mojo runs as one task per data file, deletes and filters included, and returns what a local scan returns ([tests/test_iceberg_scan.mojo](tests/test_iceberg_scan.mojo)).
 
-The Iceberg scan and actors come next.
+Actors come next.
 
 - [VISION.md](VISION.md): what dista is for, its principles and phases.
 - [DESIGN.md](DESIGN.md): how it works, and what's verified on Mojo 1.2.0.
@@ -47,7 +48,7 @@ The Iceberg scan and actors come next.
 ```
 pixi run test               # codec, frame, runtime and cluster tests, Mojo 1.2.0
 pixi run -e nightly test    # the same on the 1.3 nightly
-pixi run -e data test-parquet  # tasks over Parquet; needs parquet.mojo and its siblings checked out next door
+pixi run -e data test-data    # tasks over Parquet and Iceberg; needs those tins and their siblings checked out next door
 pixi run bench              # task throughput
 pixi run test-kind          # the smoke test on a kind cluster (needs docker, kind, kubectl)
 pixi run -e fmt fmt         # mojo format
