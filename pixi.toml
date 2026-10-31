@@ -9,7 +9,8 @@ platforms = ["osx-arm64", "linux-64"]
 
 [tasks]
 test-codec = { cmd = "mkdir -p build && mojo build -I src tests/test_codec.mojo -o build/test-codec && ./build/test-codec" }
-test = { depends-on = ["test-codec"] }
+test-frame = { cmd = "mkdir -p build && mojo build -I src tests/test_frame.mojo -o build/test-frame && ./build/test-frame" }
+test = { depends-on = ["test-codec", "test-frame"] }
 
 [package]
 name = "dista-mojo"
