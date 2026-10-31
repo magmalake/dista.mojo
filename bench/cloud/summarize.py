@@ -7,7 +7,7 @@ first pass included; Ray starts its worker processes in it), the median of
 the per-pass totals, and the slowest pass. The one-process times come from
 the check each run does once.
 
-Usage: summarize.py build/cloud/results
+Usage: summarize.py bench/cloud/results/<date>
 """
 
 import collections
@@ -105,4 +105,4 @@ def main(results):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else "build/cloud/results"))
+    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else "."))

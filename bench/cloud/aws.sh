@@ -37,7 +37,7 @@ instances() {  # id, private ip, public ip, role, for running instances
 
 head_ip() { instances | awk '$4=="head" {print $3}'; }
 
-head_ssh() { ssh "${ssh_opts[@]}" -A "ubuntu@$(head_ip)" "$@"; }
+head_ssh() { ssh "${ssh_opts[@]}" "ubuntu@$(head_ip)" "$@"; }
 
 network() {
   if ! aws ec2 describe-key-pairs --key-names "$tag" >/dev/null 2>&1; then
@@ -75,7 +75,7 @@ launch() {  # role count user-data-file
     --query Parameter.Value --output text)
   aws ec2 run-instances --image-id "$ami" --instance-type "$type" --count "$2" \
     --key-name "$tag" --security-group-ids "$sg" --subnet-id "$subnet" \
-    --instance-initiated-shutdown-behavior terminate "${market[@]}" \
+    --instance-initiated-shutdown-behavior terminate ${market[@]+"${market[@]}"} \
     --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$([ "$1" = head ] && echo 200 || echo 40),VolumeType=gp3,DeleteOnTermination=true}" \
     --metadata-options HttpTokens=required \
     --tag-specifications "ResourceType=instance,Tags=[{Key=$tag,Value=$1},{Key=Name,Value=$tag-$1}]" \
@@ -121,6 +121,8 @@ EOF
 
   echo "waiting for the head's API"
   until head_ssh test -f /etc/rancher/k3s/k3s.yaml 2>/dev/null; do sleep 5; done
+  # The workers have no public SSH; the head reaches them with the same key.
+  head_ssh 'umask 077 && cat > .ssh/id_ed25519' < "$key"
   head_ssh cat /etc/rancher/k3s/k3s.yaml | sed "s/127.0.0.1/$(head_ip)/" > "$state/kubeconfig"
   export KUBECONFIG=$state/kubeconfig
   echo "waiting for $want workers to join"

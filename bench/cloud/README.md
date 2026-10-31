@@ -58,8 +58,7 @@ the dependency step, the compile step and the image size:
 The `dista-bench` AWS profile has to be signed in (`aws login --profile
 dista-bench`), with a vCPU quota for the instances: 13 × 16 = 208 vCPUs of
 "Running On-Demand Standard instances" in us-east-2 for the full matrix, or
-of spot instances with `SPOT=1`. The sibling checkouts next to this
-repository are what get built. iceberg.mojo needs `to_batches_for_tasks`.
+of spot instances with `SPOT=1`.
 
 ```sh
 bench/cloud/aws.sh up 0              # the head node alone: ~3 minutes
@@ -68,7 +67,6 @@ bench/cloud/aws.sh up 12             # add the workers
 bench/cloud/build.sh                 # timed builds, loaded into every node
 bench/cloud/run.sh                   # 3 x 3 runs, 5 passes each
 bench/cloud/aws.sh down              # terminate everything but the bucket
-python3 bench/cloud/summarize.py build/cloud/results
 ```
 
 `NODES`, `FRAMEWORKS`, `PASSES` and `SLOTS` narrow or change the matrix. For
@@ -79,6 +77,35 @@ The pods read S3 with the static `AWS_*` variables. run.sh copies this
 machine's current credentials into a Kubernetes Secret before each run, and
 `aws login` credentials last 12 hours. Instances have no IAM role:
 objectstore.mojo doesn't read instance credentials yet.
+
+## Reproducing a published run
+
+**What gets built is pinned.** build.sh builds dista.mojo at the commit
+that's checked out, and refuses to build one that's uncommitted or not
+pushed. Its siblings are built at the commits in [revs.txt](revs.txt): the
+Mojo libraries, and taxibench.example for Ray's queries. The head node
+clones them all fresh before any timing starts, so nothing from the machine
+running the scripts goes into an image. The Rust crates are pinned by
+`bench/rust/Cargo.lock`, Ray and PyIceberg by version in
+`bench/ray/Dockerfile`, and the Mojo toolchain by dista's `pixi.lock`. The
+base images are pinned by tag.
+
+**Every run is kept.** build.sh, data.sh and run.sh write into
+`bench/cloud/results/<UTC date>/`, or `$RESULTS`. That folder is committed
+with the post that uses it:
+
+| file | what |
+|---|---|
+| `revs.txt` | every repository and commit that was built |
+| `meta.txt` | date, Region, the nodes with their instance types, kubelet and kernel versions, the table's metadata location, passes, slots |
+| `load.log` | the table load, month by month, with row counts |
+| `build.tsv`, `build-*.log.gz` | the timed builds and their full BuildKit logs |
+| `<framework>-<nodes>.log` | each run's output, every `TIME` line included |
+| `summary.md` | the tables, from summarize.py |
+
+To check a published number, rebuild at that folder's `revs.txt` and run the
+same matrix. To rework the tables from the raw logs, run
+`python3 bench/cloud/summarize.py bench/cloud/results/<date>`.
 
 ## What it costs
 

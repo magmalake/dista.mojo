@@ -7,7 +7,7 @@
 # The load runs on the cluster's head node (bench/cloud/aws.sh up 0 is
 # enough), so the TLC downloads and the writes stay inside AWS. It ends by
 # writing the table's metadata location to build/cloud/metadata.txt, which
-# run.sh reads.
+# run.sh reads, and keeps the load's log in $RESULTS with the runs.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 . bench/cloud/common.sh
@@ -31,6 +31,8 @@ case "${1:-}" in
     kubectl logs -f job/load | tee "$state/load.log"
     wait_job load || { echo "FAIL: the load did not finish"; exit 1; }
     sed -n 's/^metadata: //p' "$state/load.log" > "$state/metadata.txt"
+    results=${RESULTS:-bench/cloud/results/$(date -u +%F)}
+    mkdir -p "$results" && cp "$state/load.log" "$results/load.log"
     echo "table: $(cat "$state/metadata.txt")"
     ;;
   drop)

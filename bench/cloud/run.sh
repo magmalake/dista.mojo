@@ -7,9 +7,12 @@
 #
 # SLOTS is how many single-threaded tasks each node runs at once: that many
 # dista workers, that many Rust workers, or one Ray worker with that many
-# CPUs. It defaults to the worker nodes' vCPUs. Each run's log goes to
-# build/cloud/results/<framework>-<nodes>.log, and summarize.py turns the
-# TIME lines into tables. Needs aws.sh up, build.sh and data.sh load first.
+# CPUs. It defaults to the worker nodes' vCPUs.
+#
+# Everything lands in $RESULTS (default bench/cloud/results/<UTC date>), which
+# is meant to be committed: each run's log as <framework>-<nodes>.log,
+# meta.txt with the cluster and the table, and summary.md, which summarize.py
+# makes from the TIME lines. Needs aws.sh up, build.sh and data.sh load first.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 . bench/cloud/common.sh
@@ -17,8 +20,16 @@ cd "$(dirname "$0")/../.."
 metadata=$(cat "$state/metadata.txt")
 passes=${PASSES:-5}
 slots=${SLOTS:-$(kubectl get nodes -l dista-bench/role=worker -o jsonpath='{.items[0].status.capacity.cpu}')}
-results=$state/results
+results=${RESULTS:-bench/cloud/results/$(date -u +%F)}
 mkdir -p "$results"
+{ echo "date: $(date -u +%FT%TZ)"
+  echo "region: $AWS_REGION"
+  echo "table: $metadata"
+  echo "passes: $passes"
+  echo "slots per node: $slots"
+  kubectl get nodes -L dista-bench/role,dista-bench/rank,node.kubernetes.io/instance-type \
+    -o custom-columns='NODE:.metadata.name,ROLE:.metadata.labels.dista-bench/role,RANK:.metadata.labels.dista-bench/rank,TYPE:.metadata.labels.node\.kubernetes\.io/instance-type,KUBELET:.status.nodeInfo.kubeletVersion,KERNEL:.status.nodeInfo.kernelVersion'
+} > "$results/meta.txt"
 
 for nodes in ${NODES:-3 6 12}; do
   for fw in ${FRAMEWORKS:-dista rust ray}; do
@@ -46,4 +57,4 @@ for nodes in ${NODES:-3 6 12}; do
     kubectl delete -f "$state/$fw.yaml" --wait >/dev/null
   done
 done
-python3 bench/cloud/summarize.py "$results"
+python3 bench/cloud/summarize.py "$results" | tee "$results/summary.md"
