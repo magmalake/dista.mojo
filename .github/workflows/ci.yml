@@ -90,7 +90,7 @@ jobs:
       - uses: actions/checkout@v4
         with: {repository: magmalake/roaring.mojo, ref: a90a7bd30cf1c21403a29059282072e93fbeeee2, path: roaring.mojo}
       - uses: actions/checkout@v4
-        with: {repository: magmalake/objectstore.mojo, ref: 349aa1d333bdc9c8e144f807739556bb3f3c094b, path: objectstore.mojo}
+        with: {repository: magmalake/objectstore.mojo, ref: 4308f3e887fa6e59859d80d8c34256eea7d495aa, path: objectstore.mojo}
       - uses: actions/checkout@v4
         with: {repository: magmalake/zstd.mojo, ref: 53655623ca8585fd5b36b1239842913ec308ae69, path: zstd.mojo}
       - uses: actions/checkout@v4

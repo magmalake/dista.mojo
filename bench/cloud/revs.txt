@@ -12,7 +12,7 @@ snappy.mojo https://github.com/magmalake/snappy.mojo.git b8172ed0a4ef13911cc225d
 deflate.mojo https://github.com/magmalake/deflate.mojo.git aeb571e54ac736b97c826a23f44501715fddc656
 avro.mojo https://github.com/magmalake/avro.mojo.git 479c9d390b5c12c2497e05f84b64bf690a8cfea3
 roaring.mojo https://github.com/magmalake/roaring.mojo.git a90a7bd30cf1c21403a29059282072e93fbeeee2
-objectstore.mojo https://github.com/magmalake/objectstore.mojo.git 349aa1d333bdc9c8e144f807739556bb3f3c094b
+objectstore.mojo https://github.com/magmalake/objectstore.mojo.git 4308f3e887fa6e59859d80d8c34256eea7d495aa
 zstd.mojo https://github.com/magmalake/zstd.mojo.git 53655623ca8585fd5b36b1239842913ec308ae69
 lz4.mojo https://github.com/magmalake/lz4.mojo.git 64502eeeabed37515cd479bc421fc2920504cac5
 brotli.mojo https://github.com/magmalake/brotli.mojo.git aa6d14985baf82ad4b934f14136b95a291b55faf
