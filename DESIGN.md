@@ -29,6 +29,7 @@ def main() raises:
 - **Why declare tasks instead of `remote[square](7)`.** Mojo 1.2 can't infer a function's result type from the function value, so `R` must be written somewhere. The declaration is that place. It's also Ray's shape: `@ray.remote` once, `.remote()` at each call. *Verified.*
 - **The function type is `def(A) thin -> R`.** A top-level `def` is a `thin` function; without `thin` the parameter doesn't bind. Argument and result types need `Movable & Deinitable` (1.2 makes destruction explicit for generic types). *Verified.*
 - **One argument per task in phase 1.** Several values travel as one struct, which the codec handles by reflection. `Task2`, `Task3` overloads can come later; they're mechanical.
+- **Results as arguments.** `rt.remote[T](ref)` takes an `ObjectRef[T.A]` in place of a `T.A`. `rt.remote[T](refs)` takes a `List[ObjectRef[X]]` when `T` takes a `Seq[X]`. Either way the task waits until every input exists. Its argument is then assembled from the inputs' encoded bytes, without decoding them. If an input failed, the task fails with that error and never runs.
 - **`ObjectRef[R]`** is a typed handle to a result that may not exist yet. `rt.get(ref)` blocks until it does and returns an `R`. Getting the same ref twice decodes it twice; phase 1 keeps every result until the runtime ends.
 - **Errors.** A task that raises sends its message back; `get` re-raises it in the driver, and the worker carries on. Raising and non-raising functions both bind to `def(A) thin raises -> R`, so one `Task` type covers both. *Verified.*
 
@@ -57,7 +58,7 @@ Every node runs the same binary, so every task already exists everywhere. A task
 - **Built-ins are recognised by `reflect[T].name()`**, because `Int` or `String` can't adopt a dista trait. Note `Int` reports as `SIMD[DType.int, 1]`. *Verified.*
 - **User types opt in with `comptime assert conforms_to(T, Codec)`**, which makes `T`'s methods callable inside that branch. *Verified.*
 - **Reflection decoding builds the struct field by field** into allocated storage, at `reflect[T].field_offset[index=i]()`, then takes it out. No `Defaultable` needed. *Verified:* a struct of `Int` plus a `Codec` type round-trips.
-- **Gap: `List[T]` and other generic containers.** Reflection can't recover a `List`'s element type, so phase 1 doesn't encode lists. Workarounds: a `Codec` wrapper type, or Arrow for anything large. Revisit if Mojo adds conditional conformance on `List`.
+- **`List[T]` isn't encodable; `Seq[T]` is.** Reflection can't recover a `List`'s element type, but `Seq[T]` carries `T` as a parameter and implements `Codec`: an 8-byte count, then each element. Use it for list-valued arguments and results, including as a struct field. Arrow is for anything large.
 - **No schema evolution.** Both ends are the same binary.
 
 ## Data plane: columnar results
@@ -80,37 +81,59 @@ Columnar data does **not** go through `Serializable`. The one columnar type is a
 
 ## Processes and transport
 
-### Phase 1: one machine
+### Roles and the head
 
-- **The driver is the head.** `Runtime(...)` binds a TCP listener on `127.0.0.1` with an OS-assigned port, then forks the workers. Forking before any thread exists is safe, and it means a worker has the registry without an exec.
-- **A worker** connects back, then loops: read a task frame, dispatch, write a result frame. It exits on end-of-file.
-- **Scheduling** is a FIFO queue. `remote` only enqueues. `get` pumps: hand queued tasks to idle workers, then read the result of the oldest in-flight task. Workers compute in parallel while the driver waits on one of them, because finished results wait in socket buffers. No `poll` and no threads in phase 1.
-- **Transport** is loopback TCP over libc (`socket`, `bind`, `connect`, `send`, `recv`) in `src/dista/socket.mojo`, with `TCP_NODELAY` set. dista has no dependencies. flare's TCP would work from source, but it brings flare's native shims and its threads and json dependencies for something a hundred lines of libc covers.
-- **Frames** are a 4-byte little-endian length, then a fixed 17-byte header and a payload:
+Since phase 2's PR 3, scheduling lives in one place: a head process. Every program is one binary, and `Runtime(...)` picks its role from the environment:
+
+| Environment | Role |
+|---|---|
+| `DISTA_ROLE=head` | runs the head on `DISTA_PORT` (default 6390; 0 lets the OS pick, and the head prints it) |
+| `DISTA_ROLE=worker` | serves the head at `DISTA_HEAD=host:port` |
+| `DISTA_HEAD=host:port` | a driver that submits to that head |
+| neither | local mode: fork a head and `workers` workers, then drive them over loopback |
+
+- **Local mode runs the cluster path.** The forked head is the same code a cluster runs, so every test exercises it. The extra hop costs about 1.4 µs per task.
+- **Hello and registry hash.** Every driver and worker opens with a hello carrying its role and a hash of its registry, the task names in order. The head refuses a mismatch, so a cluster can't mix builds. Drivers get a number, which fills the top 24 bits of every object ID they create. That tells the head which driver owns a result.
+- **The head's event loop** `poll`s the listener and every connection. Each connection is a `Conn`: reads and writes use `MSG_DONTWAIT`, input accumulates until frames are whole, and output queues until the socket takes it. A slow peer never blocks anyone else, so the phase-1 rule limiting pipelined argument size is gone.
+- **Why `MSG_DONTWAIT` rather than `O_NONBLOCK`:** `fcntl` is variadic, and Apple's arm64 ABI passes variadic arguments on the stack. `external_call` puts them in registers, so `F_SETFL` silently set nothing, and the head hung in its second `recv`. Any variadic libc call has the same trap.
+- **Scheduling:** tasks queue in arrival order. Tasks waiting on inputs are held aside until every input exists. Queued tasks go to workers round-robin, up to `pipeline` in flight each (default 2). Each result or error goes back to the driver that owns it.
+- **The head keeps every result**, because a later task may take it as input. PR 4 moves results onto the workers that made them.
+- **A worker that dies** fails the tasks it had in flight, with `worker lost while running this task`. The other workers carry on.
+- **Drivers and workers use blocking sockets.** Each has one peer, the head, and the head always drains its sockets.
+- **Transport** is IPv4 TCP over libc in `src/dista/socket.mojo`: `getaddrinfo` for host names, and `TCP_NODELAY`. dista has no dependencies. flare's TCP works from source, but it brings native shims and its threads and json dependencies for something a few hundred lines of libc covers.
+
+**Frames** are a 4-byte little-endian length, then a fixed 17-byte header and a payload:
 
 | Offset | Field |
 |---|---|
-| 0 | kind: 1 task, 2 result, 3 error |
+| 0 | kind |
 | 1 | object ID, u64 |
-| 9 | task ID, u64 (0 except on a task frame) |
-| 17 | payload: the encoded argument, the encoded result, or a UTF-8 error message |
+| 9 | task ID, u64 (0 unless the kind uses it) |
+| 17 | payload |
 
-- **Measured** on an M4 MacBook with 4 workers: start-up 2.4 ms, one task round trip about 0.05 ms once warm, and 1,000 tasks of `square` in 10.8 ms, about 11 µs each. That's well under the vision's 1 ms per-task target. The phase-1 gate test passes on both Mojo 1.2.0 and the 1.3 nightly.
+| Kind | Sent by | Payload |
+|---|---|---|
+| 1 task | driver to head, head to worker | the encoded argument |
+| 2 result | worker to head, head to driver | the encoded result |
+| 3 error | worker to head, head to driver | a UTF-8 message |
+| 4 hello | driver or worker to head | role byte, then the registry hash, u64 |
+| 5 welcome | head to driver | the driver's number, u64 |
+| 6 task-after | driver to head | gather byte, count u64, then that many object IDs |
 
-### Phase 2: a cluster
+**Measured** on an M4 MacBook, local mode with 4 workers (`pixi run bench`, 10,000 tasks of `square`): 10.2 µs per task with no pipelining, 5.3 µs at depth 2, 4.4 µs at depth 4. All tests pass on Mojo 1.2.0 and the 1.3 nightly. `tests/cluster.sh` runs a head, 4 workers and a driver as separate processes found by host name, and checks that a build with different tasks is refused.
 
-- **A separate head process** (a Kubernetes StatefulSet) owns membership, the task queue and the object directory. Workers (a Deployment) find it through `DISTA_HEAD=host:port`; the same binary acts as head, worker or driver depending on its environment.
-- **The scheduler moves onto an event loop** (`poll`, or flare's reactor) so the head serves many workers without blocking on one, and so tasks can be pipelined per worker.
+### Still to come in phase 2
+
 - **Ownership** follows Ray: the submitter owns a result and holds its location. The head knows where objects live but never holds their bytes.
 - **Locality:** a task goes to the node that holds the most bytes of its arguments, falling back to the least-loaded node.
 
 ## Concurrency
 
-Threads plus flare's reactor, not async. Mojo's async is unfinished: on the 1.3 nightly, `async`/`await` were renamed `__async`/`__await` (modular `b1bb00ad53`, October 2, 2026) to mark them unstable, while the compiler's coroutine lowering is being rebuilt. Task execution stays behind dista's own interface, so coroutines can replace threads later without changing the user API.
+A `poll` event loop, plus threads where work must overlap inside one process, not async. Mojo's async is unfinished: on the 1.3 nightly, `async`/`await` were renamed `__async`/`__await` (modular `b1bb00ad53`, October 2, 2026) to mark them unstable, while the compiler's coroutine lowering is being rebuilt. Task execution stays behind dista's own interface, so coroutines can replace threads later without changing the user API.
 
 ## Failure handling
 
-- **Phase 1:** a worker that dies closes its socket. `get` on any of its in-flight tasks raises. No retry.
+- **Now:** a worker that dies fails the tasks it had in flight; `get` raises `worker lost while running this task`. No retry.
 - **Phase 4:** lost objects are rebuilt by re-running the tasks that produced them (lineage), and actors restart from checkpoints or through restate.mojo.
 
 ## Testing
@@ -132,5 +155,33 @@ ThreadSanitizer fails on allocating threaded Mojo programs today, so the runtime
 | `src/dista/task.mojo` | `Task`, `TaskLike`, task IDs, `dispatch` |
 | `src/dista/frame.mojo` | frame encoding and decoding |
 | `src/dista/socket.mojo` | loopback TCP, `fork`, `waitpid`, `_exit` over libc |
-| `src/dista/runtime.mojo` | `Runtime`, `ObjectRef`, the worker loop |
+| `src/dista/runtime.mojo` | `Runtime`, `ObjectRef`, roles, the driver and worker loops |
+| `src/dista/head.mojo` | the head's event loop and scheduler (phase 2) |
+| `src/dista/conn.mojo` | non-blocking framed connections for the head (phase 2) |
+| `src/dista/seq.mojo` | `Seq[T]` (phase 2) |
 | `tests/` | codec, dispatch, and process tests |
+
+## Phase 2 plan
+
+Phase 2 takes dista from one machine to a cluster. Its gate, from the vision: a distributed Iceberg scan of the taxi data on a 3-node cluster returns the same answer as one machine. It lands as stacked PRs of at most about 2,000 lines, each with its own gate, in two tracks that can run in parallel.
+
+**Runtime track** (dista.mojo, in order):
+
+| # | PR | Gate | Size |
+|---|---|---|---|
+| 1 | **Event loop and pipelining.** `poll` over worker sockets, several tasks in flight per worker, results taken in any order. | A fast task's `get` returns while a slow task is still running. | ~400 |
+| 2 | **Object refs as arguments, and `Seq[T]`.** A task can take another task's `ObjectRef`; it runs once its input exists. `Seq[T]` carries a list through the codec, since `List` can't be reflected. | A map-reduce: 100 maps feed one reduce. | ~500 |
+| 3 | **A separate head, and roles.** One binary runs as head, worker or driver, chosen by environment. Workers and drivers reach the head over TCP by host name. A handshake checks that both sides share a registry. Local mode still forks everything. | Head, driver and 4 workers started as separate processes run the fan-out. | ~700 |
+| 4 | **Results stay on workers.** A result stays where it was computed; the head records where it is. A consumer fetches it straight from that worker. | Map outputs reach the reduce without passing through the head. | ~700 |
+| 5 | **A shared-memory store per node.** Workers on one node share results through memory-region instead of sockets. | Two workers on one node pass a 100 MB result without a socket copy. | ~600 |
+| 6 | **Kubernetes.** A container image, manifests (a head StatefulSet, a worker Deployment) and a smoke test on a kind cluster in CI. | The fan-out runs on a 3-node kind cluster. | ~400 |
+
+**Data track** (arrow-mlake.mojo, then dista.mojo):
+
+| # | PR | Gate | Size |
+|---|---|---|---|
+| 7 | **Arrow IPC in arrow-mlake.** Move the writer from flight.mojo, add a reader, and cover every `ArrayData` type, nested ones included. | pyarrow reads what it writes, and it reads what pyarrow writes. | ~1,500 |
+| 8 | **`RecordBatch` results in dista.** Columnar results travel as IPC, in the node store and between nodes. | A task returns a batch read by parquet.mojo, and another task consumes it. | ~500 |
+| 9 | **The Iceberg scan.** One task per data file, results gathered as Arrow. | Phase 2's gate. | ~400 |
+
+PR 7 changes a published tin, and needs your sign-off before it's merged.

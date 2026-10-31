@@ -21,14 +21,29 @@ def main() raises:
     print(total)  # 332833500
 ```
 
-**Status: phase 1.** Tasks run on forked worker processes on one machine, over loopback TCP. Arguments and results can be scalars, `String`, any plain struct of those, or a type that implements `Codec`. A task that raises re-raises in `get`. 1,000 small tasks across 4 workers take about 11 ms. Multi-machine clusters, Arrow results and actors come in later phases.
+**Status: phase 2 in progress.** One binary runs as driver, head or worker, chosen by environment. Run it on its own and it forks a head and workers on one machine; point it at a head and it joins a cluster:
+
+```
+DISTA_ROLE=head DISTA_PORT=6390 ./app                  # the head
+DISTA_ROLE=worker DISTA_HEAD=headhost:6390 ./app       # once per worker
+DISTA_HEAD=headhost:6390 ./app                         # the driver
+```
+
+What works today:
+- **Arguments and results:** scalars, `String`, plain structs of those, `Seq[T]` lists, and types that implement `Codec`.
+- **Results feeding tasks:** a task can take another task's `ObjectRef`, or gather a list of them into a `Seq`, as in [examples/mapreduce.mojo](examples/mapreduce.mojo).
+- **Errors:** a task that raises re-raises in `get`, and a worker that dies fails only its own tasks.
+- **Speed:** small tasks cost about 5 µs each.
+
+Results kept on the workers that made them, a shared-memory store, Kubernetes, Arrow results and actors come next.
 
 - [VISION.md](VISION.md): what dista is for, its principles and phases.
 - [DESIGN.md](DESIGN.md): how it works, and what's verified on Mojo 1.2.0.
 
 ```
-pixi run test               # codec and runtime tests, Mojo 1.2.0
+pixi run test               # codec, frame, runtime and cluster tests, Mojo 1.2.0
 pixi run -e nightly test    # the same on the 1.3 nightly
+pixi run bench              # task throughput
 pixi run -e fmt fmt         # mojo format
 ```
 

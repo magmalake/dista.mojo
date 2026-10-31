@@ -11,7 +11,9 @@ platforms = ["osx-arm64", "linux-64"]
 test-codec = { cmd = "mkdir -p build && mojo build -I src tests/test_codec.mojo -o build/test-codec && ./build/test-codec" }
 test-frame = { cmd = "mkdir -p build && mojo build -I src tests/test_frame.mojo -o build/test-frame && ./build/test-frame" }
 test-runtime = { cmd = "mkdir -p build && mojo build -I src tests/test_runtime.mojo -o build/test-runtime && ./build/test-runtime" }
-test = { depends-on = ["test-codec", "test-frame", "test-runtime"] }
+test-cluster = { cmd = "tests/cluster.sh" }
+test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-cluster"] }
+bench = { cmd = "mkdir -p build && mojo build -I src bench/fanout.mojo -o build/bench-fanout && ./build/bench-fanout" }
 
 [package]
 name = "dista-mojo"
@@ -49,8 +51,8 @@ modular = ">=26.8.0.dev2026102305,<28"
 modular = ">=26.8.0.dev2026102305,<28"
 
 [feature.fmt.tasks]
-fmt = { cmd = "mojo format src tests" }
-format-check = { cmd = "mojo format src tests && git diff --exit-code -- src tests" }
+fmt = { cmd = "mojo format src tests bench examples" }
+format-check = { cmd = "mojo format src tests bench examples && git diff --exit-code -- src tests bench examples" }
 
 [environments]
 default = ["stable"]
