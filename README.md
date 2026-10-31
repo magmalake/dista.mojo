@@ -35,8 +35,9 @@ What works today:
 - **Errors:** a task that raises re-raises in `get`, and a worker that dies fails only its own tasks.
 - **Large results stay on the worker that made them.** On the same host other processes map them from shared memory; across hosts they fetch them directly from that worker. Small ones come back through the head.
 - **Speed:** small tasks cost about 6 µs each.
+- **Kubernetes:** one image for every role, and manifests for a head and workers, in [deploy/](deploy). CI runs a smoke test on a 3-node kind cluster.
 
-Kubernetes, Arrow results and actors come next.
+Arrow results and actors come next.
 
 - [VISION.md](VISION.md): what dista is for, its principles and phases.
 - [DESIGN.md](DESIGN.md): how it works, and what's verified on Mojo 1.2.0.
@@ -45,6 +46,7 @@ Kubernetes, Arrow results and actors come next.
 pixi run test               # codec, frame, runtime and cluster tests, Mojo 1.2.0
 pixi run -e nightly test    # the same on the 1.3 nightly
 pixi run bench              # task throughput
+pixi run test-kind          # the smoke test on a kind cluster (needs docker, kind, kubectl)
 pixi run -e fmt fmt         # mojo format
 ```
 

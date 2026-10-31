@@ -5,13 +5,16 @@ name = "dista.mojo"
 version = "0.0.1"
 description = "Distributed tasks for Mojo: mark a function remote, call it, and the work runs across a cluster."
 preview = ["pixi-build"]
-platforms = ["osx-arm64", "linux-64"]
+# linux-aarch64 lets the container image build natively on ARM hosts, such as
+# Docker on Apple silicon.
+platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 
 [tasks]
 test-codec = { cmd = "mkdir -p build && mojo build -I src -I $MR_INC tests/test_codec.mojo -o build/test-codec && ./build/test-codec" }
 test-frame = { cmd = "mkdir -p build && mojo build -I src -I $MR_INC tests/test_frame.mojo -o build/test-frame && ./build/test-frame" }
 test-runtime = { cmd = "mkdir -p build && mojo build -I src -I $MR_INC tests/test_runtime.mojo -o build/test-runtime && ./build/test-runtime" }
 test-cluster = { cmd = "tests/cluster.sh" }
+test-kind = { cmd = "tests/kind.sh" }
 test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-cluster"] }
 bench = { cmd = "mkdir -p build && mojo build -I src -I $MR_INC bench/fanout.mojo -o build/bench-fanout && ./build/bench-fanout" }
 
@@ -67,8 +70,8 @@ modular = ">=26.8.0.dev2026102305,<28"
 modular = ">=26.8.0.dev2026102305,<28"
 
 [feature.fmt.tasks]
-fmt = { cmd = "mojo format src tests bench examples" }
-format-check = { cmd = "mojo format src tests bench examples && git diff --exit-code -- src tests bench examples" }
+fmt = { cmd = "mojo format src tests bench examples deploy" }
+format-check = { cmd = "mojo format src tests bench examples deploy && git diff --exit-code -- src tests bench examples deploy" }
 
 [environments]
 default = ["stable"]

@@ -1,0 +1,76 @@
+# A dista cluster: one head and a set of workers, all running the same image.
+# Drivers reach the head at dista-head:6390 (see driver-job.yaml).
+#
+# Every pod runs the same binary; DISTA_ROLE picks its part. A head and its
+# workers must be built from the same program, or the head refuses them.
+apiVersion: v1
+kind: Service
+metadata:
+  name: dista-head
+  labels: {app: dista, role: head}
+spec:
+  clusterIP: None
+  selector: {app: dista, role: head}
+  ports:
+    - name: dista
+      port: 6390
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dista-head
+  labels: {app: dista, role: head}
+spec:
+  serviceName: dista-head
+  replicas: 1
+  selector:
+    matchLabels: {app: dista, role: head}
+  template:
+    metadata:
+      labels: {app: dista, role: head}
+    spec:
+      containers:
+        - name: head
+          image: dista:smoke
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: DISTA_ROLE, value: head}
+            - {name: DISTA_PORT, value: "6390"}
+          ports:
+            - {name: dista, containerPort: 6390}
+          readinessProbe:
+            tcpSocket: {port: 6390}
+            periodSeconds: 2
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dista-worker
+  labels: {app: dista, role: worker}
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: dista, role: worker}
+  template:
+    metadata:
+      labels: {app: dista, role: worker}
+    spec:
+      # One worker per node: the smoke test checks that tasks reach them all.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {app: dista, role: worker}
+      containers:
+        - name: worker
+          image: dista:smoke
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: DISTA_ROLE, value: worker}
+            - {name: DISTA_HEAD, value: "dista-head:6390"}
+            # Peers and drivers fetch large results from this address.
+            - name: DISTA_ADVERTISE
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
