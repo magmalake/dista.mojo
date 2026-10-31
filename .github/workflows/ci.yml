@@ -47,6 +47,18 @@ jobs:
       - name: Tests
         run: pixi run -e ${{ matrix.env }} test
 
+  # The image builds the program with pixi itself, so this job needs only
+  # docker, kubectl (both on the runner) and kind.
+  kind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: helm/kind-action@v1.15.1
+        with:
+          install_only: true
+      - name: Smoke test on a 3-node kind cluster
+        run: tests/kind.sh
+
   format:
     runs-on: ubuntu-latest
     steps:

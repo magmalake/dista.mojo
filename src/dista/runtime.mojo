@@ -33,6 +33,7 @@ every input exists, and fails it if an input failed.
 """
 
 from std.os import getenv
+from std.time import perf_counter_ns, sleep
 
 from dista.codec import decode, encode, get_scalar, put_scalar
 from dista.frame import (
@@ -86,6 +87,25 @@ def parse_host_port(addr: String) raises -> Tuple[String, Int]:
     return (String(parts[0]), Int(parts[1]))
 
 
+def connect_head(addr: String) raises -> Stream:
+    """Connects to the head at `host:port`, retrying while it isn't up yet.
+
+    In a cluster, processes start in any order: a worker's pod can come up
+    before the head's, or before its name resolves. This keeps trying for
+    `DISTA_CONNECT_TIMEOUT` seconds (default 60), then raises the last error.
+    """
+    var hp = parse_host_port(addr)
+    var limit = Int(getenv("DISTA_CONNECT_TIMEOUT", "60"))
+    var deadline = Int(perf_counter_ns()) + limit * 1_000_000_000
+    while True:
+        try:
+            return Stream.connect(hp[0], hp[1])
+        except e:
+            if Int(perf_counter_ns()) >= deadline:
+                raise e^
+        sleep(0.25)
+
+
 struct Runtime[*Ts: TaskLike](Movable):
     """A driver for tasks `Ts`, or a head or worker if the environment says so.
     """
@@ -121,8 +141,7 @@ struct Runtime[*Ts: TaskLike](Movable):
             head.run()
             exit_now(0)
         if role == "worker":
-            var hp = parse_host_port(getenv("DISTA_HEAD"))
-            Self._work(Stream.connect(hp[0], hp[1]))
+            Self._work(connect_head(getenv("DISTA_HEAD")))
             exit_now(0)
         if role != "":
             raise Error("DISTA_ROLE must be head or worker, got ", role)
@@ -131,8 +150,7 @@ struct Runtime[*Ts: TaskLike](Movable):
         var head_addr = getenv("DISTA_HEAD")
         var stream: Stream
         if head_addr != "":
-            var hp = parse_host_port(head_addr)
-            stream = Stream.connect(hp[0], hp[1])
+            stream = connect_head(head_addr)
         else:
             if workers < 1:
                 raise Error("need at least one worker")

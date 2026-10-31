@@ -1,0 +1,21 @@
+# A driver: the same image with only DISTA_HEAD set. This one runs the smoke
+# test and expects its tasks to reach three nodes.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dista-driver
+  labels: {app: dista, role: driver}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {app: dista, role: driver}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: driver
+          image: dista:smoke
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: DISTA_HEAD, value: "dista-head:6390"}
+            - {name: DISTA_EXPECT_NODES, value: "3"}
