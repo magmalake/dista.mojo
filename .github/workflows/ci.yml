@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.env == 'default' && 'stable' || matrix.env }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        env: [default, nightly]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          # Pinned: pixi.lock is written by this version, and a newer pixi
+          # rejects the committed lock with "lock file not up-to-date".
+          pixi-version: v0.78.0
+          environments: ${{ matrix.env }}
+
+      # The frame and runtime tests fork real processes and talk over
+      # loopback TCP. Linux is the leg that checks the socket layer's
+      # platform constants: sockaddr_in's first byte, SOL_SOCKET and
+      # MSG_NOSIGNAL all differ from macOS.
+      - name: Tests
+        run: pixi run -e ${{ matrix.env }} test
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          pixi-version: v0.78.0
+          environments: fmt
+      - name: Format check
+        run: pixi run -e fmt format-check

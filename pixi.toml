@@ -1,0 +1,58 @@
+[workspace]
+authors = ["Marius S <39998+winding-lines@users.noreply.github.com>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+name = "dista.mojo"
+version = "0.0.1"
+description = "Distributed tasks for Mojo: mark a function remote, call it, and the work runs across a cluster."
+preview = ["pixi-build"]
+platforms = ["osx-arm64", "linux-64"]
+
+[tasks]
+test-codec = { cmd = "mkdir -p build && mojo build -I src tests/test_codec.mojo -o build/test-codec && ./build/test-codec" }
+test-frame = { cmd = "mkdir -p build && mojo build -I src tests/test_frame.mojo -o build/test-frame && ./build/test-frame" }
+test-runtime = { cmd = "mkdir -p build && mojo build -I src tests/test_runtime.mojo -o build/test-runtime && ./build/test-runtime" }
+test = { depends-on = ["test-codec", "test-frame", "test-runtime"] }
+
+[package]
+name = "dista-mojo"
+version = "0.0.1"
+
+[package.build]
+backend = { name = "pixi-build-mojo", version = "0.*" }
+
+[package.build.config.pkg]
+path = "src/dista"
+name = "dista"
+
+[package.host-dependencies]
+mojo-compiler = "==1.2.0"
+
+[package.build-dependencies]
+mojo-compiler = "==1.2.0"
+
+[package.run-dependencies]
+mojo-compiler = ">=1.2.0,<2"
+
+# Stable is the default: dista targets Mojo 1.2.0. The nightly environment
+# tracks 1.3.0.dev so breaking changes show up early.
+[feature.stable.dependencies]
+mojo-compiler = "==1.2.0"
+
+[feature.nightly.dependencies]
+modular = ">=26.8.0.dev2026102305,<28"
+
+# `mojo-compiler` ships no formatter; the nightly `modular` package does. The
+# environment takes `no-default-feature`, so its tasks live in the feature.
+# `mojo format` has no check mode, so format-check formats and then asserts
+# the tree did not move.
+[feature.fmt.dependencies]
+modular = ">=26.8.0.dev2026102305,<28"
+
+[feature.fmt.tasks]
+fmt = { cmd = "mojo format src tests" }
+format-check = { cmd = "mojo format src tests && git diff --exit-code -- src tests" }
+
+[environments]
+default = ["stable"]
+nightly = ["nightly"]
+fmt = { features = ["fmt"], no-default-feature = true }
