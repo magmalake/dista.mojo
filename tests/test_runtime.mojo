@@ -9,7 +9,7 @@ from std.testing import (
 )
 from std.time import perf_counter_ns, sleep
 
-from dista import ObjectRef, Runtime, Task
+from dista import ObjectRef, Runtime, Seq, Task
 
 
 def square(x: Int) -> Int:
@@ -51,6 +51,26 @@ comptime FailOnOdd = Task[Int, Int, fail_on_odd]
 comptime Mirror = Task[Point, Point, mirror]
 comptime NotRegistered = Task[Int, Int, not_registered]
 comptime Nap = Task[Int, Int, nap]
+
+
+def total(xs: Seq[Int]) -> Int:
+    var t = 0
+    for i in range(len(xs)):
+        t += xs[i]
+    return t
+
+
+def increment(x: Int) -> Int:
+    return x + 1
+
+
+def describe(p: Point) -> String:
+    return String(p.label, "@", Int(p.x), ",", Int(p.y))
+
+
+comptime Total = Task[Seq[Int], Int, total]
+comptime Increment = Task[Int, Int, increment]
+comptime Describe = Task[Point, String, describe]
 comptime TextLength = Task[String, Int, text_length]
 
 
@@ -138,6 +158,46 @@ def test_large_arguments_with_pipelining() raises:
         refs.append(rt.remote[TextLength](big))
     for r in refs:
         assert_equal(rt.get(r), 1 << 20)
+
+
+def test_map_reduce() raises:
+    """The PR-2 gate: 100 map tasks feed one reduce."""
+    var rt = Runtime[Square, Total](workers=4)
+    var maps = List[ObjectRef[Int]]()
+    for i in range(100):
+        maps.append(rt.remote[Square](i))
+    var reduced = rt.remote[Total](maps)
+    assert_equal(rt.get(reduced), 328350)  # sum of squares 0..99
+
+
+def test_chain_of_refs() raises:
+    var rt = Runtime[Increment](workers=2)
+    var r = rt.remote[Increment](0)
+    for _ in range(20):
+        r = rt.remote[Increment](r)
+    assert_equal(rt.get(r), 21)
+
+
+def test_struct_result_feeds_next_task() raises:
+    var rt = Runtime[Mirror, Describe](workers=2)
+    var m = rt.remote[Mirror](Point(3.0, 4.0, "p"))
+    assert_equal(rt.get(rt.remote[Describe](m)), "p (mirrored)@-3,-4")
+
+
+def test_failed_input_fails_dependents() raises:
+    var rt = Runtime[FailOnOdd, Increment, Total](workers=2)
+    var bad = rt.remote[FailOnOdd](5)
+    var after = rt.remote[Increment](bad)
+    with assert_raises(contains="input failed: odd input 5"):
+        _ = rt.get(after)
+    var refs: List[ObjectRef[Int]] = [rt.remote[FailOnOdd](2), bad]
+    with assert_raises(contains="input failed"):
+        _ = rt.get(rt.remote[Total](refs))
+
+
+def test_seq_argument_directly() raises:
+    var rt = Runtime[Total](workers=1)
+    assert_equal(rt.get(rt.remote[Total](Seq[Int]([1, 2, 3, 4]))), 10)
 
 
 def main() raises:

@@ -22,4 +22,5 @@ See DESIGN.md for how it works.
 
 from dista.codec import Codec, decode, encode
 from dista.runtime import ObjectRef, Runtime
+from dista.seq import Seq
 from dista.task import Task, TaskLike

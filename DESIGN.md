@@ -29,6 +29,7 @@ def main() raises:
 - **Why declare tasks instead of `remote[square](7)`.** Mojo 1.2 can't infer a function's result type from the function value, so `R` must be written somewhere. The declaration is that place. It's also Ray's shape: `@ray.remote` once, `.remote()` at each call. *Verified.*
 - **The function type is `def(A) thin -> R`.** A top-level `def` is a `thin` function; without `thin` the parameter doesn't bind. Argument and result types need `Movable & Deinitable` (1.2 makes destruction explicit for generic types). *Verified.*
 - **One argument per task in phase 1.** Several values travel as one struct, which the codec handles by reflection. `Task2`, `Task3` overloads can come later; they're mechanical.
+- **Results as arguments.** `rt.remote[T](ref)` takes an `ObjectRef[T.A]` in place of a `T.A`. `rt.remote[T](refs)` takes a `List[ObjectRef[X]]` when `T` takes a `Seq[X]`. Either way the task waits until every input exists. Its argument is then assembled from the inputs' encoded bytes, without decoding them. If an input failed, the task fails with that error and never runs.
 - **`ObjectRef[R]`** is a typed handle to a result that may not exist yet. `rt.get(ref)` blocks until it does and returns an `R`. Getting the same ref twice decodes it twice; phase 1 keeps every result until the runtime ends.
 - **Errors.** A task that raises sends its message back; `get` re-raises it in the driver, and the worker carries on. Raising and non-raising functions both bind to `def(A) thin raises -> R`, so one `Task` type covers both. *Verified.*
 
@@ -57,7 +58,7 @@ Every node runs the same binary, so every task already exists everywhere. A task
 - **Built-ins are recognised by `reflect[T].name()`**, because `Int` or `String` can't adopt a dista trait. Note `Int` reports as `SIMD[DType.int, 1]`. *Verified.*
 - **User types opt in with `comptime assert conforms_to(T, Codec)`**, which makes `T`'s methods callable inside that branch. *Verified.*
 - **Reflection decoding builds the struct field by field** into allocated storage, at `reflect[T].field_offset[index=i]()`, then takes it out. No `Defaultable` needed. *Verified:* a struct of `Int` plus a `Codec` type round-trips.
-- **Gap: `List[T]` and other generic containers.** Reflection can't recover a `List`'s element type, so phase 1 doesn't encode lists. Workarounds: a `Codec` wrapper type, or Arrow for anything large. Revisit if Mojo adds conditional conformance on `List`.
+- **`List[T]` isn't encodable; `Seq[T]` is.** Reflection can't recover a `List`'s element type, but `Seq[T]` carries `T` as a parameter and implements `Codec`: an 8-byte count, then each element. Use it for list-valued arguments and results, including as a struct field. Arrow is for anything large.
 - **No schema evolution.** Both ends are the same binary.
 
 ## Data plane: columnar results

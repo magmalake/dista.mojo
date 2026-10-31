@@ -1,6 +1,6 @@
 from std.testing import TestSuite, assert_equal, assert_raises, assert_true
 
-from dista import Codec, Task, decode, encode
+from dista import Codec, Seq, Task, decode, encode
 from dista.task import fnv1a64
 
 
@@ -96,6 +96,29 @@ def test_truncated_buffer_raises() raises:
     var pos = 0
     with assert_raises(contains="decode"):
         _ = decode[String](buf, pos)
+
+
+@fieldwise_init
+struct Bag(Copyable, Movable):
+    var name: String
+    var points: Seq[Inner]
+
+
+def test_seq() raises:
+    var words = roundtrip(Seq[String](["a", "", "dista"]))
+    assert_equal(len(words), 3)
+    assert_equal(words[2], "dista")
+    assert_equal(len(roundtrip(Seq[Int]())), 0)
+
+
+def test_seq_inside_struct() raises:
+    var pts = Seq[Inner]()
+    pts.append(Inner(1, "one"))
+    pts.append(Inner(2, "two"))
+    var b = roundtrip(Bag("bag", pts^))
+    assert_equal(b.name, "bag")
+    assert_equal(len(b.points), 2)
+    assert_equal(b.points[1].label, "two")
 
 
 def square(x: Int) -> Int:
