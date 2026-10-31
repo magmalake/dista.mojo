@@ -26,6 +26,11 @@ RUN set -e; env=/src/dista.mojo/.pixi/envs/data; mkdir -p /out/lib; \
 FROM debian:bookworm-slim
 COPY --from=build /out/lib /opt/dista/lib
 COPY --from=build /out/dista /opt/dista/bin/dista
+# conda's libcurl looks for its CA bundle at the path its environment was
+# installed at, and nothing in the shim overrides that; without the bundle
+# there, every HTTPS request (S3 included) fails to verify.
+COPY --from=build /src/dista.mojo/.pixi/envs/data/ssl/cacert.pem \
+    /src/dista.mojo/.pixi/envs/data/ssl/cacert.pem
 # The shims are found as $CONDA_PREFIX/lib/<name>.
 ENV LD_LIBRARY_PATH=/opt/dista/lib CONDA_PREFIX=/opt/dista
 ENTRYPOINT ["/opt/dista/bin/dista"]
