@@ -21,7 +21,7 @@ def main() raises:
     print(total)  # 332833500
 ```
 
-**Status: phase 2 in progress.** One binary runs as driver, head or worker, chosen by environment. Run it on its own and it forks a head and workers on one machine; point it at a head and it joins a cluster:
+**Status: phase 2 done.** Its gate, a distributed Iceberg scan of the NYC taxi table on a 3-node cluster matching one machine, passes ([tests/kind_taxi.sh](tests/kind_taxi.sh)). One binary runs as driver, head or worker, chosen by environment. Run it on its own and it forks a head and workers on one machine; point it at a head and it joins a cluster:
 
 ```
 DISTA_ROLE=head DISTA_PORT=6390 ./app                  # the head

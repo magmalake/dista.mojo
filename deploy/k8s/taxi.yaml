@@ -1,0 +1,105 @@
+# The taxi gate on a cluster: a head, three workers (one per node) and a
+# driver job, all reading the warehouse from /data/wh on their node.
+# tests/kind_taxi.sh copies it there and fills in TAXI_METADATA and
+# TAXI_PREFIX.
+apiVersion: v1
+kind: Service
+metadata:
+  name: dista-head
+  labels: {app: dista-taxi, role: head}
+spec:
+  clusterIP: None
+  selector: {app: dista-taxi, role: head}
+  ports:
+    - {name: dista, port: 6390}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dista-head
+  labels: {app: dista-taxi, role: head}
+spec:
+  serviceName: dista-head
+  replicas: 1
+  selector:
+    matchLabels: {app: dista-taxi, role: head}
+  template:
+    metadata:
+      labels: {app: dista-taxi, role: head}
+    spec:
+      containers:
+        - name: head
+          image: dista:taxi
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: DISTA_ROLE, value: head}
+          readinessProbe:
+            tcpSocket: {port: 6390}
+            periodSeconds: 2
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dista-worker
+  labels: {app: dista-taxi, role: worker}
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: dista-taxi, role: worker}
+  template:
+    metadata:
+      labels: {app: dista-taxi, role: worker}
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {app: dista-taxi, role: worker}
+      volumes:
+        - name: warehouse
+          hostPath: {path: /data/wh, type: Directory}
+      containers:
+        - name: worker
+          image: dista:taxi
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - {name: warehouse, mountPath: /data/wh, readOnly: true}
+          env:
+            - {name: DISTA_ROLE, value: worker}
+            - {name: DISTA_HEAD, value: "dista-head:6390"}
+            - {name: TAXI_METADATA, value: "@TAXI_METADATA@"}
+            - {name: TAXI_PREFIX, value: "@TAXI_PREFIX@"}
+            - {name: TAXI_ROOT, value: /data/wh}
+            - name: DISTA_ADVERTISE
+              valueFrom: {fieldRef: {fieldPath: status.podIP}}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dista-taxi
+  labels: {app: dista-taxi, role: driver}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {app: dista-taxi, role: driver}
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: warehouse
+          hostPath: {path: /data/wh, type: Directory}
+      containers:
+        - name: driver
+          image: dista:taxi
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+            - {name: warehouse, mountPath: /data/wh, readOnly: true}
+          env:
+            - {name: DISTA_HEAD, value: "dista-head:6390"}
+            - {name: DISTA_EXPECT_NODES, value: "3"}
+            - {name: TAXI_METADATA, value: "@TAXI_METADATA@"}
+            - {name: TAXI_PREFIX, value: "@TAXI_PREFIX@"}
+            - {name: TAXI_ROOT, value: /data/wh}
