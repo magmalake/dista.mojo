@@ -1,0 +1,384 @@
+"""The phase-2 gate: taxibench's queries over the NYC taxi Iceberg table,
+distributed one task per data file, against the same scans in one process.
+
+79.5 million trips, 24 monthly data files. For each query the driver plans
+the scan, sends one task per surviving file, and adds the tasks' partial
+results together. Then it runs the same scan itself, in this process, and
+checks the answers agree: counts exactly, sums to 1e-9 relative (a sum's
+rounding depends on the order its terms are added in). One more query sends
+whole Arrow batches back instead of partial sums, so columnar data crosses
+nodes too.
+
+    TAXI_METADATA   the table's metadata location, as the table names it
+    TAXI_PREFIX     the warehouse location the table was written at
+    TAXI_ROOT       where that warehouse is mounted here (default: the same)
+
+`tests/kind_taxi.sh` runs it on a 3-node kind cluster.
+"""
+
+from std.os import getenv
+from std.time import perf_counter_ns
+
+from arrow_mlake import RecordBatch
+from iceberg import FileIO, ScanOptions, TableScan
+from iceberg.catalog.filesystem import read_metadata_file
+
+from dista import ObjectRef, Runtime, Seq, Task
+from dista.store import node_name
+
+comptime K_COUNT = 0
+comptime K_SUM = 1
+comptime K_RATIO = 2
+comptime K_ZONE_COUNT = 3
+comptime K_ZONE_SUM = 4
+comptime ZONES = 266
+
+
+@fieldwise_init
+struct Query(Copyable, Movable):
+    var name: String
+    var filter: String
+    var columns: Seq[String]
+    var kind: Int
+    var sum_column: String
+
+
+@fieldwise_init
+struct FileQuery(Copyable, Movable):
+    """One query over one data file."""
+
+    var query: Query
+    var path: String
+
+
+@fieldwise_init
+struct Partial(Copyable, Movable):
+    """What one file contributes; partials add up to the answer."""
+
+    var rows: Int
+    var sum_a: Float64
+    var sum_b: Float64
+    var zones: Seq[Float64]
+    var node: String
+
+    @staticmethod
+    def zero() -> Partial:
+        var z = List[Float64]()
+        for _ in range(ZONES):
+            z.append(0.0)
+        return Partial(0, 0.0, 0.0, Seq[Float64](z^), String())
+
+    def add(mut self, other: Partial):
+        self.rows += other.rows
+        self.sum_a += other.sum_a
+        self.sum_b += other.sum_b
+        var z = List[Float64]()
+        for i in range(ZONES):
+            z.append(self.zones[i] + other.zones[i])
+        self.zones = Seq[Float64](z^)
+
+
+def _io() -> FileIO:
+    var io = FileIO.local()
+    var prefix = getenv("TAXI_PREFIX")
+    var root = getenv("TAXI_ROOT", prefix)
+    if prefix != "" and root != prefix:
+        io.rebase(prefix, root)
+    return io^
+
+
+def _scan(q: Query) raises -> TableScan:
+    var io = _io()
+    var scan = TableScan(read_metadata_file(io, getenv("TAXI_METADATA")), io^)
+    scan = scan.filter(q.filter)
+    if len(q.columns) > 0:
+        var cols = List[String]()
+        for i in range(len(q.columns)):
+            cols.append(q.columns[i])
+        scan = scan.select(cols^)
+    return scan^
+
+
+def _column(b: RecordBatch, name: String) raises -> Int:
+    for c in range(b.num_columns()):
+        if b.name(c) == name:
+            return c
+    raise Error("no column ", name)
+
+
+def fold(mut p: Partial, q: Query, b: RecordBatch) raises:
+    """Adds batch `b`'s contribution to query `q` into `p`."""
+    p.rows += b.num_rows
+    if q.kind == K_SUM:
+        var col = b.column_f64(_column(b, q.sum_column))
+        for i in range(len(col[0])):
+            if col[1][i]:
+                p.sum_a += col[0][i]
+    elif q.kind == K_RATIO:
+        var tip = b.column_f64(_column(b, "tip_amount"))
+        var fare = b.column_f64(_column(b, "fare_amount"))
+        for i in range(len(tip[0])):
+            if tip[1][i] and fare[1][i]:
+                p.sum_a += tip[0][i]
+                p.sum_b += fare[0][i]
+    elif q.kind == K_ZONE_COUNT or q.kind == K_ZONE_SUM:
+        var zone = b.column_i64(_column(b, "PULocationID"))
+        var z = List[Float64]()
+        for i in range(ZONES):
+            z.append(p.zones[i])
+        if q.kind == K_ZONE_COUNT:
+            for i in range(len(zone[0])):
+                if zone[1][i] and zone[0][i] >= 0 and zone[0][i] < Int64(ZONES):
+                    z[Int(zone[0][i])] += 1.0
+        else:
+            var amount = b.column_f64(_column(b, "total_amount"))
+            for i in range(len(zone[0])):
+                if (
+                    zone[1][i]
+                    and amount[1][i]
+                    and zone[0][i] >= 0
+                    and zone[0][i] < Int64(ZONES)
+                ):
+                    z[Int(zone[0][i])] += amount[0][i]
+        p.zones = Seq[Float64](z^)
+
+
+def _node() -> String:
+    var n = getenv("NODE_NAME")
+    return n if n != "" else node_name()
+
+
+def fold_file(t: FileQuery) raises -> Partial:
+    """Task: one query over one data file, folded where it was read."""
+    var paths: List[String] = [t.path.copy()]
+    var p = Partial.zero()
+    for b in _scan(t.query).to_batches_for_paths(paths):
+        fold(p, t.query, b)
+    p.node = _node()
+    return p^
+
+
+def read_file(t: FileQuery) raises -> Seq[RecordBatch]:
+    """Task: one query over one data file, returned as Arrow batches."""
+    var paths: List[String] = [t.path.copy()]
+    return Seq[RecordBatch](_scan(t.query).to_batches_for_paths(paths))
+
+
+comptime FoldFile = Task[FileQuery, Partial, fold_file]
+comptime ReadFile = Task[FileQuery, Seq[RecordBatch], read_file]
+
+
+def _q(
+    name: StringSlice,
+    filter: StringSlice,
+    columns: List[String],
+    kind: Int,
+    sum_column: StringSlice = "",
+) -> Query:
+    return Query(
+        String(name),
+        String(filter),
+        Seq[String](columns.copy()),
+        kind,
+        String(sum_column),
+    )
+
+
+def queries() -> List[Query]:
+    """The eight taxibench queries, minus the top-ten step: zone totals compare
+    whole."""
+    return [
+        _q(
+            "q1_scan_count",
+            '[">","trip_distance",0.0]',
+            ["trip_distance"],
+            K_COUNT,
+        ),
+        _q(
+            "q2_month_range",
+            (
+                '["and",[">=","tpep_pickup_datetime","2024-03-01T00:00:00"],'
+                '["<","tpep_pickup_datetime","2024-06-01T00:00:00"]]'
+            ),
+            ["total_amount"],
+            K_SUM,
+            "total_amount",
+        ),
+        _q(
+            "q3_payment_sum",
+            '["=","payment_type",2]',
+            ["payment_type", "total_amount"],
+            K_SUM,
+            "total_amount",
+        ),
+        _q(
+            "q4_tip_ratio",
+            '["and",[">","trip_distance",10.0],[">","fare_amount",0.0]]',
+            ["trip_distance", "fare_amount", "tip_amount"],
+            K_RATIO,
+        ),
+        _q(
+            "q5_top_zones",
+            '[">","trip_distance",0.0]',
+            ["PULocationID", "trip_distance"],
+            K_ZONE_COUNT,
+        ),
+        _q(
+            "q6_zone_revenue",
+            (
+                '["and",[">=","tpep_pickup_datetime","2024-01-01T00:00:00"],'
+                '["<","tpep_pickup_datetime","2025-01-01T00:00:00"]]'
+            ),
+            ["PULocationID", "total_amount"],
+            K_ZONE_SUM,
+        ),
+        _q(
+            "q7_wide",
+            (
+                '["and",[">=","tpep_pickup_datetime","2024-06-01T00:00:00"],'
+                '["<","tpep_pickup_datetime","2024-07-01T00:00:00"]]'
+            ),
+            List[String](),
+            K_COUNT,
+        ),
+        _q(
+            "q8_selective",
+            (
+                '["and",["=","PULocationID",132],["=","payment_type",1],'
+                '[">","trip_distance",20.0]]'
+            ),
+            ["PULocationID", "payment_type", "trip_distance", "total_amount"],
+            K_SUM,
+            "total_amount",
+        ),
+    ]
+
+
+def _close(a: Float64, b: Float64) -> Bool:
+    var scale = max(abs(a), abs(b), 1.0)
+    return abs(a - b) <= 1e-9 * scale
+
+
+def _check(name: String, got: Partial, want: Partial) raises:
+    if got.rows != want.rows:
+        raise Error(
+            name, ": ", got.rows, " rows distributed, ", want.rows, " local"
+        )
+    if not _close(got.sum_a, want.sum_a) or not _close(got.sum_b, want.sum_b):
+        raise Error(
+            name,
+            ": sums ",
+            got.sum_a,
+            "/",
+            got.sum_b,
+            " vs ",
+            want.sum_a,
+            "/",
+            want.sum_b,
+        )
+    for i in range(ZONES):
+        if not _close(got.zones[i], want.zones[i]):
+            raise Error(
+                name, ": zone ", i, " ", got.zones[i], " vs ", want.zones[i]
+            )
+
+
+def _ms(t0: Int) -> Int:
+    return (Int(perf_counter_ns()) - t0) // 1_000_000
+
+
+def main() raises:
+    var rt = Runtime[FoldFile, ReadFile](workers=4)
+    var nodes = List[String]()
+    var total_dist = 0
+    var total_local = 0
+    for q in queries():
+        var t0 = Int(perf_counter_ns())
+        var tasks = _scan(q).plan_files()
+        var refs = List[ObjectRef[Partial]]()
+        for t in tasks:
+            refs.append(
+                rt.remote[FoldFile](
+                    FileQuery(q.copy(), t.data_file.file_path.copy())
+                )
+            )
+        var got = Partial.zero()
+        for r in refs:
+            var part = rt.get(r)
+            if part.node not in nodes:
+                nodes.append(part.node.copy())
+            got.add(part)
+        var dist_ms = _ms(t0)
+
+        var t1 = Int(perf_counter_ns())
+        var want = Partial.zero()
+        var reader = _scan(q).to_batch_reader()
+        while True:
+            var b = reader.next_batch()
+            if not b:
+                break
+            fold(want, q, b.value())
+        reader.raise_if_failed()
+        var local_ms = _ms(t1)
+        _check(q.name, got, want)
+        total_dist += dist_ms
+        total_local += local_ms
+        print(
+            q.name,
+            ":",
+            len(tasks),
+            "files,",
+            got.rows,
+            "rows, sum",
+            got.sum_a,
+            "| distributed",
+            dist_ms,
+            "ms, one process",
+            local_ms,
+            "ms",
+        )
+
+    # Arrow across nodes: the quarter's total_amount comes back as batches.
+    var q = queries()[1].copy()
+    var t2 = Int(perf_counter_ns())
+    var refs = List[ObjectRef[Seq[RecordBatch]]]()
+    for t in _scan(q).plan_files():
+        refs.append(
+            rt.remote[ReadFile](
+                FileQuery(q.copy(), t.data_file.file_path.copy())
+            )
+        )
+    var got = Partial.zero()
+    for r in refs:
+        var bs = rt.get(r)
+        for k in range(len(bs)):
+            fold(got, q, bs[k])
+    var want = Partial.zero()
+    for b in _scan(q).to_batches():
+        fold(want, q, b)
+    _check("q2_as_batches", got, want)
+    print(
+        "q2_as_batches :",
+        got.rows,
+        "rows as Arrow,",
+        rt.bytes_fetched(),
+        "bytes fetched over sockets,",
+        _ms(t2),
+        "ms",
+    )
+
+    print("tasks ran on", len(nodes), "nodes:", end="")
+    for n in nodes:
+        print("", n, end="")
+    print()
+    var expect = Int(getenv("DISTA_EXPECT_NODES", "1"))
+    if len(nodes) < expect:
+        raise Error("expected ", expect, " nodes, saw ", len(nodes))
+    print(
+        "PASS taxi: 8 queries + 1 as batches, distributed == one process;",
+        "distributed",
+        total_dist,
+        "ms, one process",
+        total_local,
+        "ms",
+    )
