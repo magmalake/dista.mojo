@@ -7,6 +7,8 @@ from std.testing import (
     assert_raises,
     assert_true,
 )
+from std.os import setenv, unsetenv
+from std.os.path import exists
 from std.time import perf_counter_ns, sleep
 
 from dista import ObjectRef, Runtime, Seq, Task
@@ -89,6 +91,11 @@ def grow(s: String) -> String:
     return s + String("y") * 1000
 
 
+def length(s: String) -> Int:
+    return s.byte_length()
+
+
+comptime Length = Task[String, Int, length]
 comptime Blob = Task[Int, String, blob]
 comptime TotalLength = Task[Seq[String], Int, total_length]
 comptime Grow = Task[String, String, grow]
@@ -275,6 +282,40 @@ def test_chain_of_large_results_across_workers() raises:
     for _ in range(9):
         r = rt.remote[Grow](r)
     assert_equal(rt.get(r).byte_length(), 110_000)
+
+
+def test_node_store_passes_100mb_without_sockets() raises:
+    """The PR-5 gate: a 100 MB result crosses processes through shared memory.
+    """
+    var path = String()
+    if True:
+        var rt = Runtime[Blob, Length](workers=2)
+        var big = rt.remote[Blob](100_000_000)
+        var place = rt.location(big)
+        var parts = place.split(" ")
+        assert_equal(len(parts), 2, "expected a node-store file: " + place)
+        path = String(parts[1])
+        assert_true(exists(path))
+        # Another worker takes it as input, and the driver reads it, both by
+        # mapping the file.
+        assert_equal(rt.get(rt.remote[Length](big)), 100_000_000)
+        assert_equal(rt.get(big).byte_length(), 100_000_000)
+        assert_equal(rt.bytes_fetched(), 0)
+    # The workers removed their files when they exited.
+    assert_false(exists(path), "node-store file outlived its worker")
+
+
+def test_without_the_node_store_results_come_over_sockets() raises:
+    _ = setenv("DISTA_SHM", "0")
+    try:
+        var rt = Runtime[Blob, Length](workers=2)
+        var big = rt.remote[Blob](300_000)
+        assert_false(" " in rt.location(big))
+        assert_equal(rt.get(rt.remote[Length](big)), 300_000)
+        assert_equal(rt.get(big).byte_length(), 300_000)
+        assert_equal(rt.bytes_fetched(), 300_008)  # the String's length + bytes
+    finally:
+        _ = unsetenv("DISTA_SHM")
 
 
 def main() raises:

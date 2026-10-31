@@ -1,9 +1,10 @@
 """A worker: runs tasks for the head and serves its results to peers.
 
 A small result (up to `INLINE_LIMIT` bytes) goes back to the head, which
-forwards it. A larger one stays here: the worker tells the head it's stored,
-and whoever needs it, a driver or another worker, fetches it directly from
-this worker's object server.
+forwards it. A larger one stays here: in a shared mapping in the node's store
+(see `store.mojo`), or in memory if the store is off. The worker tells the
+head where it is; a reader on this host maps the file, and one elsewhere
+fetches it from this worker's object server.
 
 So a worker is an event loop over the head, its listener, the drivers and
 workers fetching from it, and the workers it fetches from. A task whose
@@ -14,7 +15,7 @@ Running a task does block the loop, so fetches from this worker wait until
 the current task finishes.
 """
 
-from std.ffi import c_int
+from std.ffi import c_int, external_call
 from std.os import getenv
 
 from dista.codec import get_scalar, put_scalar
@@ -29,8 +30,15 @@ from dista.frame import (
     KIND_TASK_INPUTS,
     ROLE_WORKER,
     Frame,
-    decode_addr,
     encode_addr,
+)
+from dista.store import (
+    Location,
+    node_name,
+    read_shared,
+    remove_file,
+    store_dir,
+    write_shared,
 )
 from dista.socket import (
     POLLERR,
@@ -119,6 +127,13 @@ struct Worker[dispatch: DispatchFn](Movable):
     var _requested: Dict[UInt64, Bool]
     var _parked: List[_Parked]
     var _ready: List[_Ready]
+    var _ip: Array[UInt8, 4]
+    var _port: Int
+    var _node: String
+    var _dir: String
+    """The node store's directory, or "" when results stay in memory."""
+    var _files: Dict[UInt64, Location]
+    """Results this worker wrote into the node store."""
 
     def __init__(out self, var head: Stream, registry_hash: UInt64) raises:
         """Starts the object server and says hello to the head on `head`."""
@@ -140,6 +155,16 @@ struct Worker[dispatch: DispatchFn](Movable):
         self._requested = Dict[UInt64, Bool]()
         self._parked = List[_Parked]()
         self._ready = List[_Ready]()
+        self._ip = ip.copy()
+        self._port = self._listener.port
+        self._node = node_name()
+        self._dir = store_dir()
+        self._files = Dict[UInt64, Location]()
+
+    def __deinit__(deinit self):
+        # Results in the node store are files: remove them with the worker.
+        for entry in self._files.items():
+            remove_file(entry.value.path)
 
     def run(mut self) raises:
         """Serves until the head hangs up."""
@@ -236,8 +261,14 @@ struct Worker[dispatch: DispatchFn](Movable):
                     )
                     pos += len
                 else:
-                    var addr = decode_addr(f.payload, pos)
-                    self._request(obj, addr[0], addr[1])
+                    var loc = Location.decode(f.payload, pos)
+                    if loc.is_local(self._node) and obj not in self._objects:
+                        try:
+                            self._objects[obj] = read_shared(loc.path, loc.size)
+                        except e:
+                            self._lost[obj] = String(e)
+                    else:
+                        self._request(obj, loc.ip, loc.port)
                     inputs.append(_Input(obj, False, List[UInt8]()))
             self._parked.append(
                 _Parked(f.object_id, f.task_id, gather, inputs^)
@@ -289,6 +320,10 @@ struct Worker[dispatch: DispatchFn](Movable):
             self._serving[i].send(
                 KIND_RESULT, f.object_id, 0, self._objects[f.object_id]
             )
+        elif f.object_id in self._files:
+            ref loc = self._files[f.object_id]
+            var data = read_shared(loc.path, loc.size)
+            self._serving[i].send(KIND_RESULT, f.object_id, 0, data)
         else:
             var msg = String("object ", f.object_id, " is not on this worker")
             self._serving[i].send(KIND_ERROR, f.object_id, 0, msg.as_bytes())
@@ -343,7 +378,19 @@ struct Worker[dispatch: DispatchFn](Movable):
         if len(out) <= INLINE_LIMIT:
             self._head.send(KIND_RESULT, t.object_id, 0, out)
         else:
-            var size = List[UInt8]()
-            put_scalar[DType.uint64](size, UInt64(len(out)))
-            self._objects[t.object_id] = out^
-            self._head.send(KIND_STORED, t.object_id, 0, size)
+            var path = String()
+            if self._dir != "":
+                path = String(
+                    self._dir, "/dista-", self._port, "-", t.object_id
+                )
+                try:
+                    write_shared(path, out)
+                except e:
+                    print("dista worker: node store write failed:", e)
+                    path = String()
+            var loc = Location(self._ip, self._port, self._node, path, len(out))
+            if path != "":
+                self._files[t.object_id] = loc.copy()
+            else:
+                self._objects[t.object_id] = out^
+            self._head.send(KIND_STORED, t.object_id, 0, loc.encode())

@@ -99,6 +99,8 @@ struct Head(Movable):
     var _location: Dict[UInt64, Int]
     """Results that stayed on a worker: object ID to that worker's connection.
     """
+    var _where: Dict[UInt64, List[UInt8]]
+    """Those results' encoded locations, as the worker reported them."""
 
     def __init__(
         out self,
@@ -132,6 +134,7 @@ struct Head(Movable):
         self._errors = Dict[UInt64, String]()
         self._worker_addr = List[List[UInt8]]()
         self._location = Dict[UInt64, Int]()
+        self._where = Dict[UInt64, List[UInt8]]()
 
     def run(mut self) raises:
         """Serves until the last driver leaves, in local mode; else forever."""
@@ -230,8 +233,8 @@ struct Head(Movable):
                 self._deliver(f.object_id, f.kind, f.payload)
             elif f.kind == KIND_STORED:
                 self._location[f.object_id] = i
-                var addr = self._worker_addr[i].copy()
-                self._deliver(f.object_id, KIND_LOCATED, addr)
+                self._where[f.object_id] = f.payload.copy()
+                self._deliver(f.object_id, KIND_LOCATED, f.payload)
             else:
                 self._errors[f.object_id] = String(unsafe_from_utf8=f.payload)
                 self._deliver(f.object_id, f.kind, f.payload)
@@ -310,6 +313,7 @@ struct Head(Movable):
                     held.append(entry.key)
             for obj in held:
                 _ = self._location.pop(obj, -1)
+                _ = self._where.pop(obj, List[UInt8]())
                 self._fail(obj, String("result lost: its worker went away"))
 
     def _shutdown(mut self):
@@ -354,9 +358,7 @@ struct Head(Movable):
                     if d in self._location:
                         spec.append(1)
                         put_scalar[DType.uint64](spec, d)
-                        spec.extend(
-                            self._worker_addr[self._location.get(d, 0)].copy()
-                        )
+                        spec.extend(self._where.get(d, List[UInt8]()))
                     else:
                         var r = self._results.get(d, List[UInt8]())
                         spec.append(0)

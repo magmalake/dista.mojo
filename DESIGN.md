@@ -95,10 +95,11 @@ Since phase 2's PR 3, scheduling lives in one place: a head process. Every progr
 - **Local mode runs the cluster path.** The forked head is the same code a cluster runs, so every test exercises it. The extra hop costs about 1.4 µs per task.
 - **Hello and registry hash.** Every driver and worker opens with a hello carrying its role and a hash of its registry, the task names in order. The head refuses a mismatch, so a cluster can't mix builds. Drivers get a number, which fills the top 24 bits of every object ID they create. That tells the head which driver owns a result.
 - **The head's event loop** `poll`s the listener and every connection. Each connection is a `Conn`: reads and writes use `MSG_DONTWAIT`, input accumulates until frames are whole, and output queues until the socket takes it. A slow peer never blocks anyone else, so the phase-1 rule limiting pipelined argument size is gone.
-- **Why `MSG_DONTWAIT` rather than `O_NONBLOCK`:** `fcntl` is variadic, and Apple's arm64 ABI passes variadic arguments on the stack. `external_call` puts them in registers, so `F_SETFL` silently set nothing, and the head hung in its second `recv`. Any variadic libc call has the same trap.
+- **Why `MSG_DONTWAIT` rather than `O_NONBLOCK`:** `fcntl` is variadic, and Apple's arm64 ABI passes variadic arguments on the stack. A plain `external_call` puts them in registers, so `F_SETFL` silently set nothing, and the head hung in its second `recv`. `external_call[..., num_fixed_args=2]` declares the variadic split and fixes it; memory-region calls `open` that way. dista sidesteps the question with per-call `MSG_DONTWAIT`.
 - **Scheduling:** tasks queue in arrival order. Tasks waiting on inputs are held aside until every input exists. Queued tasks go to workers round-robin, up to `pipeline` in flight each (default 2). Each result or error goes back to the driver that owns it.
 - **Small results go through the head; large ones stay on their worker.** A result of 64 KiB or less comes back inline. The head keeps it, because a later task may take it as input, and forwards it to the owning driver. A larger result stays on the worker that computed it. The worker reports only its size; the head records where it lives and tells the owner, using located frames. The driver's `get` fetches it straight from that worker.
 - **Every worker is also an object server.** Its loop `poll`s the head, its listener, the drivers and workers fetching from it, and the workers it fetches from. A task whose inputs live elsewhere arrives as task-inputs, with each input either inline or as an address. It waits, parked, until every input has arrived, and the worker keeps serving fetches meanwhile. No worker waits on another synchronously, so two workers that need each other's results can't deadlock. Running a task blocks the loop, so a fetch from a busy worker waits until its current task ends.
+- **On one host, large results go through shared memory.** A worker writes each large result into a file in the node store, through memory-region's `MappedRegion`. The store is `/dev/shm` on Linux, `$TMPDIR` on macOS, or `DISTA_STORE_DIR`. The location it reports holds its address, its host name, the file's path and the exact size. A reader with the same host name maps the file read-only instead of fetching it. A worker copies the bytes into the task's argument; the driver's `get` decodes straight from the mapping. A reader on another host fetches over a socket. Workers delete their files when they exit. `DISTA_SHM=0` turns the store off. In Kubernetes each pod has its own host name and `/dev/shm`, so pods use sockets unless they share a volume. Measured: a 100 MB result goes from one worker to a second worker and to the driver in about 0.2 s, with no socket bytes.
 - **A worker advertises the address it reaches the head from** (`getsockname` on that connection), or `DISTA_ADVERTISE` if set. In Kubernetes that will be the pod IP.
 - **A worker that dies** fails the tasks it had in flight, with `worker lost while running this task`. The results it held become `result lost: its worker went away`. The other workers carry on. Results are never freed yet: workers keep them until they exit.
 - **Drivers use blocking sockets.** A driver talks to the head and to workers it fetches from, and both always drain their sockets.
@@ -121,12 +122,12 @@ Since phase 2's PR 3, scheduling lives in one place: a head process. Every progr
 | 4 hello | driver or worker to head | role byte, then the registry hash, u64 |
 | 5 welcome | head to driver | the driver's number, u64 |
 | 6 task-after | driver to head | gather byte, count u64, then that many object IDs |
-| 7 stored | worker to head | the result's size, u64: it stayed on the worker |
-| 8 located | head to driver | the address of the worker holding the result |
+| 7 stored | worker to head | the result's location: it stayed on the worker |
+| 8 located | head to driver | the result's location |
 | 9 fetch | driver or worker to a worker | none: send that object back as a result frame |
-| 10 task-inputs | head to worker | gather byte, count u64, then per input a tag: 0 with its bytes, or 1 with an address |
+| 10 task-inputs | head to worker | gather byte, count u64, then per input a tag: 0 with its bytes, or 1 with a location |
 
-An address is 12 bytes: the IPv4 address, then the port as a u64. A worker's hello also carries its own.
+An address is 12 bytes: the IPv4 address, then the port as a u64. A worker's hello carries its own. A location is the holding worker's address, its host name, the node-store path ("" if the result is only in memory) and the size, each string length-prefixed.
 
 **Measured** on an M4 MacBook, local mode with 4 workers (`pixi run bench`, 10,000 tasks of `square`): 11.0 µs per task with no pipelining, 6.2 µs at depth 2, 5.3 µs at depth 4. Worker-held results added about 1 µs per task, because each worker now polls its listener and peers between tasks. All tests pass on Mojo 1.2.0 and the 1.3 nightly. `tests/cluster.sh` runs a head, 4 workers and a driver as separate processes found by host name, and checks that a build with different tasks is refused.
 
@@ -167,6 +168,8 @@ ThreadSanitizer fails on allocating threaded Mojo programs today, so the runtime
 | `src/dista/head.mojo` | the head's event loop and scheduler (phase 2) |
 | `src/dista/conn.mojo` | non-blocking framed connections for the head (phase 2) |
 | `src/dista/seq.mojo` | `Seq[T]` (phase 2) |
+| `src/dista/worker.mojo` | the worker's event loop and object server (phase 2) |
+| `src/dista/store.mojo` | the node-local shared-memory store and locations (phase 2) |
 | `tests/` | codec, dispatch, and process tests |
 
 ## Phase 2 plan

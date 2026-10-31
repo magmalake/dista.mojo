@@ -14,8 +14,23 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         env: [default, nightly]
+    defaults:
+      run:
+        working-directory: dista.mojo
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: dista.mojo
+
+      # The nightly compiles memory-region from source, because its package
+      # is precompiled by 1.2.0 and a 1.3 compiler refuses it. The ref matches
+      # the pin in pixi.toml.
+      - if: matrix.env == 'nightly'
+        uses: actions/checkout@v4
+        with:
+          repository: magmalake/memory-region.mojo
+          ref: 91ff4418b44a89f9354e7d32633e9b11ad365dfd
+          path: memory-region.mojo
 
       - uses: prefix-dev/setup-pixi@v0.10.2
         with:
@@ -23,6 +38,7 @@ jobs:
           # rejects the committed lock with "lock file not up-to-date".
           pixi-version: v0.78.0
           environments: ${{ matrix.env }}
+          manifest-path: dista.mojo/pixi.toml
 
       # The frame and runtime tests fork real processes and talk over
       # loopback TCP. Linux is the leg that checks the socket layer's

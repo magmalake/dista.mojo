@@ -24,8 +24,9 @@ with a `comptime for` over it, and every process's hello carries a hash of it
 so the head refuses a mismatched build.
 
 A driver sends tasks to the head and reads results back. Small results come
-with the reply; a large one stays on the worker that computed it, and `get`
-fetches it from that worker directly. A task can take
+with the reply; a large one stays on the worker that computed it. On the same
+host `get` maps it from the node store and decodes it in place; from another
+host it fetches it from that worker directly. A task can take
 another task's result: pass an `ObjectRef[A]` instead of an `A`, or a
 `List[ObjectRef[X]]` to a task that takes a `Seq[X]`. The head runs it once
 every input exists, and fails it if an input failed.
@@ -45,7 +46,6 @@ from dista.frame import (
     KIND_WELCOME,
     ROLE_DRIVER,
     ROLE_WORKER,
-    decode_addr,
     read_frame,
     write_frame,
 )
@@ -59,7 +59,9 @@ from dista.socket import (
     wait_child,
 )
 from dista.task import TaskLike, fnv1a64
+from dista.store import Location, node_name
 from dista.worker import Worker, addr_key
+from memory_region import SharedMapping
 
 comptime DEFAULT_PORT = 6390
 
@@ -97,6 +99,8 @@ struct Runtime[*Ts: TaskLike](Movable):
     var _located: Dict[UInt64, List[UInt8]]
     """Results that stayed on a worker: object ID to that worker's address."""
     var _fetchers: List[Stream]
+    var _node: String
+    var _socket_bytes: Int
     var _fetcher_index: Dict[String, Int]
 
     def __init__(out self, workers: Int = 4, pipeline: Int = 2) raises:
@@ -172,6 +176,8 @@ struct Runtime[*Ts: TaskLike](Movable):
         self._errors = Dict[UInt64, String]()
         self._located = Dict[UInt64, List[UInt8]]()
         self._fetchers = List[Stream]()
+        self._node = node_name()
+        self._socket_bytes = 0
         self._fetcher_index = Dict[String, Int]()
 
     def __deinit__(deinit self):
@@ -339,30 +345,46 @@ struct Runtime[*Ts: TaskLike](Movable):
             self._read_one()
         if r.id in self._errors:
             raise Error(self._errors[r.id])
-        if r.id not in self._results:
-            self._fetch(r.id)
         var pos = 0
+        if r.id not in self._results:
+            var loc = self._where(r.id)
+            if loc.is_local(self._node):
+                # Same host: decode straight from the node store's mapping.
+                var m = SharedMapping(loc.path)
+                if loc.size > m.size():
+                    raise Error("shared object ", loc.path, " is truncated")
+                return decode[R](m.bytes()[: loc.size], pos)
+            self._fetch(r.id, loc)
         return decode[R](self._results[r.id], pos)
 
+    def bytes_fetched(self) -> Int:
+        """How many result bytes this driver has fetched over sockets."""
+        return self._socket_bytes
+
+    def _where(self, id: UInt64) raises -> Location:
+        var pos = 0
+        return Location.decode(self._located[id], pos)
+
     def location[R: AnyType](mut self, r: ObjectRef[R]) raises -> String:
-        """Where `r`'s result lives: a worker's `ip:port`, or "" if it came
-        back with the reply. Waits for the task to finish.
+        """Where `r`'s result lives: a worker's `ip:port`, then its node-store
+        file if it has one; "" if it came back with the reply. Waits for the
+        task to finish.
         """
         while not self._settled(r.id):
             self._read_one()
         if r.id not in self._located:
             return String()
-        var pos = 0
-        var addr = decode_addr(self._located[r.id], pos)
-        return addr_key(addr[0], addr[1])
+        var loc = self._where(r.id)
+        var place = addr_key(loc.ip, loc.port)
+        if loc.path != "":
+            place += " " + loc.path
+        return place
 
-    def _fetch(mut self, id: UInt64) raises:
-        """Copies a result from the worker holding it."""
-        var pos = 0
-        var addr = decode_addr(self._located[id], pos)
-        var key = addr_key(addr[0], addr[1])
+    def _fetch(mut self, id: UInt64, loc: Location) raises:
+        """Copies a result from the worker holding it, over a socket."""
+        var key = addr_key(loc.ip, loc.port)
         if key not in self._fetcher_index:
-            self._fetchers.append(Stream.connect(addr[0], addr[1]))
+            self._fetchers.append(Stream.connect(loc.ip, loc.port))
             self._fetcher_index[key] = len(self._fetchers) - 1
         var i = self._fetcher_index.get(key, -1)
         write_frame(self._fetchers[i], KIND_FETCH, id, 0, List[UInt8]())
@@ -371,6 +393,7 @@ struct Runtime[*Ts: TaskLike](Movable):
             raise Error("the worker holding object ", id, " hung up")
         ref frame = f.value()
         if frame.kind == KIND_RESULT:
+            self._socket_bytes += len(frame.payload)
             self._results[id] = frame.payload.copy()
         else:
             raise Error(String(unsafe_from_utf8=frame.payload))
