@@ -3,12 +3,17 @@ table, one Ray task per data file, checked against the same scans in one
 Python process.
 
 The queries and their folds are taxibench's own (`taxibench.queries`), so
-the arithmetic matches the Python side of that benchmark. Each task reopens
-the table, re-plans the scan and reads only its own file with PyIceberg's
-`ArrowScan`, exactly as each dista task calls `to_batches_for_paths`. The
-driver adds the partial states together.
+the arithmetic matches the Python side of that benchmark. The driver plans
+each query once and ships every task its planned `FileScanTask`; the task
+reopens the table's metadata and reads just that file with PyIceberg's
+`ArrowScan`, as each dista task calls `to_batches_for_tasks`. No task reads
+a manifest. The driver adds the partial states together.
 
-    TAXI_METADATA   the table's metadata file (the path the table was written at)
+    TAXI_METADATA   the table's metadata file (the path the table was written at);
+                    `s3://` reads with the `AWS_*` environment
+    TAXI_PASSES     distributed runs of each query (default 1); the first is
+                    checked against one process, the rest against the first,
+                    and each prints `TIME <query> <pass> <ms>`
     TAXI_THREADS    pyarrow's CPU and I/O threads per process; unset = pyarrow's default
     RAY_ADDRESS     the cluster; unset = a local Ray started here
 """
@@ -35,8 +40,29 @@ def _threads():
         pa.set_io_thread_count(int(n))
 
 
+def _s3_properties():
+    """The `AWS_*` environment as PyIceberg's S3 properties, so the reads
+    don't depend on which variables pyarrow happens to look at."""
+    env = os.environ.get
+    props = {}
+    for var, prop in [
+        ("AWS_ACCESS_KEY_ID", "s3.access-key-id"),
+        ("AWS_SECRET_ACCESS_KEY", "s3.secret-access-key"),
+        ("AWS_SESSION_TOKEN", "s3.session-token"),
+    ]:
+        if env(var):
+            props[prop] = env(var)
+    region = env("AWS_REGION") or env("AWS_DEFAULT_REGION")
+    if region:
+        props["s3.region"] = region
+    if env("AWS_ENDPOINT_URL"):
+        props["s3.endpoint"] = env("AWS_ENDPOINT_URL")
+        props["s3.force-virtual-addressing"] = "false"
+    return props
+
+
 def _table(metadata):
-    return StaticTable.from_metadata(metadata)
+    return StaticTable.from_metadata(metadata, properties=_s3_properties())
 
 
 def _scan(table, q):
@@ -54,30 +80,28 @@ def _merge(a, b):
 
 
 @ray.remote
-def fold_file(metadata, name, path):
-    """One query over one data file, folded where it was read."""
+def fold_file(metadata, name, task):
+    """One query over one planned data file, folded where it was read."""
     _threads()
     q = QUERIES[name]
     table = _table(metadata)
     scan = _scan(table, q)
-    tasks = [t for t in scan.plan_files() if t.file.file_path == path]
     arrow = ArrowScan(table.metadata, table.io, scan.projection(), scan.row_filter, scan.case_sensitive)
     state = q.init()
-    for batch in arrow.to_record_batches(tasks):
+    for batch in arrow.to_record_batches([task]):
         state = q.fold(state, batch)
     return state, os.environ.get("NODE_NAME", socket.gethostname())
 
 
 @ray.remote
-def read_file(metadata, name, path):
-    """One query over one data file, returned as an Arrow table."""
+def read_file(metadata, name, task):
+    """One query over one planned data file, returned as an Arrow table."""
     _threads()
     q = QUERIES[name]
     table = _table(metadata)
     scan = _scan(table, q)
-    tasks = [t for t in scan.plan_files() if t.file.file_path == path]
     arrow = ArrowScan(table.metadata, table.io, scan.projection(), scan.row_filter, scan.case_sensitive)
-    return arrow.to_table(tasks)
+    return arrow.to_table([task])
 
 
 def _close(a, b):
@@ -98,22 +122,30 @@ def _check(name, got, want):
             raise SystemExit(f"{name}: {k} {g} vs {v}")
 
 
+def _distributed(table, metadata, q, nodes):
+    """Query `q` as one task per planned file; the answer and how many files."""
+    tasks = list(_scan(table, q).plan_files())
+    parts = ray.get([fold_file.remote(metadata, q.name, t) for t in tasks])
+    got = q.init()
+    for state, node in parts:
+        got = _merge(got, state)
+        nodes.add(node)
+    return got, len(tasks)
+
+
 def main():
     _threads()
     ray.init(address=os.environ.get("RAY_ADDRESS"), logging_level="warning")
     metadata = os.environ["TAXI_METADATA"]
+    passes = int(os.environ.get("TAXI_PASSES", "1"))
     table = _table(metadata)
     nodes = set()
     total_dist = total_local = 0.0
     for q in queries.ALL:
         t0 = time.monotonic()
-        files = [t.file.file_path for t in _scan(table, q).plan_files()]
-        parts = ray.get([fold_file.remote(metadata, q.name, f) for f in files])
-        got = q.init()
-        for state, node in parts:
-            got = _merge(got, state)
-            nodes.add(node)
+        got, n_files = _distributed(table, metadata, q, nodes)
         dist_ms = (time.monotonic() - t0) * 1000
+        print(f"TIME {q.name} 1 {dist_ms:.0f}", flush=True)
 
         t1 = time.monotonic()
         want = q.init()
@@ -121,19 +153,24 @@ def main():
             want = q.fold(want, batch)
         local_ms = (time.monotonic() - t1) * 1000
         _check(q.name, got, want)
+        for k in range(2, passes + 1):
+            t = time.monotonic()
+            again, _ = _distributed(table, metadata, q, nodes)
+            print(f"TIME {q.name} {k} {(time.monotonic() - t) * 1000:.0f}", flush=True)
+            _check(q.name, again, got)
         total_dist += dist_ms
         total_local += local_ms
         print(
-            f"{q.name} : {len(files)} files, {got['n']} rows, sum {got.get('sum', 0.0)}"
+            f"{q.name} : {n_files} files, {got['n']} rows, sum {got.get('sum', 0.0)}"
             f" | distributed {dist_ms:.0f} ms, one process {local_ms:.0f} ms",
             flush=True,
         )
 
     q = QUERIES["q2_month_range"]
     t2 = time.monotonic()
-    files = [t.file.file_path for t in _scan(table, q).plan_files()]
+    tasks = list(_scan(table, q).plan_files())
     got = q.init()
-    for t in ray.get([read_file.remote(metadata, q.name, f) for f in files]):
+    for t in ray.get([read_file.remote(metadata, q.name, task) for task in tasks]):
         for batch in t.to_batches():
             got = q.fold(got, batch)
     want = q.init()

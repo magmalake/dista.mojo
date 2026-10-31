@@ -1,0 +1,116 @@
+# bench/ray on the EC2 cluster: the Ray head (no tasks) and the driver on the
+# head node, and one Ray worker with @SLOTS@ CPUs on each of the first @NODES@
+# worker nodes, so Ray runs @SLOTS@ single-threaded tasks per node as the
+# others run @SLOTS@ workers. bench/cloud/run.sh fills in the @...@ values;
+# the `aws` Secret holds the AWS_* variables the S3 reads use.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ray-head
+spec:
+  clusterIP: None
+  selector: {app: ray-taxi, role: head}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ray-head
+spec:
+  serviceName: ray-head
+  replicas: 1
+  selector:
+    matchLabels: {app: ray-taxi, role: head}
+  template:
+    metadata:
+      labels: {app: ray-taxi, role: head}
+    spec:
+      nodeSelector: {dista-bench/role: head}
+      volumes:
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 4Gi}
+      containers:
+        - name: head
+          image: dista-ray:taxi
+          imagePullPolicy: Never
+          command: [ray, start, --head, --port=6379, --num-cpus=0, --block, --disable-usage-stats, --include-dashboard=false]
+          env:
+            - {name: RAY_AUTH_MODE, value: disabled}
+          volumeMounts:
+            - {name: shm, mountPath: /dev/shm}
+          readinessProbe:
+            tcpSocket: {port: 6379}
+            periodSeconds: 2
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ray-worker
+spec:
+  replicas: @NODES@
+  selector:
+    matchLabels: {app: ray-taxi, role: worker}
+  template:
+    metadata:
+      labels: {app: ray-taxi, role: worker}
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: dista-bench/rank, operator: Lt, values: ["@NODES@"]}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {app: ray-taxi, role: worker}
+      volumes:
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 8Gi}
+      containers:
+        - name: worker
+          image: dista-ray:taxi
+          imagePullPolicy: Never
+          command: [sh, -c, "until ray start --address=ray-head:6379 --num-cpus=@SLOTS@ --block --disable-usage-stats; do sleep 1; done"]
+          envFrom:
+            - secretRef: {name: aws}
+          env:
+            - {name: RAY_AUTH_MODE, value: disabled}
+            - {name: TAXI_THREADS, value: "1"}
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+          volumeMounts:
+            - {name: shm, mountPath: /dev/shm}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: taxi
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {app: ray-taxi, role: driver}
+    spec:
+      restartPolicy: Never
+      nodeSelector: {dista-bench/role: head}
+      volumes:
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 4Gi}
+      containers:
+        - name: driver
+          image: dista-ray:taxi
+          imagePullPolicy: Never
+          command: [sh, -c, "until ray start --address=ray-head:6379 --num-cpus=0 --disable-usage-stats; do sleep 1; done && python /app/taxi_ray.py"]
+          envFrom:
+            - secretRef: {name: aws}
+          env:
+            - {name: RAY_AUTH_MODE, value: disabled}
+            - {name: RAY_ADDRESS, value: auto}
+            - {name: DISTA_EXPECT_NODES, value: "@NODES@"}
+            - {name: TAXI_METADATA, value: "@TAXI_METADATA@"}
+            - {name: TAXI_THREADS, value: "1"}
+            - {name: TAXI_PASSES, value: "@PASSES@"}
+          volumeMounts:
+            - {name: shm, mountPath: /dev/shm}
