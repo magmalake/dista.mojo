@@ -67,14 +67,15 @@ Columnar data does **not** go through `Serializable`. The one columnar type is a
 
 | Where | How | Phase |
 |---|---|---|
-| Same node | IPC message written once into the node's shared-memory store; readers map it | 2 |
-| Between nodes | Arrow Flight, sending the same bytes | 2 |
+| Same node | IPC stream written once into the node's shared-memory store; readers map it | 2 |
+| Between nodes | the same bytes, fetched from the worker's object server | 2 |
 | Spill to object storage | the same bytes as `.arrow` files, readable by pyarrow, DuckDB, Polars | 4 |
 | Phase 1 (one machine) | IPC bytes over the task socket | 1 |
 
 - **One object per batch**, roughly one per Parquet row group, so a scan task returns one `ObjectRef` per batch.
-- **Work needed in the tins:**
-  - Move `ipc.mojo` from flight.mojo into arrow-mlake, add a reader, and cover every `ArrayData` type, including nested types.
+- **How it's built:** the codec recognises `RecordBatch` by its reflected name, `arrow_mlake.batch.RecordBatch`, and writes an 8-byte length, then one IPC stream: the schema and the batch, written by arrow-mlake's `IpcWriter` (arrow-mlake 0.2.0). So a batch is an argument or a result like any other: inline when small, in the node store or fetched from its worker when large, and gathered into a `Seq[RecordBatch]`. Every process is the same binary, so a lighter encoding without the schema would work too, but IPC is what other tools read, and phase 4's spill files need it anyway.
+- **Verified:** `tests/test_batches.mojo`, and the PR-8 gate in `tests/test_parquet_tasks.mojo`: one task per row group of parquet.mojo's 100,000-row fixture returns the group as a batch, other tasks sum a column and count rows, and the answers match a local read. It runs in the `data` environment, which compiles parquet.mojo and its siblings from source (`pixi run -e data test-parquet`, and the CI `parquet` job), because parquet-mojo's package pins an older arrow-mlake.
+- **Work still needed in the tins:**
   - Replace `export_shared`'s JSON manifest with IPC framing, so shared memory and Flight use one encoder. This changes a published tin's format.
   - Zero-copy reads need `ArrayData` buffers that borrow from a mapped region. Until then, reading a batch copies it once. That's accepted for phases 1 and 2.
 - **Compression** (IPC's per-buffer LZ4/ZSTD) applies between nodes only.
