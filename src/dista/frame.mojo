@@ -27,6 +27,11 @@ Every frame is a 4-byte little-endian length, then that many bytes:
 | 14 holding | worker to head, on rejoining | count u64, then per object its ID u64 and its location |
 | 15 claim | driver to head, on resuming | none: this driver still holds this object, which lives on a worker |
 | 16 resumed | driver to head | none: this driver has restored, claimed or resubmitted everything |
+| 17 span | worker to head, before the result | three u64 wall-clock nanoseconds: when the task arrived, started and ended |
+| 18 timeline | driver to head, head to driver | none; the reply is a count u64, then per finished task its object ID, task ID, the four head stamps (submitted, queued, dispatched, settled), the three worker stamps, and the worker's address |
+| 19 actor-create | driver to head, head to worker | the encoded constructor argument; the object ID names the actor, the task ID its type |
+| 20 actor-call | driver to head, head to worker | the actor's ID u64, then the encoded argument; the task ID is the method's |
+| 21 actor-kill | driver to head, head to worker | none: destroy the actor the object ID names |
 
 After a head restart, a driver's hello carries its old number as a u64 after
 the registry hash, so its object IDs stay valid. It then sends, in order of
@@ -34,6 +39,13 @@ submission, each object it still needs: a small result or error back as a
 result or error frame, a result on a worker as claim, and an unfinished task
 as the task or task-after frame it first sent; then resumed. A rejoining
 worker sends holding.
+
+An actor lives on one worker, which runs nothing else while it hosts it. The
+worker answers actor-create with an empty result, or the constructor's
+error, and each call like a task: a result, stored or error frame for the
+call's object ID. Calls run in the order the driver sent them. Actors don't
+survive a head restart yet: a resuming driver fails its actors' unfinished
+calls, and a rejoining worker destroys the actor it hosted.
 
 A task-after frame queues a task whose argument is built from other results:
 the single result as is, or with gather set, a `Seq` of all of them. When
@@ -67,6 +79,11 @@ comptime KIND_STATS: UInt8 = 13
 comptime KIND_HOLDING: UInt8 = 14
 comptime KIND_CLAIM: UInt8 = 15
 comptime KIND_RESUMED: UInt8 = 16
+comptime KIND_SPAN: UInt8 = 17
+comptime KIND_TIMELINE: UInt8 = 18
+comptime KIND_ACTOR_CREATE: UInt8 = 19
+comptime KIND_ACTOR_CALL: UInt8 = 20
+comptime KIND_ACTOR_KILL: UInt8 = 21
 comptime ADDR_SIZE = 12
 comptime ROLE_DRIVER: UInt8 = 1
 comptime ROLE_WORKER: UInt8 = 2

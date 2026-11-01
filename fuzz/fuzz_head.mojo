@@ -46,6 +46,13 @@ def _check(head: Head) raises:
             raise Error("assertion failed: location names no connection")
         if entry.key not in head._where:
             raise Error("assertion failed: located but no address")
+    for entry in head._actors.items():
+        var w = entry.value.worker
+        if w >= 0 and head._hosting[w] != entry.key and not entry.value.failed:
+            raise Error("assertion failed: placed actor not hosted")
+    for i in range(len(head._hosting)):
+        if head._hosting[i] != 0 and head._hosting[i] not in head._actors:
+            raise Error("assertion failed: worker hosts a gone actor")
     for entry in head._deps_of.items():
         if entry.key not in head._refs and entry.key not in head._dead:
             raise Error("assertion failed: inputs held for a gone object")
@@ -58,6 +65,7 @@ def _connect(mut head: Head, mut peers: List[Stream]) raises -> Int:
     head._roles.append(0)
     head._inflight.append(List[UInt64]())
     head._worker_addr.append(List[UInt8]())
+    head._hosting.append(0)
     return len(head._conns) - 1
 
 
@@ -82,7 +90,7 @@ def target(data: List[UInt8]) raises:
     while pos + 5 <= len(data):
         var who = Int(data[pos] & 1)
         var hang_up = (data[pos] & 2) != 0
-        var kind = data[pos + 1] % 17
+        var kind = data[pos + 1] % 22
         var obj = (UInt64(1) << DRIVER_SHIFT) | UInt64(data[pos + 2] % 16)
         var task = UInt64(data[pos + 3] % 4)
         var n = min(Int(data[pos + 4]), len(data) - pos - 5)

@@ -171,6 +171,42 @@ def _new_socket() raises -> c_int:
     return fd
 
 
+def _refuse_self(fd: c_int) raises:
+    """Closes `fd` and raises if it connected to itself.
+
+    Connecting to a local port nothing listens on can pick that same port as
+    the source and complete a connection to itself (TCP simultaneous open).
+    A head restarting on an ephemeral port is exposed to this: a peer
+    reconnecting meanwhile would hold the port, talking to itself, and the
+    new head couldn't bind it.
+    """
+    var mine = Array[UInt8, SOCKADDR_IN_SIZE](fill=0)
+    var theirs = Array[UInt8, SOCKADDR_IN_SIZE](fill=0)
+    var len = stack_allocation[1, c_uint]()
+    len[] = c_uint(SOCKADDR_IN_SIZE)
+    if (
+        external_call["getsockname", c_int](
+            fd, mine.unsafe_ptr().unsafe_bitcast[NoneType](), len
+        )
+        != 0
+    ):
+        return
+    len[] = c_uint(SOCKADDR_IN_SIZE)
+    if (
+        external_call["getpeername", c_int](
+            fd, theirs.unsafe_ptr().unsafe_bitcast[NoneType](), len
+        )
+        != 0
+    ):
+        return
+    # The port and the IPv4 address: bytes 2 to 8 of a sockaddr_in.
+    for i in range(2, 8):
+        if mine[i] != theirs[i]:
+            return
+    _ = external_call["close", c_int](fd)
+    raise Error("connect: the socket connected to itself")
+
+
 struct Stream(Movable):
     """A connected, blocking TCP socket. Closes itself when dropped."""
 
@@ -194,6 +230,7 @@ struct Stream(Movable):
         ):
             _ = external_call["close", c_int](fd)
             _fail("connect")
+        _refuse_self(fd)
         return Stream(fd)
 
     @staticmethod
@@ -211,6 +248,7 @@ struct Stream(Movable):
         ):
             _ = external_call["close", c_int](fd)
             _fail(String("connect to ", host, ":", port))
+        _refuse_self(fd)
         return Stream(fd)
 
     @staticmethod
@@ -241,6 +279,7 @@ struct Stream(Movable):
                     port,
                 )
             )
+        _refuse_self(fd)
         return Stream(fd)
 
     def local_ip(self) raises -> Array[UInt8, 4]:
@@ -311,6 +350,18 @@ struct Stream(Movable):
     def __deinit__(deinit self):
         if self.fd >= 0:
             _ = external_call["close", c_int](self.fd)
+
+
+def wall_ns() -> UInt64:
+    """Nanoseconds since the epoch, from CLOCK_REALTIME.
+
+    The timeline stamps tasks on the head and on workers with this, so the
+    stamps compare across processes and, NTP permitting, machines; a
+    monotonic clock only compares within one host.
+    """
+    var ts = Array[Int64, 2](fill=0)
+    _ = external_call["clock_gettime", c_int](c_int(0), ts.unsafe_ptr())
+    return UInt64(ts[0]) * 1_000_000_000 + UInt64(ts[1])
 
 
 def stream_pair() raises -> List[Stream]:

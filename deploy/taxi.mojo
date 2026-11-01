@@ -17,6 +17,8 @@ nodes too.
     TAXI_PASSES     distributed runs of each query (default 1); the first is
                     checked against one process, the rest against the first,
                     and each prints `TIME <query> <pass> <ms>`
+    TAXI_TIMELINE   write the distributed runs' task timeline to this path,
+                    in Chrome's trace format, before exiting
     TAXI_MODE       `both` (default), `distributed` (no one-process scan: the
                     passes are checked against each other) or `local` (only
                     the one-process scan, no workers)
@@ -376,16 +378,22 @@ def _distributed(
     mut rt: Runtime[FoldFile, ReadFile], q: Query, mut nodes: List[String]
 ) raises -> Tuple[Partial, Int]:
     """Query `q` as one task per planned file; the answer and how many files."""
+    var t = rt.clock()
     var tasks = _scan(q).plan_files()
+    rt.span(String("plan ", q.name), t)
+    t = rt.clock()
     var refs = List[ObjectRef[Partial]]()
-    for t in tasks:
-        refs.append(rt.remote[FoldFile](FileQuery(q.copy(), PlannedFile.of(t))))
+    for f in tasks:
+        refs.append(rt.remote[FoldFile](FileQuery(q.copy(), PlannedFile.of(f))))
+    rt.span(String("submit ", q.name), t)
+    t = rt.clock()
     var got = Partial.zero()
     for r in refs:
         var part = rt.get(r)
         if part.node not in nodes:
             nodes.append(part.node.copy())
         got.add(part)
+    rt.span(String("wait and add up ", q.name), t)
     return (got^, len(tasks))
 
 
@@ -449,7 +457,9 @@ def main() raises:
 
         var local_ms = String("-")
         if mode == "both":
+            var lt = rt.clock()
             var local = _local(q)
+            rt.span(String("one process ", q.name), lt)
             _check(q.name, got, local[0])
             total_local += local[1]
             local_ms = String(local[1])
@@ -478,17 +488,23 @@ def main() raises:
     # Arrow across nodes: the quarter's total_amount comes back as batches.
     var q = queries()[1].copy()
     var t2 = Int(perf_counter_ns())
+    var bt = rt.clock()
     var refs = List[ObjectRef[Seq[RecordBatch]]]()
     for t in _scan(q).plan_files():
         refs.append(rt.remote[ReadFile](FileQuery(q.copy(), PlannedFile.of(t))))
+    rt.span("plan and submit q2_as_batches", bt)
+    bt = rt.clock()
     var got = Partial.zero()
     for r in refs:
         var bs = rt.get(r)
         for k in range(len(bs)):
             fold(got, q, bs[k])
+    rt.span("fetch and fold q2_as_batches", bt)
+    bt = rt.clock()
     var want = Partial.zero()
     for b in _scan(q).to_batches():
         fold(want, q, b)
+    rt.span("check q2_as_batches in the driver", bt)
     _check("q2_as_batches", got, want)
     print(
         "q2_as_batches :",
@@ -507,6 +523,9 @@ def main() raises:
     var expect = Int(getenv("DISTA_EXPECT_NODES", "1"))
     if len(nodes) < expect:
         raise Error("expected ", expect, " nodes, saw ", len(nodes))
+    var timeline = getenv("TAXI_TIMELINE")
+    if timeline != "":
+        print("timeline:", rt.timeline(timeline), "tasks in", timeline)
     if mode == "both":
         print(
             "PASS taxi: 8 queries + 1 as batches, distributed == one process;",

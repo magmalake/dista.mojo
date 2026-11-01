@@ -18,9 +18,14 @@ A result here lives until the head says free, once nothing references it.
 Inputs fetched from peers are copies, kept only until the tasks waiting on
 them have their arguments.
 
+A worker the head gives an actor builds its state and then runs only that
+actor's calls, in the order they come. A kill destroys the state, and the
+worker goes back to running tasks.
+
 If the head goes away, `run` returns and the results here stay. `rejoin`
 introduces the worker to a new head and reports what it holds; the tasks it
-had queued are dropped, since their drivers resubmit them.
+had queued are dropped, since their drivers resubmit them. An actor it
+hosted is destroyed: actors don't survive a head restart yet.
 """
 
 from std.ffi import c_int, external_call
@@ -30,12 +35,16 @@ from dista.codec import get_scalar, put_scalar
 from dista.conn import Conn
 from dista.frame import (
     message,
+    KIND_ACTOR_CALL,
+    KIND_ACTOR_CREATE,
+    KIND_ACTOR_KILL,
     KIND_ERROR,
     KIND_FETCH,
     KIND_FREE,
     KIND_HELLO,
     KIND_HOLDING,
     KIND_RESULT,
+    KIND_SPAN,
     KIND_STORED,
     KIND_TASK,
     KIND_TASK_INPUTS,
@@ -43,6 +52,7 @@ from dista.frame import (
     Frame,
     encode_addr,
 )
+from dista.task import StatePtr
 from dista.store import (
     Location,
     node_name,
@@ -61,6 +71,7 @@ from dista.socket import (
     Stream,
     poll,
     resolve_ipv4,
+    wall_ns,
 )
 
 comptime INLINE_LIMIT = 64 * 1024
@@ -68,6 +79,17 @@ comptime INLINE_LIMIT = 64 * 1024
 
 comptime DispatchFn = def(UInt64, List[UInt8], mut List[UInt8]) thin raises
 """Runs task `task_id` on encoded arguments, appending the encoded result."""
+
+comptime CreateFn = def(UInt64, List[UInt8]) thin raises -> StatePtr
+"""Builds actor type `type_id`'s state from its encoded argument."""
+
+comptime CallFn = def(
+    UInt64, UInt64, StatePtr, List[UInt8], mut List[UInt8]
+) thin raises
+"""Runs method `method_id` on the state of an actor of type `type_id`."""
+
+comptime DestroyFn = def(UInt64, StatePtr) thin
+"""Destroys the state of an actor of type `type_id`."""
 
 
 def addr_key(ip: Array[UInt8, 4], port: Int) -> String:
@@ -149,6 +171,7 @@ struct _Parked(Copyable, Movable):
     var task_id: UInt64
     var gather: Bool
     var inputs: List[_Input]
+    var arrived: UInt64
 
     def __init__(
         out self,
@@ -161,22 +184,39 @@ struct _Parked(Copyable, Movable):
         self.task_id = task_id
         self.gather = gather
         self.inputs = inputs^
+        self.arrived = wall_ns()
 
 
 struct _Ready(Movable):
     var object_id: UInt64
     var task_id: UInt64
     var args: List[UInt8]
+    var arrived: UInt64
+    """When the task reached this worker, before any of its inputs did."""
+    var kind: UInt8
+    """`KIND_TASK`, or the actor frame this is: create, call or kill."""
 
     def __init__(
-        out self, object_id: UInt64, task_id: UInt64, var args: List[UInt8]
+        out self,
+        object_id: UInt64,
+        task_id: UInt64,
+        var args: List[UInt8],
+        arrived: UInt64 = 0,
+        kind: UInt8 = KIND_TASK,
     ):
         self.object_id = object_id
         self.task_id = task_id
         self.args = args^
+        self.arrived = arrived if arrived != 0 else wall_ns()
+        self.kind = kind
 
 
-struct Worker[dispatch: DispatchFn](Movable):
+struct Worker[
+    dispatch: DispatchFn,
+    create: CreateFn,
+    call: CallFn,
+    destroy: DestroyFn,
+](Movable):
     var _head: Conn
     var _listener: Listener
     var _key: String
@@ -206,6 +246,13 @@ struct Worker[dispatch: DispatchFn](Movable):
     """
     var _debug: Bool
     """`DISTA_DEBUG=1`: log each task's inputs as they're assembled."""
+    var _actor: UInt64
+    """The actor hosted here, or 0."""
+    var _actor_type: UInt64
+    var _state: Optional[StatePtr]
+    """Its state, unless its constructor failed."""
+    var _actor_error: String
+    """Why its constructor failed."""
 
     def __init__(out self, var head: Stream, registry_hash: UInt64) raises:
         """Starts the object server and says hello to the head on `head`."""
@@ -234,6 +281,10 @@ struct Worker[dispatch: DispatchFn](Movable):
         self._token = worker_token()
         self._fetched = Dict[UInt64, Bool]()
         self._debug = getenv("DISTA_DEBUG") == "1"
+        self._actor = 0
+        self._actor_type = 0
+        self._state = None
+        self._actor_error = String()
 
     @staticmethod
     def _hello(
@@ -247,6 +298,7 @@ struct Worker[dispatch: DispatchFn](Movable):
     def rejoin(mut self, var head: Stream, registry_hash: UInt64) raises:
         """Says hello to a new head and reports the results held here."""
         self._head = Conn(head^)
+        self._end_actor()
         self._ready.clear()
         self._parked.clear()
         self._requested.clear()
@@ -354,10 +406,16 @@ struct Worker[dispatch: DispatchFn](Movable):
             c.read_available()
 
     def _from_head(mut self, var f: Frame) raises:
-        if f.kind == KIND_TASK:
+        if (
+            f.kind == KIND_TASK
+            or f.kind == KIND_ACTOR_CREATE
+            or f.kind == KIND_ACTOR_CALL
+            or f.kind == KIND_ACTOR_KILL
+        ):
             var obj = f.object_id
             var task = f.task_id
-            self._ready.append(_Ready(obj, task, f^.take_payload()))
+            var kind = f.kind
+            self._ready.append(_Ready(obj, task, f^.take_payload(), kind=kind))
         elif f.kind == KIND_TASK_INPUTS:
             var spec = parse_task_inputs(f.payload)
             var gather = spec.gather
@@ -484,7 +542,9 @@ struct Worker[dispatch: DispatchFn](Movable):
                         args.extend(
                             self._objects.get(inp.object_id, List[UInt8]())
                         )
-                self._ready.append(_Ready(p.object_id, p.task_id, args^))
+                self._ready.append(
+                    _Ready(p.object_id, p.task_id, args^, p.arrived)
+                )
         self._parked = still^
         # Fetched copies nothing parked still waits on have done their job.
         var done = List[UInt64]()
@@ -506,8 +566,61 @@ struct Worker[dispatch: DispatchFn](Movable):
         except:
             self._head.closed = True
 
+    def _end_actor(mut self):
+        """Destroys the actor hosted here, if any."""
+        if self._state:
+            Self.destroy(self._actor_type, self._state.value())
+        self._state = None
+        self._actor = 0
+        self._actor_type = 0
+        self._actor_error = String()
+
+    def _run_actor(mut self, var t: _Ready) raises:
+        """Runs an actor frame: build the actor, call it, or destroy it."""
+        var started = wall_ns()
+        if t.kind == KIND_ACTOR_CREATE:
+            self._end_actor()
+            self._actor = t.object_id
+            self._actor_type = t.task_id
+            try:
+                self._state = Self.create(t.task_id, t.args)
+            except e:
+                self._actor_error = String(e)
+                self._span(t.object_id, t.arrived, started)
+                self._report_error(t.object_id, self._actor_error.copy())
+                return
+            self._span(t.object_id, t.arrived, started)
+            self._to_head(KIND_RESULT, t.object_id, List[UInt8]())
+        elif t.kind == KIND_ACTOR_KILL:
+            if t.object_id == self._actor:
+                self._end_actor()
+        else:
+            var out = List[UInt8]()
+            try:
+                var pos = 0
+                var a = get_scalar[DType.uint64](t.args, pos)
+                if a != self._actor:
+                    raise Error("actor ", a, " is not on this worker")
+                if not self._state:
+                    raise Error("actor failed to start: ", self._actor_error)
+                Self.call(
+                    t.task_id,
+                    self._actor_type,
+                    self._state.value(),
+                    List[UInt8](t.args[8:]),
+                    out,
+                )
+            except e:
+                self._span(t.object_id, t.arrived, started)
+                self._report_error(t.object_id, String(e))
+                return
+            self._finish(t.object_id, t.arrived, started, out^)
+
     def _run_one(mut self) raises:
         var t = self._ready.pop(0)
+        if t.kind != KIND_TASK:
+            self._run_actor(t^)
+            return
         if t.object_id in self._files:
             # A task resubmitted across a head restart, whose result this
             # worker already has. Tasks are pure, so report that copy rather
@@ -517,19 +630,30 @@ struct Worker[dispatch: DispatchFn](Movable):
             )
             return
         var out = List[UInt8]()
+        var started = wall_ns()
         try:
             Self.dispatch(t.task_id, t.args, out)
         except e:
+            self._span(t.object_id, t.arrived, started)
             self._report_error(t.object_id, String(e))
             return
+        self._finish(t.object_id, t.arrived, started, out^)
+
+    def _finish(
+        mut self,
+        obj: UInt64,
+        arrived: UInt64,
+        started: UInt64,
+        var out: List[UInt8],
+    ):
+        """Sends a small result to the head, or stores a large one here."""
         if len(out) <= INLINE_LIMIT:
-            self._to_head(KIND_RESULT, t.object_id, out)
+            self._span(obj, arrived, started)
+            self._to_head(KIND_RESULT, obj, out)
         else:
             var path = String()
             if self._dir != "":
-                path = String(
-                    self._dir, "/dista-", hex(self._token), "-", t.object_id
-                )
+                path = String(self._dir, "/dista-", hex(self._token), "-", obj)
                 try:
                     write_shared(path, out)
                 except e:
@@ -537,10 +661,19 @@ struct Worker[dispatch: DispatchFn](Movable):
                     path = String()
             var loc = Location(self._ip, self._port, self._node, path, len(out))
             if path != "":
-                self._files[t.object_id] = loc.copy()
+                self._files[obj] = loc.copy()
             else:
-                self._objects[t.object_id] = out^
-            self._to_head(KIND_STORED, t.object_id, loc.encode())
+                self._objects[obj] = out^
+            self._span(obj, arrived, started)  # storing included
+            self._to_head(KIND_STORED, obj, loc.encode())
+
+    def _span(mut self, obj: UInt64, arrived: UInt64, started: UInt64):
+        """Tells the head when `obj`'s task arrived, started and ended here."""
+        var body = List[UInt8]()
+        put_scalar[DType.uint64](body, arrived)
+        put_scalar[DType.uint64](body, started)
+        put_scalar[DType.uint64](body, wall_ns())
+        self._to_head(KIND_SPAN, obj, body)
 
     def _to_head(mut self, kind: UInt8, obj: UInt64, payload: Span[UInt8, _]):
         """Sends to the head; a head that's gone is noticed by `run`."""

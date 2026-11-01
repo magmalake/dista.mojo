@@ -97,12 +97,16 @@ spec:
       volumes:
         - name: shm
           emptyDir: {medium: Memory, sizeLimit: 8Gi}
+        # The task timeline lands on the head node; run.sh copies it back.
+        - name: results
+          hostPath: {path: /var/lib/dista-results, type: DirectoryOrCreate}
       containers:
         - name: driver
           image: dista:taxi
           imagePullPolicy: Never
           volumeMounts:
             - {name: shm, mountPath: /dev/shm}
+            - {name: results, mountPath: /results}
           envFrom:
             - secretRef: {name: aws}
           env:
@@ -111,3 +115,4 @@ spec:
             - {name: TAXI_METADATA, value: "@TAXI_METADATA@"}
             - {name: TAXI_PASSES, value: "@PASSES@"}
             - {name: TAXI_MODE, value: distributed}
+            - {name: TAXI_TIMELINE, value: "/results/dista-@NODES@-timeline.json"}
