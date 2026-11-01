@@ -229,17 +229,23 @@ def connect_head(addr: String) raises -> Stream:
     In a cluster, processes start in any order: a worker's pod can come up
     before the head's, or before its name resolves. This keeps trying for
     `DISTA_CONNECT_TIMEOUT` seconds (default 60), then raises the last error.
+
+    The wait between tries starts at 10 ms and doubles to 250 ms: a head that
+    restarts is usually back within a fraction of a second, and a flat 250 ms
+    added that much to every recovery.
     """
     var hp = parse_host_port(addr)
     var limit = Int(getenv("DISTA_CONNECT_TIMEOUT", "60"))
     var deadline = Int(perf_counter_ns()) + limit * 1_000_000_000
+    var wait = 0.01
     while True:
         try:
             return Stream.connect(hp[0], hp[1])
         except e:
             if Int(perf_counter_ns()) >= deadline:
                 raise e^
-        sleep(0.25)
+        sleep(wait)
+        wait = min(wait * 2.0, 0.25)
 
 
 struct Runtime[*Ts: TaskLike](Movable):
