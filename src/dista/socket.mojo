@@ -313,6 +313,22 @@ struct Stream(Movable):
             _ = external_call["close", c_int](self.fd)
 
 
+def stream_pair() raises -> List[Stream]:
+    """Two connected local stream sockets, for tests and fuzzing."""
+    var fds = Array[c_int, 2](fill=0)
+    if (
+        external_call["socketpair", c_int](
+            c_int(1), c_int(1), c_int(0), fds.unsafe_ptr()
+        )
+        != 0
+    ):
+        _fail("socketpair")
+    var out = List[Stream]()
+    out.append(Stream(fds[0]))
+    out.append(Stream(fds[1]))
+    return out^
+
+
 struct Listener(Movable):
     """A TCP listener. Closes itself when dropped."""
 

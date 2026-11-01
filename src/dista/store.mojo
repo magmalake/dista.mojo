@@ -164,8 +164,8 @@ struct Location(Copyable, Movable):
 
 def _get_string(buf: Span[UInt8, _], mut pos: Int) raises -> String:
     var n = Int(get_scalar[DType.uint64](buf, pos))
-    if pos + n > len(buf):
+    if n < 0 or n > len(buf) - pos:
         raise Error("truncated location")
-    var s = String(unsafe_from_utf8=buf[pos : pos + n])
+    var s = String(from_utf8=buf[pos : pos + n])
     pos += n
     return s^

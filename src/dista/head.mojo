@@ -36,6 +36,7 @@ from std.ffi import c_int
 from dista.codec import get_scalar, put_scalar
 from dista.conn import Conn
 from dista.frame import (
+    message,
     ADDR_SIZE,
     KIND_CLAIM,
     KIND_ERROR,
@@ -240,9 +241,13 @@ struct Head(Movable):
                     return
                 self._queue.append(_Task(obj, task, f^.take_payload()))
             elif f.kind == KIND_TASK_AFTER:
+                if len(f.payload) < 9:
+                    raise Error("truncated task-after")
                 var gather = f.payload[0] != 0
                 var pos = 1
                 var n = Int(get_scalar[DType.uint64](f.payload, pos))
+                if n < 0 or n > (len(f.payload) - pos) // 8:
+                    raise Error("task-after with a bad input count ", n)
                 var deps = List[UInt64](capacity=n)
                 for _ in range(n):
                     deps.append(get_scalar[DType.uint64](f.payload, pos))
@@ -278,7 +283,7 @@ struct Head(Movable):
                 if f.kind == KIND_RESULT:
                     self._results[obj] = f^.take_payload()
                 else:
-                    self._errors[obj] = String(unsafe_from_utf8=f.payload)
+                    self._errors[obj] = message(f.payload)
             elif f.kind == KIND_CLAIM:
                 self._hold(f.object_id)
                 _ = self._orphans.pop(f.object_id, False)
@@ -342,7 +347,7 @@ struct Head(Movable):
                     self._where[obj] = f.payload.copy()
                     self._deliver(obj, KIND_LOCATED, f.payload)
             else:
-                self._errors[obj] = String(unsafe_from_utf8=f.payload)
+                self._errors[obj] = message(f.payload)
                 self._deliver(obj, f.kind, f.payload)
             self._settle(obj)
 

@@ -41,7 +41,9 @@ trait Codec:
 
 
 def _need(buf: Span[UInt8, _], pos: Int, n: Int) raises:
-    if pos + n > len(buf):
+    # Lengths come off the wire: a negative one would pass a plain
+    # `pos + n > len` and slice out of bounds.
+    if n < 0 or pos < 0 or n > len(buf) - pos:
         raise Error(
             "decode: needed ", n, " bytes at ", pos, ", have ", len(buf) - pos
         )
@@ -166,7 +168,7 @@ def decode[T: Movable](buf: Span[UInt8, _], mut pos: Int) raises -> T:
     elif name == "String":
         var n = Int(get_scalar[DType.int64](buf, pos))
         _need(buf, pos, n)
-        var s = String(unsafe_from_utf8=buf[pos : pos + n])
+        var s = String(from_utf8=buf[pos : pos + n])
         pos += n
         return rebind_var[T](s^)
     elif name == "arrow_mlake.batch.RecordBatch":

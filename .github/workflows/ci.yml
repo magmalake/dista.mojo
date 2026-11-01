@@ -123,6 +123,24 @@ jobs:
       - name: Smoke test on a 3-node kind cluster
         run: tests/kind.sh
 
+  # Every fuzz harness under fuzz/, for a short session each, with all bounds
+  # checks on. Longer sessions are a FUZZ_RUNS away locally.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          pixi-version: v0.78.0
+          environments: fuzz
+      - name: Fuzz
+        run: FUZZ_RUNS=20000 pixi run -e fuzz fuzz
+      - if: failure()
+        name: Show the crashing inputs
+        run: |
+          for f in build/fuzz-*-last.bin; do echo "$f"; xxd "$f" | head -20; done
+          ls -R build/fuzz-crashes || true
+
   format:
     runs-on: ubuntu-latest
     steps:

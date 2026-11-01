@@ -37,6 +37,7 @@ from std.time import perf_counter_ns, sleep
 
 from dista.codec import decode, encode, get_scalar, put_scalar
 from dista.frame import (
+    message,
     KIND_CLAIM,
     KIND_ERROR,
     KIND_FETCH,
@@ -293,7 +294,7 @@ struct Runtime[*Ts: TaskLike](Movable):
         if frame.kind == KIND_ERROR:
             raise Error(
                 "the head refused this driver: ",
-                String(unsafe_from_utf8=frame.payload),
+                message(frame.payload),
             )
         if frame.kind != KIND_WELCOME:
             raise Error("expected welcome, got frame kind ", Int(frame.kind))
@@ -507,7 +508,7 @@ struct Runtime[*Ts: TaskLike](Movable):
                 if frame.kind == KIND_RESULT:
                     self._results[id] = frame.payload.copy()
                 else:
-                    self._errors[id] = String(unsafe_from_utf8=frame.payload)
+                    self._errors[id] = message(frame.payload)
             self._settle(id)
         elif frame.kind == KIND_LOCATED:
             if keep:
@@ -625,4 +626,4 @@ struct Runtime[*Ts: TaskLike](Movable):
             self._socket_bytes += len(frame.payload)
             self._results[id] = frame.payload.copy()
         else:
-            raise Error(String(unsafe_from_utf8=frame.payload))
+            raise Error(message(frame.payload))
