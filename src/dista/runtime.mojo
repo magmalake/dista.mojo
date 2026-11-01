@@ -37,18 +37,21 @@ from std.time import perf_counter_ns, sleep
 
 from dista.codec import decode, encode, get_scalar, put_scalar
 from dista.frame import (
+    KIND_CLAIM,
     KIND_ERROR,
     KIND_FETCH,
     KIND_HELLO,
     KIND_LOCATED,
     KIND_RELEASE,
     KIND_RESULT,
+    KIND_RESUMED,
     KIND_STATS,
     KIND_TASK,
     KIND_TASK_AFTER,
     KIND_WELCOME,
     ROLE_DRIVER,
     ROLE_WORKER,
+    Frame,
     read_frame,
     write_frame,
 )
@@ -79,6 +82,16 @@ struct ObjectRef[T: AnyType](ImplicitlyCopyable, Movable, Writable):
 
     def write_to(self, mut writer: Some[Writer]):
         writer.write("ObjectRef(", self.id, ")")
+
+
+@fieldwise_init
+struct _Submission(Copyable, Movable):
+    """A task this driver sent, kept until it settles so it can be resent."""
+
+    var kind: UInt8
+    var task_id: UInt64
+    var payload: List[UInt8]
+    var deps: List[UInt64]
 
 
 @fieldwise_init
@@ -140,6 +153,16 @@ struct Runtime[*Ts: TaskLike](Movable):
     var _fetcher_index: Dict[String, Int]
     var _released: Dict[UInt64, Bool]
     var _stats: Optional[HeadStats]
+    var _head_addr: String
+    """The head's `host:port` in a cluster, or "" in local mode."""
+    var _subs: Dict[UInt64, _Submission]
+    """Tasks not settled yet, resent if the head restarts."""
+    var _dependents: Dict[UInt64, Int]
+    """For an object, how many unsettled submissions take it as input."""
+    var _live: Dict[UInt64, Bool]
+    """Objects this driver would restore after a head restart."""
+    var _resumes: Int
+    """How many times this driver has resumed with a restarted head."""
 
     def __init__(out self, workers: Int = 4, pipeline: Int = 2) raises:
         """Starts this process in the role its environment names.
@@ -160,7 +183,8 @@ struct Runtime[*Ts: TaskLike](Movable):
             head.run()
             exit_now(0)
         if role == "worker":
-            Self._work(connect_head(getenv("DISTA_HEAD")))
+            var at = getenv("DISTA_HEAD")
+            Self._work(connect_head(at), at)
             exit_now(0)
         if role != "":
             raise Error("DISTA_ROLE must be head or worker, got ", role)
@@ -216,6 +240,11 @@ struct Runtime[*Ts: TaskLike](Movable):
         self._fetcher_index = Dict[String, Int]()
         self._released = Dict[UInt64, Bool]()
         self._stats = None
+        self._head_addr = head_addr
+        self._subs = Dict[UInt64, _Submission]()
+        self._dependents = Dict[UInt64, Int]()
+        self._live = Dict[UInt64, Bool]()
+        self._resumes = 0
 
     def __deinit__(deinit self):
         # In local mode the head exits once its only driver leaves, and closes
@@ -288,10 +317,20 @@ struct Runtime[*Ts: TaskLike](Movable):
         Self._dispatch(task_id, args, out)
 
     @staticmethod
-    def _work(var head: Stream) raises:
-        """A worker: run tasks and serve results until the head hangs up."""
+    def _work(var head: Stream, rejoin_at: String = "") raises:
+        """A worker: run tasks and serve results until the head hangs up.
+
+        Given the head's address, a worker whose head goes away reconnects
+        (for up to `DISTA_CONNECT_TIMEOUT` seconds) and rejoins it with its
+        results, so a restarted head picks up where it left off.
+        """
         var w = Worker[Self._dispatch_list](head^, Self._registry_hash())
-        w.run()
+        while True:
+            w.run()
+            if rejoin_at == "":
+                return
+            print("dista worker: head gone, rejoining", rejoin_at)
+            w.rejoin(connect_head(rejoin_at), Self._registry_hash())
 
     @staticmethod
     def _check_registered[T: TaskLike]() raises:
@@ -310,7 +349,7 @@ struct Runtime[*Ts: TaskLike](Movable):
         var args = List[UInt8]()
         encode(arg, args)
         var id = self._new_id()
-        write_frame(self._head, KIND_TASK, id, T.id(), args)
+        self._submit(id, KIND_TASK, T.id(), args^, List[UInt64]())
         return ObjectRef[T.R](id)
 
     def remote[
@@ -346,25 +385,134 @@ struct Runtime[*Ts: TaskLike](Movable):
         for d in deps:
             put_scalar[DType.uint64](body, d)
         var id = self._new_id()
-        write_frame(self._head, KIND_TASK_AFTER, id, task_id, body)
+        self._submit(id, KIND_TASK_AFTER, task_id, body^, deps.copy())
         return ObjectRef[R](id)
+
+    def _submit(
+        mut self,
+        id: UInt64,
+        kind: UInt8,
+        task_id: UInt64,
+        var payload: List[UInt8],
+        var deps: List[UInt64],
+    ) raises:
+        for d in deps:
+            self._dependents[d] = self._dependents.get(d, 0) + 1
+        self._live[id] = True
+        self._subs[id] = _Submission(kind, task_id, payload^, deps^)
+        var sent = True
+        ref body = self._subs[id].payload
+        try:
+            write_frame(self._head, kind, id, task_id, body)
+        except:
+            sent = False
+        if not sent:
+            # Resuming resends this submission with the rest.
+            self._resume(Error("lost the head while submitting"))
+
+    def _send(mut self, kind: UInt8, id: UInt64, payload: List[UInt8]) raises:
+        """Sends a frame to the head, resuming with a new head if it's gone."""
+        try:
+            write_frame(self._head, kind, id, 0, payload)
+        except e:
+            self._resume(e)
+            write_frame(self._head, kind, id, 0, payload)
+
+    def _settle(mut self, id: UInt64):
+        """`id`'s task is done: it no longer needs its inputs kept."""
+        var sub = self._subs.pop(id, _Submission(0, 0, [], []))
+        for d in sub.deps:
+            var n = self._dependents.get(d, 0) - 1
+            if n > 0:
+                self._dependents[d] = n
+                continue
+            _ = self._dependents.pop(d, 0)
+            if d in self._released:
+                self._drop_local(d)
+
+    def _drop_local(mut self, id: UInt64):
+        _ = self._results.pop(id, List[UInt8]())
+        _ = self._errors.pop(id, String())
+        _ = self._located.pop(id, List[UInt8]())
+        _ = self._live.pop(id, False)
+
+    def _resume(mut self, cause: Error) raises:
+        """Reconnects to a restarted head and gives it back this driver's state.
+
+        In local mode the head is this process's child and doesn't come back,
+        so the error stands.
+        """
+        if self._head_addr == "":
+            raise cause.copy()
+        print("dista driver: lost the head (", cause, "), resuming")
+        self._resumes += 1
+        self._head.close()
+        self._head = connect_head(self._head_addr)
+        var hello = Self._hello_payload(ROLE_DRIVER)
+        put_scalar[DType.uint64](hello, self._driver)
+        write_frame(self._head, KIND_HELLO, 0, 0, hello)
+        var f = read_frame(self._head)
+        if not f or f.value().kind != KIND_WELCOME:
+            raise Error("the restarted head didn't welcome this driver back")
+        # Oldest first, so every task's inputs are back before it is.
+        for n in range(1, Int(self._counter) + 1):
+            var id = (self._driver << DRIVER_SHIFT) | UInt64(n)
+            if id not in self._live:
+                continue
+            if id in self._results:
+                write_frame(self._head, KIND_RESULT, id, 0, self._results[id])
+            elif id in self._errors:
+                write_frame(
+                    self._head, KIND_ERROR, id, 0, self._errors[id].as_bytes()
+                )
+            elif id in self._located:
+                write_frame(self._head, KIND_CLAIM, id, 0, List[UInt8]())
+            elif id in self._subs:
+                ref sub = self._subs[id]
+                write_frame(self._head, sub.kind, id, sub.task_id, sub.payload)
+        write_frame(
+            self._head,
+            KIND_RESUMED,
+            self._driver << DRIVER_SHIFT,
+            0,
+            List[UInt8](),
+        )
+        # Released objects came back only for the tasks that need them.
+        for entry in self._live.items():
+            if entry.key in self._released:
+                write_frame(
+                    self._head, KIND_RELEASE, entry.key, 0, List[UInt8]()
+                )
 
     def _settled(self, id: UInt64) -> Bool:
         return id in self._results or id in self._errors or id in self._located
 
     def _read_one(mut self) raises:
-        var f = read_frame(self._head)
+        var f: Optional[Frame]
+        try:
+            f = read_frame(self._head)
+        except e:
+            self._resume(e)
+            return
         if not f:
-            raise Error("the head closed the connection")
+            self._resume(Error("the head closed the connection"))
+            return
         ref frame = f.value()
-        if frame.kind == KIND_RESULT:
-            self._results[frame.object_id] = frame.payload.copy()
+        var id = frame.object_id
+        # A released object is still kept while an unsettled task needs it:
+        # a restarted head would need it back.
+        var keep = id not in self._released or id in self._dependents
+        if frame.kind == KIND_RESULT or frame.kind == KIND_ERROR:
+            if keep:
+                if frame.kind == KIND_RESULT:
+                    self._results[id] = frame.payload.copy()
+                else:
+                    self._errors[id] = String(unsafe_from_utf8=frame.payload)
+            self._settle(id)
         elif frame.kind == KIND_LOCATED:
-            self._located[frame.object_id] = frame.payload.copy()
-        elif frame.kind == KIND_ERROR:
-            self._errors[frame.object_id] = String(
-                unsafe_from_utf8=frame.payload
-            )
+            if keep:
+                self._located[id] = frame.payload.copy()
+            self._settle(id)
         elif frame.kind == KIND_STATS:
             var pos = 0
             var n = List[Int]()
@@ -414,10 +562,11 @@ struct Runtime[*Ts: TaskLike](Movable):
         if r.id in self._released:
             return
         self._released[r.id] = True
-        _ = self._results.pop(r.id, List[UInt8]())
-        _ = self._errors.pop(r.id, String())
-        _ = self._located.pop(r.id, List[UInt8]())
-        write_frame(self._head, KIND_RELEASE, r.id, 0, List[UInt8]())
+        if self._dependents.get(r.id, 0) == 0:
+            self._drop_local(r.id)
+        # Otherwise its copy stays here until the tasks that take it settle:
+        # a restarted head would need it back.
+        self._send(KIND_RELEASE, r.id, List[UInt8]())
 
     def release[R: AnyType](mut self, refs: List[ObjectRef[R]]) raises:
         """Releases every ref in `refs`."""
@@ -427,9 +576,14 @@ struct Runtime[*Ts: TaskLike](Movable):
     def stats(mut self) raises -> HeadStats:
         """Asks the head what it holds. Frames that arrive first are kept."""
         self._stats = None
-        write_frame(self._head, KIND_STATS, 0, 0, List[UInt8]())
+        self._send(KIND_STATS, 0, List[UInt8]())
+        var asked = self._resumes
         while not self._stats:
             self._read_one()
+            if self._resumes != asked:
+                # The head that was asked is gone: ask the new one.
+                asked = self._resumes
+                self._send(KIND_STATS, 0, List[UInt8]())
         return self._stats.value().copy()
 
     def bytes_fetched(self) -> Int:

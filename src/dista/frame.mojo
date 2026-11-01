@@ -24,6 +24,16 @@ Every frame is a 4-byte little-endian length, then that many bytes:
 | 11 release | driver to head | none: the driver is done with this object |
 | 12 free | head to worker | none: delete this object |
 | 13 stats | driver to head, head to driver | none; the reply is five u64 counts (see `HeadStats`) |
+| 14 holding | worker to head, on rejoining | count u64, then per object its ID u64 and its location |
+| 15 claim | driver to head, on resuming | none: this driver still holds this object, which lives on a worker |
+| 16 resumed | driver to head | none: this driver has restored, claimed or resubmitted everything |
+
+After a head restart, a driver's hello carries its old number as a u64 after
+the registry hash, so its object IDs stay valid. It then sends, in order of
+submission, each object it still needs: a small result or error back as a
+result or error frame, a result on a worker as claim, and an unfinished task
+as the task or task-after frame it first sent; then resumed. A rejoining
+worker sends holding.
 
 A task-after frame queues a task whose argument is built from other results:
 the single result as is, or with gather set, a `Seq` of all of them. When
@@ -54,6 +64,9 @@ comptime KIND_TASK_INPUTS: UInt8 = 10
 comptime KIND_RELEASE: UInt8 = 11
 comptime KIND_FREE: UInt8 = 12
 comptime KIND_STATS: UInt8 = 13
+comptime KIND_HOLDING: UInt8 = 14
+comptime KIND_CLAIM: UInt8 = 15
+comptime KIND_RESUMED: UInt8 = 16
 comptime ADDR_SIZE = 12
 comptime ROLE_DRIVER: UInt8 = 1
 comptime ROLE_WORKER: UInt8 = 2
