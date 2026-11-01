@@ -22,5 +22,5 @@ spec:
             - secretRef: {name: aws}
           env:
             - {name: TAXI_MODE, value: local}
-            - {name: TAXI_THREADS, value: "1"}
+            - {name: TAXI_THREADS, value: "@TAXI_THREADS@"}
             - {name: TAXI_METADATA, value: "@TAXI_METADATA@"}

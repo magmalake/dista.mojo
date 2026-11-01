@@ -2,7 +2,9 @@
 # The benchmark on the EC2 cluster, in two parts.
 #
 #   bench/cloud/run.sh local    the reference: each framework scans the table
-#                               in one process on the head node, no workers
+#                               in one process on the head node, no workers,
+#                               on THREADS threads (default 1; 16 is the
+#                               head node's every core)
 #   bench/cloud/run.sh          the matrix: each framework on each node count,
 #                               every query TAXI_PASSES times
 #   NODES="3 6 12" FRAMEWORKS="dista rust ray" PASSES=5 SLOTS=16 bench/cloud/run.sh
@@ -64,9 +66,10 @@ if [ "${1:-}" = local ]; then
     esac
     echo "== $fw, one process on the head node"
     sed -e "s|@APP@|$fw-taxi|g" -e "s|@IMAGE@|$image|g" -e "s|@COMMAND@|$command|g" \
-      -e "s|@TAXI_METADATA@|$metadata|g" bench/cloud/k8s/local.yaml > "$state/$fw-local.yaml"
+      -e "s|@TAXI_METADATA@|$metadata|g" -e "s|@TAXI_THREADS@|${THREADS:-1}|g" \
+      bench/cloud/k8s/local.yaml > "$state/$fw-local.yaml"
     log=$results/$fw-local.log
-    { echo "# $fw local"; echo "# metadata=$metadata"; } > "$log"
+    { echo "# $fw local, ${THREADS:-1} threads"; echo "# metadata=$metadata"; } > "$log"
     run_job "$state/$fw-local.yaml" "$log" "$fw-taxi"
   done
   python3 bench/cloud/summarize.py "$results" | tee "$results/summary.md"

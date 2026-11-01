@@ -74,7 +74,7 @@ jobs:
       - uses: actions/checkout@v4
         with: {repository: magmalake/parquet.mojo, ref: 9a596283d3612d1ebeca199f9e48f1c1a7eaab51, path: parquet.mojo}
       - uses: actions/checkout@v4
-        with: {repository: magmalake/iceberg.mojo, ref: 557ecdde5b6ead3a32da1580769378ca99365aeb, path: iceberg.mojo}
+        with: {repository: magmalake/iceberg.mojo, ref: db887402f266edeac68a39a951dc18df58e97f0e, path: iceberg.mojo}
       - uses: actions/checkout@v4
         with: {repository: magmalake/threads.mojo, ref: f45e780a8de77278c140cee36904e46e93e0ca1c, path: threads.mojo}
       - uses: actions/checkout@v4
@@ -90,7 +90,7 @@ jobs:
       - uses: actions/checkout@v4
         with: {repository: magmalake/roaring.mojo, ref: a90a7bd30cf1c21403a29059282072e93fbeeee2, path: roaring.mojo}
       - uses: actions/checkout@v4
-        with: {repository: magmalake/objectstore.mojo, ref: 1781d56ae908798a835e9178fa6b046c86d5ff27, path: objectstore.mojo}
+        with: {repository: magmalake/objectstore.mojo, ref: 670247293c816668d479bfd323cae380921cb49f, path: objectstore.mojo}
       - uses: actions/checkout@v4
         with: {repository: magmalake/zstd.mojo, ref: 53655623ca8585fd5b36b1239842913ec308ae69, path: zstd.mojo}
       - uses: actions/checkout@v4

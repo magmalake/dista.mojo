@@ -21,6 +21,8 @@ nodes too.
                     and each prints `TIME <query> <pass> <ms>`
     TAXI_TIMELINE   write the distributed runs' task timeline to this path,
                     in Chrome's trace format, before exiting
+    TAXI_THREADS    threads for the one-process scan (iceberg's `num_workers`);
+                    unset, one per core
     TAXI_MODE       `both` (default), `distributed` (no one-process scan: the
                     passes are checked against each other) or `local` (only
                     the one-process scan, no workers)
@@ -423,11 +425,19 @@ def _distributed(
     return (got^, len(tasks))
 
 
+def _local_options() raises -> ScanOptions:
+    """`TAXI_THREADS` threads for the one-process scan, as the Rust and Ray
+    references read it; unset, one per core."""
+    var opts = ScanOptions()
+    opts.num_workers = Int(getenv("TAXI_THREADS", "0"))
+    return opts^
+
+
 def _local(q: Query, table: TableMetadata) raises -> Tuple[Partial, Int]:
     """Query `q` scanned in this process; the answer and its milliseconds."""
     var t = Int(perf_counter_ns())
     var want = Partial.zero()
-    var reader = _scan(q, table.copy()).to_batch_reader()
+    var reader = _scan(q, table.copy()).to_batch_reader(_local_options())
     while True:
         var b = reader.next_batch()
         if not b:
