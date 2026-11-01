@@ -1,7 +1,9 @@
 # dista on the EC2 cluster: the head and the driver on the head node, and
 # @SLOTS@ single-threaded workers on each of the first @NODES@ worker nodes.
 # bench/cloud/run.sh fills in the @...@ values; the `aws` Secret holds the
-# AWS_* variables the S3 reads use.
+# AWS_* variables the S3 reads use. dista's node store lives in /dev/shm,
+# which a pod otherwise gets as 64 MB, so workers and driver mount a bigger
+# one, as the Ray pods do for Ray's object store.
 apiVersion: v1
 kind: Service
 metadata:
@@ -60,10 +62,15 @@ spec:
           whenUnsatisfiable: DoNotSchedule
           labelSelector:
             matchLabels: {app: dista-taxi, role: worker}
+      volumes:
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 8Gi}
       containers:
         - name: worker
           image: dista:taxi
           imagePullPolicy: Never
+          volumeMounts:
+            - {name: shm, mountPath: /dev/shm}
           envFrom:
             - secretRef: {name: aws}
           env:
@@ -87,10 +94,15 @@ spec:
     spec:
       restartPolicy: Never
       nodeSelector: {dista-bench/role: head}
+      volumes:
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 8Gi}
       containers:
         - name: driver
           image: dista:taxi
           imagePullPolicy: Never
+          volumeMounts:
+            - {name: shm, mountPath: /dev/shm}
           envFrom:
             - secretRef: {name: aws}
           env:
