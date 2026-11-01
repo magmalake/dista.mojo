@@ -4,6 +4,10 @@
 # the head killed (-9) and restarted at random moments. The driver checks
 # every result it still holds against the same functions run in-process.
 #
+# A seed that runs past CHAOS_TIMEOUT seconds (default 180) fails, after
+# saving the driver's stack to build/chaos-hang-<seed>.txt (macOS `sample`,
+# Linux gdb), so a hang can't stall CI and leaves something to read.
+#
 # Only the head is killed for now: a worker's death fails its tasks until
 # actors bring restarts (phase 3, PR 6), and then workers join the kill list.
 set -euo pipefail
@@ -34,13 +38,29 @@ for seed in ${CHAOS_SEEDS:-1 2 3}; do
   pids+=($driver)
 
   # Kill the head every 0.3-1.2 s (seeded) while the driver runs;
-  # CHAOS_FAST=1 makes it every 0.1-0.5 s.
+  # CHAOS_FAST=1 makes it every 0.1-0.5 s, CHAOS_FAST=2 every 0.05-0.2 s.
   RANDOM=$seed
   kills=0
+  started=$SECONDS
   lo=3 spread=9
   [ "${CHAOS_FAST:-0}" = 1 ] && lo=1 spread=5
   while kill -0 "$driver" 2>/dev/null; do
-    sleep "0.$((lo + RANDOM % spread))"
+    if [ $((SECONDS - started)) -gt "${CHAOS_TIMEOUT:-180}" ]; then
+      echo "FAIL: chaos seed $seed hung after $kills head kills; stack in build/chaos-hang-$seed.txt"
+      if command -v sample >/dev/null; then
+        sample "$driver" 2 -file "build/chaos-hang-$seed.txt" >/dev/null 2>&1 || true
+      elif command -v gdb >/dev/null; then
+        gdb -p "$driver" -batch -ex "thread apply all bt" > "build/chaos-hang-$seed.txt" 2>&1 || true
+      fi
+      grep -E "dista::" "build/chaos-hang-$seed.txt" | head -15 || true
+      tail -20 build/chaos-driver.log
+      exit 1
+    fi
+    if [ "${CHAOS_FAST:-0}" = 2 ]; then
+      sleep "$(printf '0.%02d' $((5 + RANDOM % 15)))"
+    else
+      sleep "0.$((lo + RANDOM % spread))"
+    fi
     kill -0 "$driver" 2>/dev/null || break
     kill -9 "$head" 2>/dev/null || true
     sleep 0.2

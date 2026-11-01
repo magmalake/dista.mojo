@@ -164,6 +164,8 @@ struct Runtime[*Ts: TaskLike](Movable):
     """Objects this driver would restore after a head restart."""
     var _resumes: Int
     """How many times this driver has resumed with a restarted head."""
+    var _claimed: Dict[UInt64, Bool]
+    """Results claimed from a restarted head that hasn't said where yet."""
 
     def __init__(out self, workers: Int = 4, pipeline: Int = 2) raises:
         """Starts this process in the role its environment names.
@@ -246,6 +248,7 @@ struct Runtime[*Ts: TaskLike](Movable):
         self._dependents = Dict[UInt64, Int]()
         self._live = Dict[UInt64, Bool]()
         self._resumes = 0
+        self._claimed = Dict[UInt64, Bool]()
 
     def __deinit__(deinit self):
         # In local mode the head exits once its only driver leaves, and closes
@@ -435,6 +438,7 @@ struct Runtime[*Ts: TaskLike](Movable):
         _ = self._results.pop(id, List[UInt8]())
         _ = self._errors.pop(id, String())
         _ = self._located.pop(id, List[UInt8]())
+        _ = self._claimed.pop(id, False)
         _ = self._live.pop(id, False)
 
     def _resume(mut self, cause: Error) raises:
@@ -447,8 +451,19 @@ struct Runtime[*Ts: TaskLike](Movable):
             raise cause.copy()
         print("dista driver: lost the head (", cause, "), resuming")
         self._resumes += 1
-        self._head.close()
-        self._head = connect_head(self._head_addr)
+        while True:
+            # Raises once the head has been unreachable for
+            # DISTA_CONNECT_TIMEOUT seconds.
+            self._head.close()
+            self._head = connect_head(self._head_addr)
+            try:
+                self._replay()
+                return
+            except e:
+                print("dista driver: lost the head again resuming (", e, ")")
+
+    def _replay(mut self) raises:
+        """Says hello under this driver's number and sends back its state."""
         var hello = Self._hello_payload(ROLE_DRIVER)
         put_scalar[DType.uint64](hello, self._driver)
         write_frame(self._head, KIND_HELLO, 0, 0, hello)
@@ -466,12 +481,14 @@ struct Runtime[*Ts: TaskLike](Movable):
                 write_frame(
                     self._head, KIND_ERROR, id, 0, self._errors[id].as_bytes()
                 )
-            elif id in self._located:
+            elif id in self._located or id in self._claimed:
                 write_frame(self._head, KIND_CLAIM, id, 0, List[UInt8]())
                 # Where it was may be stale: a task run twice across restarts
                 # leaves copies, and the new head may keep the other one. It
-                # says where it has the result in reply.
+                # says where it has the result in reply; until then the claim
+                # stands, through further restarts.
                 _ = self._located.pop(id, List[UInt8]())
+                self._claimed[id] = True
             elif id in self._subs:
                 ref sub = self._subs[id]
                 write_frame(self._head, sub.kind, id, sub.task_id, sub.payload)
@@ -515,6 +532,7 @@ struct Runtime[*Ts: TaskLike](Movable):
                     self._errors[id] = message(frame.payload)
             self._settle(id)
         elif frame.kind == KIND_LOCATED:
+            _ = self._claimed.pop(id, False)
             if keep:
                 self._located[id] = frame.payload.copy()
             self._settle(id)
