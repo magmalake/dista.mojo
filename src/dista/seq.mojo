@@ -53,7 +53,9 @@ struct Seq[T: Copyable & Deinitable](Codec, Copyable, Sized):
         var n = Int(get_scalar[DType.int64](buf, pos))
         if n < 0:
             raise Error("decode: negative Seq length ", n)
-        var items = List[Self.T](capacity=n)
+        # Every item takes at least a byte, so a count beyond the input is a
+        # lie: don't reserve for it.
+        var items = List[Self.T](capacity=min(n, len(buf) - pos))
         for _ in range(n):
             items.append(decode[Self.T](buf, pos))
         return Self(items^)

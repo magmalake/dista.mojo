@@ -29,6 +29,7 @@ from std.os import getenv
 from dista.codec import get_scalar, put_scalar
 from dista.conn import Conn
 from dista.frame import (
+    message,
     KIND_ERROR,
     KIND_FETCH,
     KIND_FREE,
@@ -73,6 +74,59 @@ def addr_key(ip: Array[UInt8, 4], port: Int) -> String:
     return String(
         Int(ip[0]), ".", Int(ip[1]), ".", Int(ip[2]), ".", Int(ip[3]), ":", port
     )
+
+
+@fieldwise_init
+struct InputSpec(Copyable, Movable):
+    """One input in a task-inputs frame: its bytes, or where to get them."""
+
+    var object_id: UInt64
+    var inline: Bool
+    var bytes: List[UInt8]
+    var location: Optional[Location]
+
+
+@fieldwise_init
+struct TaskInputs(Movable):
+    var gather: Bool
+    var inputs: List[InputSpec]
+
+
+def parse_task_inputs(payload: Span[UInt8, _]) raises -> TaskInputs:
+    """A task-inputs payload, checked: a malformed one raises."""
+    if len(payload) < 9:
+        raise Error("truncated task-inputs")
+    var gather = payload[0] != 0
+    var pos = 1
+    var n = Int(get_scalar[DType.uint64](payload, pos))
+    if n < 0 or n > len(payload):
+        raise Error("bad task-inputs count ", n)
+    var inputs = List[InputSpec](capacity=n)
+    for _ in range(n):
+        if pos >= len(payload):
+            raise Error("truncated task-inputs")
+        var tag = payload[pos]
+        pos += 1
+        var obj = get_scalar[DType.uint64](payload, pos)
+        if tag == 0:
+            var size = Int(get_scalar[DType.uint64](payload, pos))
+            if size < 0 or size > len(payload) - pos:
+                raise Error("bad task-inputs length ", size)
+            inputs.append(
+                InputSpec(
+                    obj, True, List[UInt8](payload[pos : pos + size]), None
+                )
+            )
+            pos += size
+        elif tag == 1:
+            inputs.append(
+                InputSpec(
+                    obj, False, List[UInt8](), Location.decode(payload, pos)
+                )
+            )
+        else:
+            raise Error("bad task-inputs tag ", Int(tag))
+    return TaskInputs(gather, inputs^)
 
 
 struct _Input(Copyable, Movable):
@@ -150,6 +204,8 @@ struct Worker[dispatch: DispatchFn](Movable):
     var _fetched: Dict[UInt64, Bool]
     """Objects in `_objects` that are copies of inputs, not results made here.
     """
+    var _debug: Bool
+    """`DISTA_DEBUG=1`: log each task's inputs as they're assembled."""
 
     def __init__(out self, var head: Stream, registry_hash: UInt64) raises:
         """Starts the object server and says hello to the head on `head`."""
@@ -177,6 +233,7 @@ struct Worker[dispatch: DispatchFn](Movable):
         self._files = Dict[UInt64, Location]()
         self._token = worker_token()
         self._fetched = Dict[UInt64, Bool]()
+        self._debug = getenv("DISTA_DEBUG") == "1"
 
     @staticmethod
     def _hello(
@@ -302,24 +359,15 @@ struct Worker[dispatch: DispatchFn](Movable):
             var task = f.task_id
             self._ready.append(_Ready(obj, task, f^.take_payload()))
         elif f.kind == KIND_TASK_INPUTS:
-            var gather = f.payload[0] != 0
-            var pos = 1
-            var n = Int(get_scalar[DType.uint64](f.payload, pos))
-            var inputs = List[_Input](capacity=n)
-            for _ in range(n):
-                var tag = f.payload[pos]
-                pos += 1
-                var obj = get_scalar[DType.uint64](f.payload, pos)
-                if tag == 0:
-                    var len = Int(get_scalar[DType.uint64](f.payload, pos))
-                    inputs.append(
-                        _Input(
-                            obj, True, List[UInt8](f.payload[pos : pos + len])
-                        )
-                    )
-                    pos += len
+            var spec = parse_task_inputs(f.payload)
+            var gather = spec.gather
+            var inputs = List[_Input](capacity=len(spec.inputs))
+            for ref inp in spec.inputs:
+                var obj = inp.object_id
+                if inp.inline:
+                    inputs.append(_Input(obj, True, inp.bytes.copy()))
                 else:
-                    var loc = Location.decode(f.payload, pos)
+                    var loc = inp.location.value().copy()
                     if loc.is_local() and obj not in self._objects:
                         try:
                             self._objects[obj] = read_shared(loc.path, loc.size)
@@ -339,7 +387,7 @@ struct Worker[dispatch: DispatchFn](Movable):
         elif f.kind == KIND_ERROR:
             raise Error(
                 "the head refused this worker: ",
-                String(unsafe_from_utf8=f.payload),
+                message(f.payload),
             )
         else:
             raise Error("worker got frame kind ", Int(f.kind), " from the head")
@@ -375,7 +423,7 @@ struct Worker[dispatch: DispatchFn](Movable):
             self._fetched[obj] = True
             self._objects[obj] = f^.take_payload()
         else:
-            self._lost[f.object_id] = String(unsafe_from_utf8=f.payload)
+            self._lost[f.object_id] = message(f.payload)
 
     def _serve_fetch(mut self, i: Int, var f: Frame) raises:
         if f.kind != KIND_FETCH:
@@ -415,6 +463,20 @@ struct Worker[dispatch: DispatchFn](Movable):
                 var args = List[UInt8]()
                 if p.gather:
                     put_scalar[DType.int64](args, Int64(len(p.inputs)))
+                if self._debug:
+                    print("dista worker: task", p.object_id, "inputs:", end="")
+                    for ref inp in p.inputs:
+                        var n = len(inp.bytes) if inp.have else len(
+                            self._objects.get(inp.object_id, List[UInt8]())
+                        )
+                        print(
+                            " ",
+                            inp.object_id,
+                            "inline" if inp.have else "fetched",
+                            n,
+                            end="",
+                        )
+                    print()
                 for ref inp in p.inputs:
                     if inp.have:
                         args.extend(inp.bytes.copy())
@@ -446,6 +508,14 @@ struct Worker[dispatch: DispatchFn](Movable):
 
     def _run_one(mut self) raises:
         var t = self._ready.pop(0)
+        if t.object_id in self._files:
+            # A task resubmitted across a head restart, whose result this
+            # worker already has. Tasks are pure, so report that copy rather
+            # than run it again and rewrite a file someone may be reading.
+            self._to_head(
+                KIND_STORED, t.object_id, self._files[t.object_id].encode()
+            )
+            return
         var out = List[UInt8]()
         try:
             Self.dispatch(t.task_id, t.args, out)

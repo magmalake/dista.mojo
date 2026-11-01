@@ -74,6 +74,12 @@ comptime HEADER = 17
 comptime MAX_FRAME = 1 << 30
 
 
+def message(payload: Span[UInt8, _]) -> String:
+    """An error frame's text. It comes from another process, so bytes that
+    aren't UTF-8 become replacement characters instead of a broken String."""
+    return String(from_utf8_lossy=payload)
+
+
 struct Frame(Movable):
     var kind: UInt8
     var object_id: UInt64

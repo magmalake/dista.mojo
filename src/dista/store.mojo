@@ -97,8 +97,13 @@ def remove_file(path: String):
 
 
 def write_shared(path: String, data: Span[UInt8, _]) raises:
-    """Writes `data` into a new shared mapping at `path`."""
-    var region = MappedRegion(path, len(data))
+    """Writes `data` into a new shared mapping at `path`.
+
+    It's written under a temporary name and renamed into place, so a reader
+    that maps `path` sees a whole result, old or new, never one mid-write.
+    """
+    var tmp = String(path, ".tmp")
+    var region = MappedRegion(tmp, len(data))
     var dst = Pointer[UInt8, MutUntrackedOrigin](
         unsafe_from_address=region.base()
     )
@@ -107,6 +112,15 @@ def write_shared(path: String, data: Span[UInt8, _]) raises:
     # Mojo destroys a value after its last use, which would otherwise be
     # `base()` above: the region would be unmapped before the writes.
     region^.close()
+    var final = path
+    if (
+        external_call["rename", c_int](
+            tmp.as_c_string_span(), final.as_c_string_span()
+        )
+        != 0
+    ):
+        remove_file(tmp)
+        raise Error("could not move ", tmp, " into place")
 
 
 def read_shared(path: String, size: Int) raises -> List[UInt8]:
@@ -164,8 +178,8 @@ struct Location(Copyable, Movable):
 
 def _get_string(buf: Span[UInt8, _], mut pos: Int) raises -> String:
     var n = Int(get_scalar[DType.uint64](buf, pos))
-    if pos + n > len(buf):
+    if n < 0 or n > len(buf) - pos:
         raise Error("truncated location")
-    var s = String(unsafe_from_utf8=buf[pos : pos + n])
+    var s = String(from_utf8=buf[pos : pos + n])
     pos += n
     return s^

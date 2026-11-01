@@ -17,8 +17,9 @@ test-batches = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_
 test-free = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_free.mojo -o build/test-free && ./build/test-free" }
 test-cluster = { cmd = "tests/cluster.sh" }
 test-restart = { cmd = "tests/head_restart.sh" }
+test-chaos = { cmd = "CHAOS_FAST=1 tests/chaos.sh" }
 test-kind = { cmd = "tests/kind.sh" }
-test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-cluster", "test-restart"] }
+test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-cluster", "test-restart", "test-chaos"] }
 bench = { cmd = "mkdir -p build && mojo build -I src $DEP_INC bench/fanout.mojo -o build/bench-fanout && ./build/bench-fanout" }
 
 [package]
@@ -80,8 +81,8 @@ modular = ">=26.8.0.dev2026102305,<28"
 modular = ">=26.8.0.dev2026102305,<28"
 
 [feature.fmt.tasks]
-fmt = { cmd = "mojo format src tests bench examples deploy" }
-format-check = { cmd = "mojo format src tests bench examples deploy && git diff --exit-code -- src tests bench examples deploy" }
+fmt = { cmd = "mojo format src tests bench examples deploy fuzz" }
+format-check = { cmd = "mojo format src tests bench examples deploy fuzz && git diff --exit-code -- src tests bench examples deploy fuzz" }
 
 # The data environment runs dista tasks over parquet.mojo and iceberg.mojo.
 # Their Mojo sources compile from checkouts next to this one, as their own
@@ -110,8 +111,24 @@ test-parquet = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_
 test-iceberg = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_iceberg_scan.mojo -o build/test-iceberg && ./build/test-iceberg" }
 test-data = { depends-on = ["test-parquet", "test-iceberg"] }
 
+# Fuzzing with mozz (packaged for magmalake as mozz_mlake), as flare does: one
+# harness per parser or protocol under fuzz/, built with every bounds check
+# on. Each harness writes the input it's running to build/fuzz-<name>-last.bin
+# first, so a hard abort still leaves the crashing input behind; mozz saves
+# the ones it catches to build/fuzz-crashes/. FUZZ_RUNS sets the iterations.
+[feature.fuzz.dependencies]
+mozz_mlake = { git = "https://github.com/magmalake/mozz_mlake.git", rev = "bd84a1f1e376912414a3ddcf0f4151ed65435a44" }
+
+[feature.fuzz.tasks]
+fuzz-frames = { cmd = "mkdir -p build && mojo build -D ASSERT=all -I src $DEP_INC fuzz/fuzz_frames.mojo -o build/fuzz-frames && ./build/fuzz-frames" }
+fuzz-codec = { cmd = "mkdir -p build && mojo build -D ASSERT=all -I src $DEP_INC fuzz/fuzz_codec.mojo -o build/fuzz-codec && ./build/fuzz-codec" }
+fuzz-payloads = { cmd = "mkdir -p build && mojo build -D ASSERT=all -I src $DEP_INC fuzz/fuzz_payloads.mojo -o build/fuzz-payloads && ./build/fuzz-payloads" }
+fuzz-head = { cmd = "mkdir -p build && mojo build -D ASSERT=all -I src $DEP_INC fuzz/fuzz_head.mojo -o build/fuzz-head && ./build/fuzz-head" }
+fuzz = { depends-on = ["fuzz-frames", "fuzz-codec", "fuzz-payloads", "fuzz-head"] }
+
 [environments]
 default = ["stable"]
+fuzz = ["stable", "fuzz"]
 nightly = ["nightly"]
 fmt = { features = ["fmt"], no-default-feature = true }
 data = { features = ["data"], no-default-feature = true }
