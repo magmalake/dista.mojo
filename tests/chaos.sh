@@ -52,8 +52,17 @@ for seed in ${CHAOS_SEEDS:-1 2 3}; do
       elif command -v gdb >/dev/null; then
         gdb -p "$driver" -batch -ex "thread apply all bt" > "build/chaos-hang-$seed.txt" 2>&1 || true
       fi
-      grep -E "dista::" "build/chaos-hang-$seed.txt" | head -15 || true
+      grep -E "dista::" "build/chaos-hang-$seed.txt" | head -30 || true
+      echo "== who holds port $port"
+      lsof -nP -iTCP:"$port" 2>/dev/null || true
+      echo "== processes"
+      ps -o pid,stat,etime,command -p "$(IFS=,; echo "${pids[*]}")" 2>/dev/null | grep -v " Z " || true
+      echo "== driver log"
       tail -20 build/chaos-driver.log
+      echo "== head log"
+      tail -20 build/chaos-head.log
+      echo "== workers log"
+      grep -v "head gone, rejoining" build/chaos-workers.log | tail -20 || true
       exit 1
     fi
     if [ "${CHAOS_FAST:-0}" = 2 ]; then
