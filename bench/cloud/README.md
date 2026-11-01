@@ -67,28 +67,31 @@ dista-bench`), with a vCPU quota for the instances: 13 × 16 = 208 vCPUs of
 "Running On-Demand Standard instances" in us-east-2 for the full matrix, or
 of spot instances with `SPOT=1`.
 
+`bench/cloud/bench` runs all of it. Each run brings the cluster up, runs,
+and tears it down whatever happens, and writes its own results folder:
+
 ```sh
-bench/cloud/aws.sh up 0              # the head node alone: ~3 minutes
-bench/cloud/data.sh load             # the table, once: it stays in S3
-bench/cloud/build.sh                 # timed builds, on the head node alone
-bench/cloud/run.sh local             # the one-process references, one thread
-THREADS=16 bench/cloud/run.sh local  # ...and on all 16 cores
-bench/cloud/aws.sh up 12             # add the workers
-bench/cloud/build.sh load            # the same images, onto the workers
-bench/cloud/run.sh                   # 3 x 3 runs, 5 passes each
-bench/cloud/aws.sh down              # terminate everything but the bucket
+bench/cloud/bench data load          # the table, once: it stays in S3
+bench/cloud/bench gate               # 3 workers, 3 frameworks, 2 passes: ~15 minutes
+bench/cloud/bench local              # one process on the head node, 16 then 1 thread
+bench/cloud/bench matrix             # 3, 6 and 12 nodes, 5 passes each
+bench/cloud/bench status             # anything running, and what it costs an hour
+bench/cloud/bench runs               # past runs with their totals
+bench/cloud/bench logs [run]         # follow the job running now, or a run's summary
+bench/cloud/bench timeline [run]     # a run's dista timeline, in Perfetto
 ```
 
-`NODES`, `FRAMEWORKS`, `PASSES` and `SLOTS` narrow or change the matrix. For
-example, `NODES=3 FRAMEWORKS=dista PASSES=1 bench/cloud/run.sh` is a smoke
-test. `data.sh drop` deletes the bucket.
+`local --threads "16 1"` and `matrix --nodes "3 6 12" --passes 5` are the
+defaults. `FRAMEWORKS` narrows any run; `RESULTS` names its folder, which
+is otherwise `results/<kind>-<UTC date>[-<n>]`. A run's progress log is
+`run.log` in that folder. The one-thread references give every framework
+one decoding thread and `TAXI_FILES_AT_ONCE` (8) files' reads in flight.
 
-`bench/cloud/gate.sh` is the short run to do before the full matrix, once
-the table is loaded: a head and 3 workers, the timed builds, the three
-frameworks on 3 nodes with 2 passes each, then teardown, whatever fails. It
-takes about 15 minutes, 5 of them queries, and writes
-`results/gate-<date>/`, with dista's task timeline
-(`dista-3-timeline.json.gz`, for Perfetto).
+The scripts underneath still work on their own: `aws.sh up|status|ssh|down`,
+`data.sh load|drop`, `build.sh`, and `run.sh` with `NODES`, `FRAMEWORKS`,
+`PASSES`, `SLOTS` and `THREADS`; `NODES=3 FRAMEWORKS=dista PASSES=1
+bench/cloud/run.sh` on a running cluster is a smoke test. `data.sh drop`
+deletes the bucket.
 
 The nodes read and write S3 with an IAM role, `dista-bench-node`, which
 aws.sh creates. It's allowed the benchmark bucket and nothing else. Each

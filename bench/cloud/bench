@@ -1,0 +1,190 @@
+#!/bin/bash
+# The cloud benchmark from one command. It drives aws.sh, data.sh, build.sh
+# and run.sh, and adds what using them by hand kept getting wrong: a run
+# always tears its cluster down, gets a results folder of its own, and says
+# where everything landed.
+#
+#   bench up [N]          the head node and N workers (default 0)
+#   bench down            terminate every instance (the S3 bucket stays)
+#   bench status          instances, nodes and the hourly price; what's running
+#   bench ssh [n]         a shell on the head, or on worker n
+#   bench data load|drop  the taxi table in S3 (once; it stays)
+#   bench build           timed image builds on the head node, loaded on every node
+#
+#   bench gate            3 workers, builds, the 3 frameworks on 3 nodes, 2 passes
+#   bench local [--threads "16 1"]
+#                         the one-process references on the head node alone
+#   bench matrix [--nodes "3 6 12"] [--passes 5]
+#                         the distributed matrix on the largest node count
+#
+#   bench runs            the results folders, newest first, with their totals
+#   bench logs [run]      follow the job running now, or show a run's summary
+#   bench timeline [run]  unpack a run's dista timeline and open Perfetto
+#
+# gate, local and matrix bring the cluster up, run, and tear it down whatever
+# happens (an interrupted run included). Their results go to
+# bench/cloud/results/<kind>-<UTC date>[-<n>], or $RESULTS. A run's own
+# progress log is <results>/run.log. FRAMEWORKS narrows any of them, as in
+# run.sh.
+#
+#   AWS_PROFILE  default dista-bench      AWS_REGION  default us-east-2
+set -uo pipefail
+cd "$(dirname "$0")/../.."
+here=bench/cloud
+export AWS_PROFILE=${AWS_PROFILE:-dista-bench}
+export AWS_REGION=${AWS_REGION:-us-east-2}
+export KUBECONFIG=build/cloud/kubeconfig
+
+usage() { sed -n '2,/^set -uo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+# A results folder nobody has used: <kind>-<date>, then -2, -3, ...
+fresh_results() {
+  local base=$here/results/$1-$(date -u +%F) dir n=2
+  dir=$base
+  while [ -e "$dir" ]; do dir=$base-$n; n=$((n + 1)); done
+  echo "$dir"
+}
+
+# Runs "$@" with the cluster torn down afterwards, whatever happens.
+with_cluster() {
+  local workers=$1
+  shift
+  trap 'echo "== teardown $(date -u +%T)"; "$here/aws.sh" down' EXIT
+  trap 'exit 130' INT TERM
+  echo "== up $workers $(date -u +%T)"
+  "$here/aws.sh" up "$workers" || exit 1
+  "$@"
+  local status=$?
+  echo "== done $(date -u +%T)"
+  return $status
+}
+
+# Everything a run prints, also kept in its results folder.
+logged() {
+  mkdir -p "$RESULTS"
+  echo "results: $RESULTS"
+  "$@" 2>&1 | tee -a "$RESULTS/run.log"
+  return "${PIPESTATUS[0]}"
+}
+
+run_gate() {
+  echo "== build $(date -u +%T)"
+  "$here/build.sh" || return 1
+  echo "== run $(date -u +%T)"
+  NODES=3 PASSES=2 "$here/run.sh"
+}
+
+run_local() {
+  echo "== build $(date -u +%T)"
+  RESULTS=$RESULTS/build "$here/build.sh" || return 1
+  local t status=0
+  for t in $threads; do
+    echo "== one process, $t threads $(date -u +%T)"
+    RESULTS=$RESULTS/t$t THREADS=$t "$here/run.sh" local || status=1
+  done
+  return $status
+}
+
+run_matrix() {
+  echo "== build $(date -u +%T)"
+  "$here/build.sh" || return 1
+  echo "== run $(date -u +%T)"
+  NODES=$nodes PASSES=$passes "$here/run.sh"
+}
+
+latest_run() { ls -1dt "$here"/results/*/ 2>/dev/null | head -1 | sed 's:/$::'; }
+
+resolve_run() {
+  if [ -z "${1:-}" ]; then latest_run; return; fi
+  if [ -d "$1" ]; then echo "$1"; return; fi
+  if [ -d "$here/results/$1" ]; then echo "$here/results/$1"; return; fi
+  echo "no run $1" >&2
+  return 1
+}
+
+cmd=${1:-help}
+[ $# -gt 0 ] && shift
+case $cmd in
+  up) "$here/aws.sh" up "${1:-0}" ;;
+  down) "$here/aws.sh" down ;;
+  ssh) "$here/aws.sh" ssh "$@" ;;
+  data) "$here/data.sh" "$@" ;;
+  build) "$here/build.sh" ;;
+  status)
+    "$here/aws.sh" status
+    if [ -f "$KUBECONFIG" ] && kubectl get nodes >/dev/null 2>&1; then
+      echo "== jobs and pods"
+      kubectl get jobs,pods -o wide 2>/dev/null | head -30
+    fi
+    ;;
+  gate)
+    export RESULTS=${RESULTS:-$(fresh_results gate)}
+    logged with_cluster 3 run_gate
+    ;;
+  local)
+    threads="16 1"
+    while [ $# -gt 0 ]; do
+      case $1 in
+        --threads) threads=$2; shift 2 ;;
+        *) usage 2 ;;
+      esac
+    done
+    export RESULTS=${RESULTS:-$(fresh_results local)}
+    logged with_cluster 0 run_local
+    ;;
+  matrix)
+    nodes="3 6 12" passes=5
+    while [ $# -gt 0 ]; do
+      case $1 in
+        --nodes) nodes=$2; shift 2 ;;
+        --passes) passes=$2; shift 2 ;;
+        *) usage 2 ;;
+      esac
+    done
+    most=0
+    for n in $nodes; do [ "$n" -gt "$most" ] && most=$n; done
+    export RESULTS=${RESULTS:-$(fresh_results matrix)}
+    logged with_cluster "$most" run_matrix
+    ;;
+  runs)
+    for d in $(ls -1dt "$here"/results/*/ 2>/dev/null); do
+      d=${d%/}
+      printf '%-48s' "${d#"$here"/results/}"
+      for s in "$d"/summary.md "$d"/*/summary.md; do
+        [ -f "$s" ] || continue
+        grep -m1 -E '^\| total' "$s" | tr -d '*' | tr -s ' ' | sed 's/^| total[^|]*//' | tr '\n' ' '
+      done
+      echo
+    done
+    ;;
+  logs)
+    if [ -z "${1:-}" ] && [ -f "$KUBECONFIG" ] && kubectl get job taxi >/dev/null 2>&1; then
+      kubectl logs -f job/taxi
+    else
+      run=$(resolve_run "${1:-}") || exit 1
+      echo "== $run"
+      ls "$run"
+      for s in "$run"/summary.md "$run"/*/summary.md; do
+        [ -f "$s" ] && { echo "== $s"; cat "$s"; }
+      done
+    fi
+    ;;
+  timeline)
+    run=$(resolve_run "${1:-}") || exit 1
+    trace=$(ls "$run"/dista-*-timeline.json* "$run"/*/dista-*-timeline.json* 2>/dev/null | head -1)
+    [ -n "$trace" ] || { echo "no dista timeline in $run" >&2; exit 1; }
+    mkdir -p build/cloud
+    out=build/cloud/$(basename "${trace%.gz}")
+    case $trace in
+      *.gz) gunzip -c "$trace" > "$out" || exit 1 ;;
+      *) cp "$trace" "$out" || exit 1 ;;
+    esac
+    echo "$out: drag it into the Perfetto tab"
+    if command -v open >/dev/null; then
+      open https://ui.perfetto.dev
+      open -R "$out"
+    fi
+    ;;
+  help|-h|--help) usage ;;
+  *) usage 2 ;;
+esac
