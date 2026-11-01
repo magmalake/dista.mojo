@@ -2,9 +2,9 @@
 # checkout, <directory> <repository> <commit>. dista.mojo itself is built at
 # the commit being benchmarked, which build.sh adds. Every repository is public.
 memory-region.mojo https://github.com/magmalake/memory-region.mojo.git 40068c4f95ea659e9b78aa91ced45420b07e3e6e
-arrow-mlake.mojo https://github.com/magmalake/arrow-mlake.mojo.git b9d2ae45f82c719a250e6e3e4567855959027632
+arrow-mlake.mojo https://github.com/magmalake/arrow-mlake.mojo.git d157bb3296b4f6d36feae2848ebf6e0c7e4f9f5e
 parquet.mojo https://github.com/magmalake/parquet.mojo.git 9a596283d3612d1ebeca199f9e48f1c1a7eaab51
-iceberg.mojo https://github.com/magmalake/iceberg.mojo.git 2aca8d38b293e76ce907dbea2e17f47cac44e38b
+iceberg.mojo https://github.com/magmalake/iceberg.mojo.git 571f60ad8408dc8a9999ca0feffd506343333e59
 threads.mojo https://github.com/magmalake/threads.mojo.git c8c658dfa6fac00b7d5ab89a0277f248a7a79457
 thrift.mojo https://github.com/magmalake/thrift.mojo.git 21cdbce67d22d72e88e88a60e2f168b05b4ef9fa
 hashes.mojo https://github.com/magmalake/hashes.mojo.git 395aca597f9410bd0511df44d972f14b10a8b01d
