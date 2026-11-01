@@ -257,7 +257,7 @@ Actors and methods go in `Runtime[...]` with the tasks, so the registry hash sti
 
 ### PRs
 
-Stacked, at most about 2,000 lines each, in order. In PR 4 a head restart loses the actors: the resuming driver fails their unfinished calls, and a rejoining worker destroys its actor. From PR 6 on, the restarted head places them again and replays their calls, as it does when a worker dies:
+Stacked, at most about 2,000 lines each, in order. Through PR 6 a head restart loses the actors: the resuming driver fails their unfinished calls, and a rejoining worker destroys its actor. A worker's death doesn't, from PR 6. Surviving a head restart comes with PR 7: the call log that rebuilds an actor is the head's, so it goes with the head, and the creating driver only knows its own calls, not those from tasks and other actors. A checkpoint in object storage, with the calls since it, is what a new head can rebuild from:
 
 | # | PR | Gate | Size |
 |---|---|---|---|
@@ -267,8 +267,8 @@ Stacked, at most about 2,000 lines each, in order. In PR 4 a head restart loses 
 | 3 | **A task timeline.** Head and worker timestamps per task; `rt.timeline(path)` writes Chrome's trace format. | A fan-out's trace opens in Perfetto with one track per worker, and every task's span sits inside its submit and settle. | ~400 |
 | 4 | **Actors: declare, place, call.** `Actor`, `Method`, `rt.create`, `rt.call`, `rt.kill`; one worker per actor; ordered calls; results as `ObjectRef`s. | A counter actor takes 1,000 calls from the driver and returns 1,000 in order; a task uses a method's result. | ~900 |
 | 5 | **Handles as values** (done). `ActorHandle` through the codec; `CtxTask` and `CtxMethod` get a `Client`, the driver's side of the protocol, which a worker opens to the head as `ROLE_CLIENT`; calls from tasks and other actors go through the head like a driver's. | 100 tasks each call one shared actor; the actor sees every call once. | ~400 |
-| 6 | **Restart from the constructor.** The head notices the worker is gone, places the actor elsewhere, and replays the calls since it was created. | The counter's worker is killed after 500 of 1,000 calls; the final count is still 1,000. | ~600 |
-| 7 | **Checkpoints.** `checkpoint_every`, `rt.checkpoint`, state through the codec to `DISTA_CHECKPOINT_URI`; restore plus replay of the calls since; the head drops calls a checkpoint covers. | Phase 3's gate: on kind, the counter's pod is deleted mid-run; the actor restores from its checkpoint and the count is exact. | ~700 |
+| 6 | **Restart from the constructor** (done). The head keeps every call made to an actor; when its worker goes away it places the actor elsewhere, builds it again and replays every call in order. Each call is answered once: a second answer is dropped. | The counter's worker is killed after 500 of 1,000 calls; the final count is still 1,000. | ~600 |
+| 7 | **Checkpoints.** `checkpoint_every`, `rt.checkpoint`, state through the codec to `DISTA_CHECKPOINT_URI`; restore plus replay of the calls since; the head drops calls a checkpoint covers, which bounds the call log. A restarted head rebuilds an actor from its checkpoint and the calls its callers resend. | Phase 3's gate: on kind, the counter's pod is deleted mid-run; the actor restores from its checkpoint and the count is exact. | ~700 |
 | 8 | **Prometheus metrics.** `/metrics` on the head and every worker: task counters, queue depth, objects and store bytes, actors, a task-duration histogram. | `curl` on each pod's `/metrics` during a kind run shows tasks done climbing to the total. | ~500 |
 
 ### Telemetry
