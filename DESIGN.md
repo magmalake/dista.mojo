@@ -304,13 +304,13 @@ The taxi benchmark is mostly reading Parquet from S3. A second benchmark should 
 
 ### To do: a `dista` command for operating a cluster
 
-With the metrics (PR 8): the one binary already runs as head, worker or driver, so it grows subcommands, as `ray start`, `ray status` and `ray timeline` do:
+With the metrics (PR 8), as a binary of its own. Today one binary runs as head, worker or driver, but only the workers and drivers run the user's code: the tasks and actors, and whatever those depend on (Arrow, Iceberg, a model's library). The head routes frames and checks registry hashes. So the head and the command line go into a generic `dista` binary that depends on dista's core alone, released and versioned on its own, while the user's binary stays the driver and the worker. One head can then serve jobs built from different code, told apart by their registry hashes.
 
 | Command | What it does |
 |---|---|
-| `dista head`, `dista worker --head host:port` | What `DISTA_ROLE` does today. |
+| `dista head` | The head, as `DISTA_ROLE=head` runs it today from the user's binary. |
 | `dista status` | The head's view: workers, actors, objects held, queue depth (the stats frame, extended). |
 | `dista timeline -o trace.json` | Every driver's finished tasks, not only the caller's own. |
 | `dista stop` | Asks the head to shut down, and its workers with it. |
 
-`status` and `timeline` need an observer role: a peer that says hello to the head and asks, without being a driver that owns objects. The benchmark's own command, `bench/cloud/bench`, is separate: it runs the AWS clusters and the frameworks on them.
+`status` and `timeline` need an observer role: a peer that says hello to the head and asks, without being a driver that owns objects, and without a registry hash to check. A head that serves several jobs checks each driver's hash against the workers it hands that driver's tasks to, rather than against its own. The benchmark's own command, `bench/cloud/bench`, is separate: it runs the AWS clusters and the frameworks on them.
