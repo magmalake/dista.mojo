@@ -45,26 +45,37 @@ fresh_results() {
   echo "$dir"
 }
 
-# Runs "$@" with the cluster torn down afterwards, whatever happens.
+# Brings the cluster up and runs "$@"; arm_teardown takes it down.
 with_cluster() {
   local workers=$1
   shift
-  trap 'echo "== teardown $(date -u +%T)"; "$here/aws.sh" down' EXIT
-  trap 'exit 130' INT TERM
   echo "== up $workers $(date -u +%T)"
-  "$here/aws.sh" up "$workers" || exit 1
+  "$here/aws.sh" up "$workers" || return 1
   "$@"
   local status=$?
   echo "== done $(date -u +%T)"
   return $status
 }
 
-# Everything a run prints, also kept in its results folder.
-logged() {
+teardown() {
+  trap - EXIT INT TERM
+  echo "== teardown $(date -u +%T)"
+  "$here/aws.sh" down 2>&1 | tail -1
+}
+
+arm_teardown() {
+  trap teardown EXIT
+  trap 'exit 130' INT TERM
+}
+
+# From here on, everything this run prints is also kept in its results
+# folder. A redirection rather than a pipe, so the run stays in this shell
+# with its traps: on the left of `| tee` it ran in a subshell, whose EXIT
+# trap bash 3.2 doesn't run, which once left 13 instances up.
+log_to_results() {
   mkdir -p "$RESULTS"
+  exec > >(tee -a "$RESULTS/run.log") 2>&1
   echo "results: $RESULTS"
-  "$@" 2>&1 | tee -a "$RESULTS/run.log"
-  return "${PIPESTATUS[0]}"
 }
 
 run_gate() {
@@ -119,7 +130,9 @@ case $cmd in
     ;;
   gate)
     export RESULTS=${RESULTS:-$(fresh_results gate)}
-    logged with_cluster 3 run_gate
+    log_to_results
+    arm_teardown
+    with_cluster 3 run_gate
     ;;
   local)
     threads="16 1"
@@ -130,7 +143,9 @@ case $cmd in
       esac
     done
     export RESULTS=${RESULTS:-$(fresh_results local)}
-    logged with_cluster 0 run_local
+    log_to_results
+    arm_teardown
+    with_cluster 0 run_local
     ;;
   matrix)
     nodes="3 6 12" passes=5
@@ -144,7 +159,9 @@ case $cmd in
     most=0
     for n in $nodes; do [ "$n" -gt "$most" ] && most=$n; done
     export RESULTS=${RESULTS:-$(fresh_results matrix)}
-    logged with_cluster "$most" run_matrix
+    log_to_results
+    arm_teardown
+    with_cluster "$most" run_matrix
     ;;
   runs)
     for d in $(ls -1dt "$here"/results/*/ 2>/dev/null); do

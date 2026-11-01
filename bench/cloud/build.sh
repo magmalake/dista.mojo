@@ -36,27 +36,40 @@ images="${*:-dista ray rust}"
 
 # Loads image $1 (a tar on the head node) into the head's and every worker's
 # k3s.
+worker_ips() {
+  kubectl get nodes -l dista-bench/role=worker \
+    -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{" "}{end}'
+}
+
+# Imports image $1 on the workers at $2 (space-separated), all at once, from
+# one session on the head: one connection per worker from there. Opening one
+# connection to the head per worker instead, twelve at once, ran into sshd's
+# limit on unauthenticated connections, and two nodes were refused.
+import_on() {
+  on_head "for ip in $2; do ssh -o StrictHostKeyChecking=no -o LogLevel=ERROR ubuntu@\$ip 'sudo k3s ctr images import -' < images/$1.tar >/dev/null & done; wait"
+}
+
 load_image() {
   on_head "sudo k3s ctr images import images/$1.tar >/dev/null"
-  for ip in $(kubectl get nodes -l dista-bench/role=worker \
-      -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'); do
-    on_head "ssh -o StrictHostKeyChecking=no -o LogLevel=ERROR ubuntu@$ip 'sudo k3s ctr images import -' < images/$1.tar >/dev/null" &
-  done
-  wait
+  import_on "$1" "$(worker_ips)"
   # A node without the image leaves its pods unschedulable (imagePullPolicy
   # is Never), which stalled the first 12-node run; check every node.
-  local tag missing=0
+  local tag
   case $1 in
     dista) tag=dista:taxi ;;
     ray) tag=dista-ray:taxi ;;
     rust) tag=dista-rust:taxi ;;
   esac
-  for ip in $(kubectl get nodes -l dista-bench/role=worker \
-      -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'); do
-    on_head "ssh -o StrictHostKeyChecking=no -o LogLevel=ERROR ubuntu@$ip 'sudo k3s ctr images ls -q' | grep -q '$tag'" \
-      || { echo "$1 is missing on $ip"; missing=1; }
+  local attempt missing
+  for attempt in 1 2; do
+    missing=$(on_head "for ip in $(worker_ips); do ssh -o StrictHostKeyChecking=no -o LogLevel=ERROR ubuntu@\$ip 'sudo k3s ctr images ls -q' | grep -q '$tag' || echo \$ip; done")
+    [ -z "$missing" ] && return 0
+    [ $attempt = 2 ] && break
+    echo "$1 is missing on $missing; loading those again, one at a time"
+    for ip in $missing; do import_on "$1" "$ip"; done
   done
-  [ $missing = 0 ]
+  for ip in $missing; do echo "$1 is missing on $ip"; done
+  return 1
 }
 
 if [ $load_only = 1 ]; then
