@@ -21,6 +21,9 @@ nodes too.
                     and each prints `TIME <query> <pass> <ms>`
     TAXI_TIMELINE   write the distributed runs' task timeline to this path,
                     in Chrome's trace format, before exiting
+    TAXI_SPLIT_BELOW  a query planning fewer files than this (default 64) is
+                    planned again with files split into row-group tasks of
+                    about TAXI_SPLIT_BYTES (default 16 MiB); 0 turns it off
     TAXI_THREADS    threads for the one-process scan (iceberg's `num_workers`);
                     unset, one per core
     TAXI_FILES_AT_ONCE  files a one-thread scan reads together (default 8),
@@ -86,6 +89,9 @@ struct PlannedFile(Copyable, Movable):
     var length: Int64
     var spec_id: Int
     var sequence: Int64
+    var split_offsets: Seq[Int64]
+    """Where each row group starts: what lets a task own only the row groups
+    in its byte range. Without them a split task reads the whole file."""
 
     @staticmethod
     def of(t: FileScanTask) raises -> PlannedFile:
@@ -102,9 +108,13 @@ struct PlannedFile(Copyable, Movable):
             t.length,
             t.spec_id,
             t.data_sequence_number,
+            Seq[Int64](f.split_offsets.copy()),
         )
 
     def task(self) -> FileScanTask:
+        var offsets = List[Int64](capacity=len(self.split_offsets))
+        for i in range(len(self.split_offsets)):
+            offsets.append(self.split_offsets[i])
         var f = DataFile(
             CONTENT_DATA,
             self.path.copy(),
@@ -116,7 +126,7 @@ struct PlannedFile(Copyable, Movable):
             [],
             [],
             False,
-            [],
+            offsets^,
             [],
             0,
             False,
@@ -411,6 +421,17 @@ def _distributed(
     # One cache across every query: the table doesn't change, so after the
     # first plan its manifests are never read again.
     var tasks = _scan(q, table.copy()).plan_files_with(manifests)
+    # A query that keeps only a few files would run as a few tasks while the
+    # rest of the cluster waits (q7 reads all 19 columns of one file). Plan it
+    # again with files split at row-group boundaries, so each row group can
+    # be its own task. Iceberg's split planning: the same rows, read once.
+    var split_below = Int(getenv("TAXI_SPLIT_BELOW", "64"))
+    if len(tasks) < split_below:
+        tasks = (
+            _scan(q, table.copy())
+            .with_split_size(Int(getenv("TAXI_SPLIT_BYTES", String(16 << 20))))
+            .plan_files_with(manifests)
+        )
     rt.span(String("plan ", q.name), t)
     t = rt.clock()
     var refs = List[ObjectRef[Partial]]()
