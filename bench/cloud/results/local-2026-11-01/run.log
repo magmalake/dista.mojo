@@ -1,0 +1,75 @@
+results: bench/cloud/results/local-2026-11-01
+== up 0 18:24:15
+launching the head (c7g.4xlarge)
+waiting for the head's API
+waiting for 0 workers to join
+NAME             STATUS   ROLES                  AGE   VERSION         ROLE   RANK
+ip-172-31-0-37   Ready    control-plane,master   4s    v1.33.13+k3s2   head   
+KUBECONFIG=build/cloud/kubeconfig
+== build 18:25:26
+== building dista:taxi on c7g.4xlarge
+dista	128	38.2	55.3	93	32	c7g.4xlarge
+== loading dista:taxi into every node
+== building dista-ray:taxi on c7g.4xlarge
+ray	46	18.8	-	607	204	c7g.4xlarge
+== loading dista-ray:taxi into every node
+== building dista-rust:taxi on c7g.4xlarge
+rust	174	94.9	60.4	132	41	c7g.4xlarge
+== loading dista-rust:taxi into every node
+image  total_s  deps_s  compile_s  disk_mb  gzip_mb  instance
+dista  128      38.2    55.3       93       32       c7g.4xlarge
+ray    46       18.8    -          607      204      c7g.4xlarge
+rust   174      94.9    60.4       132      41       c7g.4xlarge
+== one process, 16 threads 18:32:13
+== dista, one process on the head node
+PASS taxi: 8 queries in one process; one process 56380 ms
+== rust, one process on the head node
+FAIL: see bench/cloud/results/local-2026-11-01/t16/rust-local.log
+# rust local, 16 threads
+# metadata=s3://dista-bench-617847241090-us-east-2/warehouse/taxi/trips/metadata/00168-6ca1a160-53d8-4ae9-a692-b3f88d78a536.metadata.json
+Error: "Unexpected => Failed to load Parquet metadata, source: External: Unexpected => Failure in doing io operation, source: Unexpected (persistent) at read, context: { called: reqsign::Sign, service: s3, path: warehouse/taxi/trips/data/pickup_month=2015-06/00000-2-27d5945a-8f68-4038-9954-02f47e3dd14d.parquet, range: 48950107-49474394 } => signing http request, source: failed to load signing credential"
+[pod/taxi-5vk2q/driver] Error: "Unexpected => Failed to load Parquet metadata, source: External: Unexpected => Failure in doing io operation, source: Unexpected (persistent) at read, context: { called: reqsign::Sign, service: s3, path: warehouse/taxi/trips/data/pickup_month=2015-06/00000-2-27d5945a-8f68-4038-9954-02f47e3dd14d.parquet, range: 48950107-49474394 } => signing http request, source: failed to load signing credential"
+== ray, one process on the head node
+PASS ray taxi: 8 queries in one process; one process 94504 ms
+## One process, on the head node (ms)
+
+| query | dista | rust | ray |
+|---|---:|---:|---:|
+| q1_scan_count | 7,828 |  | 9,192 |
+| q2_month_range | 315 |  | 446 |
+| q3_payment_sum | 9,229 |  | 14,937 |
+| q4_tip_ratio | 10,663 |  | 22,689 |
+| q5_top_zones | 15,309 |  | 16,625 |
+| q6_zone_revenue | 747 |  | 1,233 |
+| q7_wide | 888 |  | 706 |
+| q8_selective | 11,401 |  | 28,676 |
+| total | **56,380** | **0** | **94,504** |
+
+## Problems
+
+- rust's reference run didn't pass
+== one process, 1 threads 18:35:13
+== dista, one process on the head node
+PASS taxi: 8 queries in one process; one process 211887 ms
+== rust, one process on the head node
+PASS rust taxi: 8 queries in one process; one process 208341 ms
+== ray, one process on the head node
+PASS ray taxi: 8 queries in one process; one process 184326 ms
+## One process, on the head node (ms)
+
+| query | dista | rust | ray |
+|---|---:|---:|---:|
+| q1_scan_count | 28,022 | 34,318 | 17,537 |
+| q2_month_range | 391 | 834 | 533 |
+| q3_payment_sum | 38,329 | 39,690 | 29,969 |
+| q4_tip_ratio | 50,365 | 42,206 | 44,095 |
+| q5_top_zones | 41,525 | 46,057 | 31,709 |
+| q6_zone_revenue | 1,718 | 1,696 | 1,945 |
+| q7_wide | 1,132 | 1,097 | 1,211 |
+| q8_selective | 50,405 | 42,443 | 57,328 |
+| total | **211,887** | **208,341** | **184,327** |
+
+All answers agree with the one-process references (dista, rust, ray).
+== done 18:45:41
+== teardown 18:45:41
+terminated; the bucket stays (bench/cloud/data.sh drop removes it)

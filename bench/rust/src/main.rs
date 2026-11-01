@@ -528,7 +528,7 @@ async fn local_fold(table: &Table, q: &Query) -> R<Partial> {
     let scan = build_scan(table, q)?;
     let tasks = plan(&scan).await?;
     if single_threaded() {
-        return fold_tasks(table.file_io().clone(), *q, tasks).await;
+        return fold_tasks(table.file_io().clone(), *q, tasks, None).await;
     }
     // iceberg-rust's reader yields one stream, and whoever polls it decodes
     // every file: polled from one task, a multi-threaded runtime still
@@ -544,7 +544,11 @@ async fn local_fold(table: &Table, q: &Query) -> R<Partial> {
         let io = table.file_io().clone();
         let q = *q;
         handles.push(tokio::spawn(async move {
-            fold_tasks(io, q, share).await.map_err(|e| e.to_string())
+            // One file at a time per task: n files in flight in all, as
+            // when one stream read them. n streams with iceberg-rust's
+            // default of n each put n² reads in flight, and loading the S3
+            // credentials under that failed.
+            fold_tasks(io, q, share, Some(1)).await.map_err(|e| e.to_string())
         }));
     }
     let mut p = Partial::zero();
@@ -554,10 +558,20 @@ async fn local_fold(table: &Table, q: &Query) -> R<Partial> {
     Ok(p)
 }
 
-/// One stream of `tasks`, folded as it's read.
-async fn fold_tasks(io: FileIO, q: Query, tasks: Vec<FileScanTask>) -> R<Partial> {
+/// One stream of `tasks`, folded as it's read, with at most `files` of them
+/// in flight if given.
+async fn fold_tasks(
+    io: FileIO,
+    q: Query,
+    tasks: Vec<FileScanTask>,
+    files: Option<usize>,
+) -> R<Partial> {
     let stream = futures::stream::iter(tasks.into_iter().map(Ok)).boxed();
-    let mut batches = reader(&io).build().read(stream)?.stream();
+    let mut r = reader(&io);
+    if let Some(n) = files {
+        r = r.with_data_file_concurrency_limit(n);
+    }
+    let mut batches = r.build().read(stream)?.stream();
     let mut p = Partial::zero();
     while let Some(b) = batches.next().await {
         fold(&mut p, &q, &b?)?;

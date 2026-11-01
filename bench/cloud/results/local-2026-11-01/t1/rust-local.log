@@ -1,0 +1,19 @@
+# rust local, 1 threads
+# metadata=s3://dista-bench-617847241090-us-east-2/warehouse/taxi/trips/metadata/00168-6ca1a160-53d8-4ae9-a692-b3f88d78a536.metadata.json
+ANSWER q1_scan_count 1426837047 0.0 0.0 0.0
+q1_scan_count : 1426837047 rows, sum 0 | distributed -, one process 34318 ms
+ANSWER q2_month_range 10820685 299443390.9200005 0.0 0.0
+q2_month_range : 10820685 rows, sum 299443390.9200005 | distributed -, one process 834 ms
+ANSWER q3_payment_sum 556168189 7104909931.20017 0.0 0.0
+q3_payment_sum : 556168189 rows, sum 7104909931.20017 | distributed -, one process 39690 ms
+ANSWER q4_tip_ratio 78963270 477912778.63000125 3644792856.850169 0.0
+q4_tip_ratio : 78963270 rows, sum 477912778.63000125 | distributed -, one process 42206 ms
+ANSWER q5_top_zones 1426837047 0.0 0.0 1426837047.0
+q5_top_zones : 1426837047 rows, sum 0 | distributed -, one process 46057 ms
+ANSWER q6_zone_revenue 41169300 0.0 0.0 1145855820.8794913
+q6_zone_revenue : 41169300 rows, sum 0 | distributed -, one process 1696 ms
+ANSWER q7_wide 3539142 0.0 0.0 0.0
+q7_wide : 3539142 rows, sum 0 | distributed -, one process 1097 ms
+ANSWER q8_selective 3172858 256998447.1299999 0.0 0.0
+q8_selective : 3172858 rows, sum 256998447.1299999 | distributed -, one process 42443 ms
+PASS rust taxi: 8 queries in one process; one process 208341 ms
