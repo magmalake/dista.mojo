@@ -16,6 +16,16 @@ aws_secret() {
     --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 }
 
+# Copies $1 from the head node to $2.
+from_head() {
+  local ip
+  ip=$(aws ec2 describe-instances --filters "Name=tag:dista-bench,Values=head" \
+    "Name=instance-state-name,Values=running" \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+  scp -q -i "$state/key.pem" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR "ubuntu@$ip:$1" "$2"
+}
+
 # Waits for job/$1 to finish and says whether it succeeded.
 wait_job() {
   while true; do

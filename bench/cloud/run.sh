@@ -96,6 +96,10 @@ for nodes in ${NODES:-3 6 12}; do
     { echo "# $fw nodes=$nodes slots=$slots passes=$passes"
       echo "# metadata=$metadata"; } > "$log"
     run_job "$state/$fw.yaml" "$log" "$fw-taxi"
+    if [ "$fw" = dista ]; then
+      from_head "/var/lib/dista-results/dista-$nodes-timeline.json" \
+        "$results/dista-$nodes-timeline.json" || echo "no timeline from dista on $nodes nodes"
+    fi
   done
 done
 python3 bench/cloud/summarize.py "$results" | tee "$results/summary.md"
