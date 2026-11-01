@@ -624,14 +624,14 @@ struct Runtime[*Ts: TaskLike](Movable):
                 for _ in range(7):
                     t.append(get_scalar[DType.uint64](frame.payload, pos))
                 var addr = decode_addr(frame.payload, pos)
-                var where = String()
+                var worker = String()
                 if addr[1] != 0:
-                    where = addr_key(addr[0], addr[1])
+                    worker = addr_key(addr[0], addr[1])
                 self._spans.append(
                     TaskSpan(
                         obj,
                         Self._task_name(task),
-                        where^,
+                        worker^,
                         t[0],
                         t[1],
                         t[2],
@@ -766,9 +766,14 @@ struct Runtime[*Ts: TaskLike](Movable):
                 out += _meta(p, "thread_name", "waiting for inputs", 2)
             var pid = pids.get(sp.worker, 0)
             if sp.started > sp.arrived:
-                out += _event("inputs", pid, 2, sp.arrived - t0, sp.started - sp.arrived, String(
-                    '{"object":', sp.object_id, "}"
-                ))
+                out += _event(
+                    "inputs",
+                    pid,
+                    2,
+                    sp.arrived - t0,
+                    sp.started - sp.arrived,
+                    String('{"object":', sp.object_id, "}"),
+                )
             out += _event(
                 sp.task,
                 pid,
@@ -783,7 +788,8 @@ struct Runtime[*Ts: TaskLike](Movable):
                     ',"dispatch_wait_us":',
                     _us(sp.dispatched - sp.queued) if sp.queued else String(0),
                     ',"settle_after_end_us":',
-                    _us(sp.settled - sp.ended) if sp.settled > sp.ended else String(0),
+                    _us(sp.settled - sp.ended) if sp.settled
+                    > sp.ended else String(0),
                     "}",
                 ),
             )
