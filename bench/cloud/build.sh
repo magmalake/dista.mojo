@@ -43,6 +43,20 @@ load_image() {
     on_head "ssh -o StrictHostKeyChecking=no -o LogLevel=ERROR ubuntu@$ip 'sudo k3s ctr images import -' < images/$1.tar >/dev/null" &
   done
   wait
+  # A node without the image leaves its pods unschedulable (imagePullPolicy
+  # is Never), which stalled the first 12-node run; check every node.
+  local tag missing=0
+  case $1 in
+    dista) tag=dista:taxi ;;
+    ray) tag=dista-ray:taxi ;;
+    rust) tag=dista-rust:taxi ;;
+  esac
+  for ip in $(kubectl get nodes -l dista-bench/role=worker \
+      -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'); do
+    on_head "ssh -o StrictHostKeyChecking=no -o LogLevel=ERROR ubuntu@$ip 'sudo k3s ctr images ls -q' | grep -q '$tag'" \
+      || { echo "$1 is missing on $ip"; missing=1; }
+  done
+  [ $missing = 0 ]
 }
 
 if [ $load_only = 1 ]; then

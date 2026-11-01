@@ -1,0 +1,2 @@
+# dista nodes=12 slots=16 passes=5
+# metadata=s3://dista-bench-617847241090-us-east-2/warehouse/taxi/trips/metadata/00168-6ca1a160-53d8-4ae9-a692-b3f88d78a536.metadata.json

@@ -114,6 +114,7 @@ def main(results):
             worst.append(f"{max(per_pass):,.0f}" if per_pass else "")
             if not runs[k]["passed"]:
                 agree.append("**failed**")
+                problems.append(f"{k[0]} on {k[1]} nodes didn't pass")
             elif reference is None:
                 agree.append("no reference")
             else:

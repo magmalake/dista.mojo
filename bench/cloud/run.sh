@@ -35,11 +35,16 @@ run_job() {
   local manifest=$1 log=$2 app=$3
   kubectl delete -f "$manifest" --ignore-not-found --wait >/dev/null
   kubectl apply -f "$manifest" >/dev/null
+  local ok=0 ready=1
   for w in $(kubectl get -f "$manifest" -o name | grep -E 'deployment|statefulset' || true); do
-    kubectl rollout status "$w" --timeout=600s >/dev/null
+    if ! kubectl rollout status "$w" --timeout=600s >/dev/null; then
+      # One stuck rollout fails this run, not the rest of the matrix.
+      echo "FAIL: $w didn't become ready" | tee -a "$log"
+      kubectl get pods -o wide | grep -v Running | head -20 >> "$log"
+      ready=0
+    fi
   done
-  local ok=0
-  wait_job taxi && ok=1
+  [ $ready = 1 ] && wait_job taxi && ok=1
   kubectl logs job/taxi >> "$log" || true
   grep -E '^(PASS|tasks ran)' "$log" || true
   if [ $ok = 0 ] || ! grep -q '^PASS' "$log"; then
