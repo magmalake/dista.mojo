@@ -313,6 +313,18 @@ struct Stream(Movable):
             _ = external_call["close", c_int](self.fd)
 
 
+def wall_ns() -> UInt64:
+    """Nanoseconds since the epoch, from CLOCK_REALTIME.
+
+    The timeline stamps tasks on the head and on workers with this, so the
+    stamps compare across processes and, NTP permitting, machines; a
+    monotonic clock only compares within one host.
+    """
+    var ts = Array[Int64, 2](fill=0)
+    _ = external_call["clock_gettime", c_int](c_int(0), ts.unsafe_ptr())
+    return UInt64(ts[0]) * 1_000_000_000 + UInt64(ts[1])
+
+
 def stream_pair() raises -> List[Stream]:
     """Two connected local stream sockets, for tests and fuzzing."""
     var fds = Array[c_int, 2](fill=0)

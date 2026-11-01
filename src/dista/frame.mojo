@@ -27,6 +27,8 @@ Every frame is a 4-byte little-endian length, then that many bytes:
 | 14 holding | worker to head, on rejoining | count u64, then per object its ID u64 and its location |
 | 15 claim | driver to head, on resuming | none: this driver still holds this object, which lives on a worker |
 | 16 resumed | driver to head | none: this driver has restored, claimed or resubmitted everything |
+| 17 span | worker to head, before the result | three u64 wall-clock nanoseconds: when the task arrived, started and ended |
+| 18 timeline | driver to head, head to driver | none; the reply is a count u64, then per finished task its object ID, task ID, the four head stamps (submitted, queued, dispatched, settled), the three worker stamps, and the worker's address |
 
 After a head restart, a driver's hello carries its old number as a u64 after
 the registry hash, so its object IDs stay valid. It then sends, in order of
@@ -67,6 +69,8 @@ comptime KIND_STATS: UInt8 = 13
 comptime KIND_HOLDING: UInt8 = 14
 comptime KIND_CLAIM: UInt8 = 15
 comptime KIND_RESUMED: UInt8 = 16
+comptime KIND_SPAN: UInt8 = 17
+comptime KIND_TIMELINE: UInt8 = 18
 comptime ADDR_SIZE = 12
 comptime ROLE_DRIVER: UInt8 = 1
 comptime ROLE_WORKER: UInt8 = 2

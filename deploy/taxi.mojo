@@ -17,6 +17,8 @@ nodes too.
     TAXI_PASSES     distributed runs of each query (default 1); the first is
                     checked against one process, the rest against the first,
                     and each prints `TIME <query> <pass> <ms>`
+    TAXI_TIMELINE   write the distributed runs' task timeline to this path,
+                    in Chrome's trace format, before exiting
     TAXI_MODE       `both` (default), `distributed` (no one-process scan: the
                     passes are checked against each other) or `local` (only
                     the one-process scan, no workers)
@@ -507,6 +509,9 @@ def main() raises:
     var expect = Int(getenv("DISTA_EXPECT_NODES", "1"))
     if len(nodes) < expect:
         raise Error("expected ", expect, " nodes, saw ", len(nodes))
+    var timeline = getenv("TAXI_TIMELINE")
+    if timeline != "":
+        print("timeline:", rt.timeline(timeline), "tasks in", timeline)
     if mode == "both":
         print(
             "PASS taxi: 8 queries + 1 as batches, distributed == one process;",

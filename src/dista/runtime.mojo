@@ -49,10 +49,12 @@ from dista.frame import (
     KIND_STATS,
     KIND_TASK,
     KIND_TASK_AFTER,
+    KIND_TIMELINE,
     KIND_WELCOME,
     ROLE_DRIVER,
     ROLE_WORKER,
     Frame,
+    decode_addr,
     read_frame,
     write_frame,
 )
@@ -96,6 +98,31 @@ struct _Submission(Copyable, Movable):
 
 
 @fieldwise_init
+struct TaskSpan(Copyable, Movable, Writable):
+    """One finished task, from `Runtime.spans`: wall-clock nanoseconds.
+
+    The first four are the head's, the last three the worker's. On a
+    cluster the two clocks agree only as well as NTP keeps them.
+    """
+
+    var object_id: UInt64
+    var task: String
+    """The task's registered name."""
+    var worker: String
+    """The worker's `ip:port`, or "" if it never ran (an input failed)."""
+    var submitted: UInt64
+    var queued: UInt64
+    """When its inputs existed and it joined the queue."""
+    var dispatched: UInt64
+    var settled: UInt64
+    var arrived: UInt64
+    """On the worker: when the task reached it, before any input fetches."""
+    var started: UInt64
+    var ended: UInt64
+    """When it finished, its result stored."""
+
+
+@fieldwise_init
 struct HeadStats(Copyable, Movable, Writable):
     """What the head holds, from `Runtime.stats`."""
 
@@ -108,6 +135,53 @@ struct HeadStats(Copyable, Movable, Writable):
     """Results the head knows live on a worker."""
     var pending: Int
     """Tasks queued or waiting on inputs."""
+
+
+def _us(ns: UInt64) -> String:
+    return String(Float64(ns) / 1000.0)
+
+
+def _json_string(s: String) -> String:
+    var out = String('"')
+    for cp in s.codepoint_slices():
+        if cp == '"' or cp == "\\":
+            out += "\\"
+        out += cp
+    return out + '"'
+
+
+def _meta(pid: Int, what: String, name: String, tid: Int = 0) -> String:
+    return String(
+        '{"name":"',
+        what,
+        '","ph":"M","pid":',
+        pid,
+        ',"tid":',
+        tid,
+        ',"args":{"name":',
+        _json_string(name),
+        "}},\n",
+    )
+
+
+def _event(
+    name: String, pid: Int, tid: Int, ts: UInt64, dur: UInt64, args: String
+) -> String:
+    return String(
+        '{"name":',
+        _json_string(name),
+        ',"ph":"X","pid":',
+        pid,
+        ',"tid":',
+        tid,
+        ',"ts":',
+        _us(ts),
+        ',"dur":',
+        _us(dur),
+        ',"args":',
+        args,
+        "},\n",
+    )
 
 
 def parse_host_port(addr: String) raises -> Tuple[String, Int]:
@@ -166,6 +240,8 @@ struct Runtime[*Ts: TaskLike](Movable):
     """How many times this driver has resumed with a restarted head."""
     var _claimed: Dict[UInt64, Bool]
     """Results claimed from a restarted head that hasn't said where yet."""
+    var _spans: List[TaskSpan]
+    var _timeline_answered: Bool
 
     def __init__(out self, workers: Int = 4, pipeline: Int = 2) raises:
         """Starts this process in the role its environment names.
@@ -249,6 +325,8 @@ struct Runtime[*Ts: TaskLike](Movable):
         self._live = Dict[UInt64, Bool]()
         self._resumes = 0
         self._claimed = Dict[UInt64, Bool]()
+        self._spans = List[TaskSpan]()
+        self._timeline_answered = False
 
     def __deinit__(deinit self):
         # In local mode the head exits once its only driver leaves, and closes
@@ -536,6 +614,34 @@ struct Runtime[*Ts: TaskLike](Movable):
             if keep:
                 self._located[id] = frame.payload.copy()
             self._settle(id)
+        elif frame.kind == KIND_TIMELINE:
+            var pos = 0
+            var n = Int(get_scalar[DType.uint64](frame.payload, pos))
+            for _ in range(n):
+                var obj = get_scalar[DType.uint64](frame.payload, pos)
+                var task = get_scalar[DType.uint64](frame.payload, pos)
+                var t = List[UInt64]()
+                for _ in range(7):
+                    t.append(get_scalar[DType.uint64](frame.payload, pos))
+                var addr = decode_addr(frame.payload, pos)
+                var where = String()
+                if addr[1] != 0:
+                    where = addr_key(addr[0], addr[1])
+                self._spans.append(
+                    TaskSpan(
+                        obj,
+                        Self._task_name(task),
+                        where^,
+                        t[0],
+                        t[1],
+                        t[2],
+                        t[3],
+                        t[4],
+                        t[5],
+                        t[6],
+                    )
+                )
+            self._timeline_answered = True
         elif frame.kind == KIND_STATS:
             var pos = 0
             var n = List[Int]()
@@ -608,6 +714,83 @@ struct Runtime[*Ts: TaskLike](Movable):
                 asked = self._resumes
                 self._send(KIND_STATS, 0, List[UInt8]())
         return self._stats.value().copy()
+
+    @staticmethod
+    def _task_name(task_id: UInt64) -> String:
+        comptime for i in range(Self.Ts.length):
+            if Self.Ts[i].id() == task_id:
+                return String(Self.Ts[i].name())
+        return String("task ", task_id)
+
+    def spans(mut self) raises -> List[TaskSpan]:
+        """Every task this driver submitted that has finished, with its
+        timeline, since the last call. A head restart loses the spans it held
+        and those of tasks running then.
+        """
+        self._timeline_answered = False
+        self._send(KIND_TIMELINE, 0, List[UInt8]())
+        var asked = self._resumes
+        while not self._timeline_answered:
+            self._read_one()
+            if self._resumes != asked:
+                asked = self._resumes
+                self._send(KIND_TIMELINE, 0, List[UInt8]())
+        var out = self._spans^
+        self._spans = List[TaskSpan]()
+        return out^
+
+    def timeline(mut self, path: String) raises -> Int:
+        """Writes the finished tasks' timeline to `path` in Chrome's trace
+        format, for Perfetto (ui.perfetto.dev) or chrome://tracing, and
+        returns how many tasks it holds.
+
+        Each worker is a process with two tracks: its tasks running, and its
+        tasks waiting for their inputs. Times are microseconds from the first
+        submission; each run's arguments carry the head's waits too.
+        """
+        var spans = self.spans()
+        var t0 = UInt64(0)
+        for ref sp in spans:
+            if t0 == 0 or sp.submitted < t0:
+                t0 = sp.submitted
+        var pids = Dict[String, Int]()
+        var out = String("[\n")
+        for ref sp in spans:
+            if sp.worker == "" or sp.started == 0:
+                continue
+            if sp.worker not in pids:
+                var p = len(pids) + 1
+                pids[sp.worker] = p
+                out += _meta(p, "process_name", "worker " + sp.worker)
+                out += _meta(p, "thread_name", "running", 1)
+                out += _meta(p, "thread_name", "waiting for inputs", 2)
+            var pid = pids.get(sp.worker, 0)
+            if sp.started > sp.arrived:
+                out += _event("inputs", pid, 2, sp.arrived - t0, sp.started - sp.arrived, String(
+                    '{"object":', sp.object_id, "}"
+                ))
+            out += _event(
+                sp.task,
+                pid,
+                1,
+                sp.started - t0,
+                sp.ended - sp.started,
+                String(
+                    '{"object":',
+                    sp.object_id,
+                    ',"queued_after_submit_us":',
+                    _us(sp.queued - sp.submitted) if sp.queued else String(0),
+                    ',"dispatch_wait_us":',
+                    _us(sp.dispatched - sp.queued) if sp.queued else String(0),
+                    ',"settle_after_end_us":',
+                    _us(sp.settled - sp.ended) if sp.settled > sp.ended else String(0),
+                    "}",
+                ),
+            )
+        out += '{"name":"end","ph":"i","ts":0,"pid":0,"tid":0,"s":"g"}\n]\n'
+        with open(path, "w") as f:
+            f.write(out)
+        return len(spans)
 
     def bytes_fetched(self) -> Int:
         """How many result bytes this driver has fetched over sockets."""

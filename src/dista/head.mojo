@@ -47,21 +47,33 @@ from dista.frame import (
     KIND_RELEASE,
     KIND_RESULT,
     KIND_RESUMED,
+    KIND_SPAN,
     KIND_STATS,
     KIND_STORED,
     KIND_TASK,
     KIND_TASK_AFTER,
     KIND_TASK_INPUTS,
+    KIND_TIMELINE,
     KIND_WELCOME,
     ROLE_DRIVER,
     ROLE_WORKER,
     Frame,
 )
-from dista.socket import POLLERR, POLLHUP, POLLIN, POLLOUT, Listener, poll
+from dista.socket import (
+    POLLERR,
+    POLLHUP,
+    POLLIN,
+    POLLOUT,
+    Listener,
+    poll,
+    wall_ns,
+)
 from dista.store import Location
 
 comptime DRIVER_SHIFT = 40
 """Object IDs carry their driver's number above this bit."""
+comptime MAX_SPANS = 1_000_000
+"""Finished task spans the head keeps per driver until it asks for them."""
 comptime _ROLE_NONE: UInt8 = 0
 comptime _ROLE_GONE: UInt8 = 255
 
@@ -69,6 +81,24 @@ comptime _ROLE_GONE: UInt8 = 255
 def owner_of(object_id: UInt64) -> UInt64:
     """The number of the driver that created `object_id`."""
     return object_id >> DRIVER_SHIFT
+
+
+@fieldwise_init
+struct _Span(Copyable, Movable):
+    """One task's timeline: the head's stamps and the worker's."""
+
+    var object_id: UInt64
+    var task_id: UInt64
+    var worker: Int
+    """The connection that ran it, or -1."""
+    var submitted: UInt64
+    var queued: UInt64
+    var dispatched: UInt64
+    var settled: UInt64
+    var arrived: UInt64
+    """On the worker: when the task reached it, before any input fetches."""
+    var started: UInt64
+    var ended: UInt64
 
 
 struct _Task(Copyable, Movable):
@@ -134,6 +164,10 @@ struct Head(Movable):
     """Results a rejoining worker reported that no driver has claimed yet."""
     var _resumed: Dict[UInt64, Bool]
     """Drivers that have finished resuming with this head."""
+    var _spans: Dict[UInt64, _Span]
+    """Tasks in progress, by object."""
+    var _finished: Dict[UInt64, List[_Span]]
+    """Settled tasks' spans, by driver, until the driver asks for them."""
 
     def __init__(
         out self,
@@ -174,6 +208,8 @@ struct Head(Movable):
         self._dead = Dict[UInt64, Bool]()
         self._orphans = Dict[UInt64, Bool]()
         self._resumed = Dict[UInt64, Bool]()
+        self._spans = Dict[UInt64, _Span]()
+        self._finished = Dict[UInt64, List[_Span]]()
 
     def run(mut self) raises:
         """Serves until the last driver leaves, in local mode; else forever."""
@@ -239,7 +275,9 @@ struct Head(Movable):
                 self._hold(obj)
                 if self._adopt(obj):
                     return
+                self._open_span(obj, task)
                 self._queue.append(_Task(obj, task, f^.take_payload()))
+                self._stamp_queued(obj)
             elif f.kind == KIND_TASK_AFTER:
                 if len(f.payload) < 9:
                     raise Error("truncated task-after")
@@ -267,6 +305,7 @@ struct Head(Movable):
                 for d in deps:
                     self._refs[d] = self._refs.get(d, 0) + 1
                 self._deps_of[f.object_id] = deps.copy()
+                self._open_span(f.object_id, f.task_id)
                 self._waiting.append(
                     _Task(
                         f.object_id,
@@ -309,6 +348,8 @@ struct Head(Movable):
             elif f.kind == KIND_RELEASE:
                 if self._held.pop(f.object_id, False):
                     self._dec(f.object_id)
+            elif f.kind == KIND_TIMELINE:
+                self._send_timeline(i)
             elif f.kind == KIND_STATS:
                 var body = List[UInt8]()
                 put_scalar[DType.uint64](body, UInt64(len(self._refs)))
@@ -324,6 +365,14 @@ struct Head(Movable):
         elif role == ROLE_WORKER:
             if f.kind == KIND_HOLDING:
                 self._holding(i, f.payload)
+                return
+            if f.kind == KIND_SPAN:
+                if f.object_id in self._spans:
+                    var pos = 0
+                    ref sp = self._spans[f.object_id]
+                    sp.arrived = get_scalar[DType.uint64](f.payload, pos)
+                    sp.started = get_scalar[DType.uint64](f.payload, pos)
+                    sp.ended = get_scalar[DType.uint64](f.payload, pos)
                 return
             if (
                 f.kind != KIND_RESULT
@@ -463,6 +512,65 @@ struct Head(Movable):
         var deps = self._deps_of.pop(object_id, List[UInt64]())
         for d in deps:
             self._dec(d)
+        self._close_span(object_id)
+
+    # ── timeline ─────────────────────────────────────────────────────────
+    def _open_span(mut self, object_id: UInt64, task_id: UInt64):
+        self._spans[object_id] = _Span(
+            object_id, task_id, -1, wall_ns(), 0, 0, 0, 0, 0, 0
+        )
+
+    def _stamp_queued(mut self, object_id: UInt64):
+        if object_id in self._spans:
+            try:
+                self._spans[object_id].queued = wall_ns()
+            except:
+                pass
+
+    def _close_span(mut self, object_id: UInt64):
+        var sp = self._spans.pop(
+            object_id, _Span(0, 0, -1, 0, 0, 0, 0, 0, 0, 0)
+        )
+        if sp.submitted == 0:
+            return
+        sp.settled = wall_ns()
+        var d = owner_of(object_id)
+        if d not in self._finished:
+            self._finished[d] = List[_Span]()
+        try:
+            ref done = self._finished[d]
+            if len(done) < MAX_SPANS:
+                done.append(sp^)
+        except:
+            pass
+
+    def _send_timeline(mut self, i: Int) raises:
+        """Sends driver `i` its finished spans, and forgets them."""
+        var d = UInt64(0)
+        for entry in self._driver_conn.items():
+            if entry.value == i:
+                d = entry.key
+        var done = self._finished.pop(d, List[_Span]())
+        var body = List[UInt8]()
+        put_scalar[DType.uint64](body, UInt64(len(done)))
+        for ref sp in done:
+            put_scalar[DType.uint64](body, sp.object_id)
+            put_scalar[DType.uint64](body, sp.task_id)
+            for v in [
+                sp.submitted,
+                sp.queued,
+                sp.dispatched,
+                sp.settled,
+                sp.arrived,
+                sp.started,
+                sp.ended,
+            ]:
+                put_scalar[DType.uint64](body, v)
+            if sp.worker >= 0 and sp.worker < len(self._worker_addr):
+                body.extend(self._worker_addr[sp.worker].copy())
+            else:
+                body.extend(List[UInt8](length=ADDR_SIZE, fill=0))
+        self._conns[i].send(KIND_TIMELINE, 0, 0, body)
 
     def _dec(mut self, object_id: UInt64):
         if object_id not in self._refs:
@@ -565,6 +673,7 @@ struct Head(Movable):
                 for d in t.deps:
                     args.extend(self._results.get(d, List[UInt8]()))
                 self._queue.append(_Task(t.object_id, t.task_id, args^))
+                self._stamp_queued(t.object_id)
             else:
                 # Some inputs live on workers: tell the worker that runs this
                 # task where to fetch them, and pass the rest inline.
@@ -584,6 +693,7 @@ struct Head(Movable):
                 self._queue.append(
                     _Task(t.object_id, t.task_id, spec^, kind=KIND_TASK_INPUTS)
                 )
+                self._stamp_queued(t.object_id)
         self._waiting = still^
 
     def _queued(self) -> Int:
@@ -602,6 +712,13 @@ struct Head(Movable):
                 ref t = self._queue[self._queue_head]
                 self._queue_head += 1
                 self._inflight[i].append(t.object_id)
+                if t.object_id in self._spans:
+                    try:
+                        ref sp = self._spans[t.object_id]
+                        sp.worker = i
+                        sp.dispatched = wall_ns()
+                    except:
+                        pass
                 try:
                     self._conns[i].send(t.kind, t.object_id, t.task_id, t.args)
                 except e:

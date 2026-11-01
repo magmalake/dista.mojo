@@ -36,6 +36,7 @@ from dista.frame import (
     KIND_HELLO,
     KIND_HOLDING,
     KIND_RESULT,
+    KIND_SPAN,
     KIND_STORED,
     KIND_TASK,
     KIND_TASK_INPUTS,
@@ -61,6 +62,7 @@ from dista.socket import (
     Stream,
     poll,
     resolve_ipv4,
+    wall_ns,
 )
 
 comptime INLINE_LIMIT = 64 * 1024
@@ -149,6 +151,7 @@ struct _Parked(Copyable, Movable):
     var task_id: UInt64
     var gather: Bool
     var inputs: List[_Input]
+    var arrived: UInt64
 
     def __init__(
         out self,
@@ -161,19 +164,27 @@ struct _Parked(Copyable, Movable):
         self.task_id = task_id
         self.gather = gather
         self.inputs = inputs^
+        self.arrived = wall_ns()
 
 
 struct _Ready(Movable):
     var object_id: UInt64
     var task_id: UInt64
     var args: List[UInt8]
+    var arrived: UInt64
+    """When the task reached this worker, before any of its inputs did."""
 
     def __init__(
-        out self, object_id: UInt64, task_id: UInt64, var args: List[UInt8]
+        out self,
+        object_id: UInt64,
+        task_id: UInt64,
+        var args: List[UInt8],
+        arrived: UInt64 = 0,
     ):
         self.object_id = object_id
         self.task_id = task_id
         self.args = args^
+        self.arrived = arrived if arrived != 0 else wall_ns()
 
 
 struct Worker[dispatch: DispatchFn](Movable):
@@ -484,7 +495,9 @@ struct Worker[dispatch: DispatchFn](Movable):
                         args.extend(
                             self._objects.get(inp.object_id, List[UInt8]())
                         )
-                self._ready.append(_Ready(p.object_id, p.task_id, args^))
+                self._ready.append(
+                    _Ready(p.object_id, p.task_id, args^, p.arrived)
+                )
         self._parked = still^
         # Fetched copies nothing parked still waits on have done their job.
         var done = List[UInt64]()
@@ -517,12 +530,15 @@ struct Worker[dispatch: DispatchFn](Movable):
             )
             return
         var out = List[UInt8]()
+        var started = wall_ns()
         try:
             Self.dispatch(t.task_id, t.args, out)
         except e:
+            self._span(t.object_id, t.arrived, started)
             self._report_error(t.object_id, String(e))
             return
         if len(out) <= INLINE_LIMIT:
+            self._span(t.object_id, t.arrived, started)
             self._to_head(KIND_RESULT, t.object_id, out)
         else:
             var path = String()
@@ -540,7 +556,16 @@ struct Worker[dispatch: DispatchFn](Movable):
                 self._files[t.object_id] = loc.copy()
             else:
                 self._objects[t.object_id] = out^
+            self._span(t.object_id, t.arrived, started)  # storing included
             self._to_head(KIND_STORED, t.object_id, loc.encode())
+
+    def _span(mut self, obj: UInt64, arrived: UInt64, started: UInt64):
+        """Tells the head when `obj`'s task arrived, started and ended here."""
+        var body = List[UInt8]()
+        put_scalar[DType.uint64](body, arrived)
+        put_scalar[DType.uint64](body, started)
+        put_scalar[DType.uint64](body, wall_ns())
+        self._to_head(KIND_SPAN, obj, body)
 
     def _to_head(mut self, kind: UInt8, obj: UInt64, payload: Span[UInt8, _]):
         """Sends to the head; a head that's gone is noticed by `run`."""
