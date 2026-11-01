@@ -202,3 +202,70 @@ Phase 2 takes dista from one machine to a cluster. Its gate, from the vision: a 
 | 9 | **The Iceberg scan.** One task per data file, results gathered as Arrow. | Phase 2's gate. | ~400 |
 
 PR 7 changes a published tin, and needs your sign-off before it's merged.
+
+## Phase 3 plan
+
+Phase 3 adds actors: long-lived structs that keep state between calls. Its gate, from the vision: a long-lived actor survives its worker restarting, with its state restored.
+
+It starts with two things the cluster runs need before they're measured again: results are freed, and the head can restart. Both sit on the hot path, so the next AWS runs should include them.
+
+### The head, version 0
+
+Today the head is one process holding everything: the queue, where each result lives, which workers exist. If it dies, the job dies with it.
+
+**Version 0 makes the head's state rebuildable instead of durable.** Nothing it holds is written to disk. When Kubernetes restarts it:
+- **Workers rebuild the directory.** Each worker reconnects (they already retry for `DISTA_CONNECT_TIMEOUT`) and reports the results it holds and, once actors exist, the actor it hosts with its last call number. The head rebuilds the directory from those reports.
+- **The driver rebuilds the queue.** It reconnects and resubmits every task it hasn't got a result for. Tasks with a result on a worker aren't run again.
+- **Running tasks may run twice.** A task that was running when the head died can be resubmitted and run again, so tasks have to be safe to repeat, which they are for a pure function.
+
+That covers a head restart, not a head that's lost for good with the driver. Replicating the head is later work.
+
+**Throughput.** The head is a single-threaded `poll()` loop. `bench/fanout.mojo` grows a mode that measures tasks per second through the head with 16, 64 and 192 workers, empty tasks and 1 MB results. That shows whether the head limits the 12-node runs, before the actor work adds traffic to it.
+
+### How actors work
+
+**Declared at compile time, like tasks.** dista can't load code at runtime, so an actor is a state type and its constructor, and each method is declared once:
+
+```mojo
+comptime Counter = Actor[CounterState, CounterArgs, new_counter]
+comptime Add = Method[Counter, Int, Int, add]           # def add(mut s: CounterState, n: Int) raises -> Int
+
+var c = rt.create[Counter](CounterArgs(start=0))        # an ActorHandle
+var r = rt.call[Add](c, 5)                               # an ObjectRef[Int], as for a task
+```
+
+Actors and methods go in `Runtime[...]` with the tasks, so the registry hash still proves every process runs the same code.
+
+**One actor, one worker process.** The head places an actor on a free worker, and that worker serves only that actor until the actor is killed. This is Ray's model. It keeps a single-threaded worker simple: the actor's state is owned by one process, and nothing else runs beside it.
+
+**Calls run one at a time, in order.** The head numbers each actor's calls and sends them in that order. The worker runs them one after another. A method's result is an `ObjectRef` like a task's: it stays on the worker if it's large, and it can be another task's argument.
+
+**Handles are values.** An `ActorHandle` goes through the codec, so a task or another actor can call methods. Calls from workers go through the head, which keeps the order.
+
+**Restart.** When an actor's worker goes away, the head marks the actor restarting and places it on another worker. Kubernetes restarts the pod, which rejoins as a new worker. The actor comes back from its last checkpoint, or from its constructor if it has none, and the calls since then are replayed.
+
+**Checkpoints.** A checkpoint is the actor's state encoded by the codec, with the number of the last call it reflects. A state type can implement `Codec` itself to save only what it can't rebuild: a cache can save nothing, and a loaded model can save its path. Checkpoints are written through objectstore to `DISTA_CHECKPOINT_URI`, a local directory or `s3://`, so they outlive the node. The head keeps each call's arguments until a checkpoint covers it.
+
+### Defaults to confirm
+
+| Question | Default | Alternative |
+|---|---|---|
+| When to checkpoint | Every N calls (per actor, `checkpoint_every`), plus an explicit `rt.checkpoint(handle)` | Only explicit, or only on a timer |
+| Calls in flight when the worker dies | Replayed after the restore: at-least-once, so a method should be safe to run twice | Failed with an error: at-most-once |
+| Concurrency | One call at a time per actor | Concurrent read-only methods |
+| Freeing results | Reference counts at the head: the driver's hold plus the pending tasks that take a result. `rt.release(ref)` drops the driver's hold. | Free on `ObjectRef` destruction, which needs a non-copyable ref |
+
+### PRs
+
+Stacked, at most about 2,000 lines each, in order. Once a worker re-registers its actor after a head restart (from PR 3 on), actors survive a head restart too:
+
+| # | PR | Gate | Size |
+|---|---|---|---|
+| 1 | **Freeing results.** Reference counts at the head; `rt.release`; workers delete a freed result from memory or the node store. | A loop of 10,000 tasks with 1 MB results finishes with the stores empty. | ~500 |
+| 2 | **Head restart, version 0.** Workers re-register what they hold; the driver resubmits what it hasn't got; head throughput in `bench/fanout.mojo`. | The head is killed mid-fan-out on kind; the job finishes with every answer right. Tasks per second with 16, 64 and 192 workers are recorded. | ~600 |
+| 3 | **Actors: declare, place, call.** `Actor`, `Method`, `rt.create`, `rt.call`, `rt.kill`; one worker per actor; ordered calls; results as `ObjectRef`s. | A counter actor takes 1,000 calls from the driver and returns 1,000 in order; a task uses a method's result. | ~900 |
+| 4 | **Handles as values.** `ActorHandle` through the codec; method calls from tasks and other actors, routed by the head. | 100 tasks each call one shared actor; the actor sees every call once. | ~400 |
+| 5 | **Restart from the constructor.** The head notices the worker is gone, places the actor elsewhere, and replays the calls since it was created. | The counter's worker is killed after 500 of 1,000 calls; the final count is still 1,000. | ~600 |
+| 6 | **Checkpoints.** `checkpoint_every`, `rt.checkpoint`, state through the codec to `DISTA_CHECKPOINT_URI`; restore plus replay of the calls since; the head drops calls a checkpoint covers. | Phase 3's gate: on kind, the counter's pod is deleted mid-run; the actor restores from its checkpoint and the count is exact. | ~700 |
+
+Restate stays out of phase 3. It's the candidate for durable workflows built on actors later, and for phase 4's recovery.
