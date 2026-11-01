@@ -1,0 +1,32 @@
+# dista local, 16 threads
+# metadata=s3://dista-bench-617847241090-us-east-2/warehouse/taxi/trips/metadata/00168-6ca1a160-53d8-4ae9-a692-b3f88d78a536.metadata.json
+ANSWER q1_scan_count 1426837047 0.0 0.0 0.0
+q1_scan_count : 1426837047 rows, sum 0.0 | distributed - , one process 8906 ms
+ANSWER q2_month_range 10820685 299443390.91862446 0.0 0.0
+q2_month_range : 10820685 rows, sum 299443390.91862446 | distributed - , one process 351 ms
+Stack dump without symbol names (ensure you have llvm-symbolizer in your PATH or set the environment var `LLVM_SYMBOLIZER_PATH` to point to it):
+0  libKGENCompilerRTShared.so 0x0000ea736e5cf820
+1  libKGENCompilerRTShared.so 0x0000ea736e5ccf00
+2  libKGENCompilerRTShared.so 0x0000ea736e5d025c
+3  linux-vdso.so.1            0x0000ea736e669a60 __kernel_rt_sigreturn + 0
+4  libcurl.so.4               0x0000ea736c20fee0
+5  libcurl.so.4               0x0000ea736c19f1e0
+6  libcurl.so.4               0x0000ea736c211c64
+7  libcurl.so.4               0x0000ea736c2129dc
+8  libcurl.so.4               0x0000ea736c1e5ea0
+9  libcurl.so.4               0x0000ea736c1e7a48
+10 libcurl.so.4               0x0000ea736c1e7d98 curl_multi_perform + 172
+11 libcurl.so.4               0x0000ea736c1ae288
+12 libcurl.so.4               0x0000ea736c1ae708 curl_easy_perform + 156
+13 libobjectstoremojo.so      0x0000ea736c2a3448 os_http_request_ex + 760
+14 libobjectstoremojo.so      0x0000ea736c2a3890 os_http_request + 80
+15 dista                      0x0000b2a191c34180
+16 dista                      0x0000b2a191c3d394
+17 dista                      0x0000b2a191c3d618
+18 dista                      0x0000b2a191bc1124
+19 dista                      0x0000b2a191bf96bc
+20 dista                      0x0000b2a191b03928
+21 dista                      0x0000b2a191b13228
+22 dista                      0x0000b2a191b12cd8
+23 libc.so.6                  0x0000ea736e392030
+24 libc.so.6                  0x0000ea736e3fbf5c

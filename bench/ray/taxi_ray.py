@@ -20,7 +20,9 @@ a manifest. The driver adds the partial states together.
 
 Each query's answer prints as `ANSWER <query> <rows> <sum_a> <sum_b>
 <zones_total>`, the same line deploy/taxi.mojo prints.
-    TAXI_THREADS    pyarrow's CPU and I/O threads per process; unset = pyarrow's default
+    TAXI_THREADS    pyarrow's CPU threads per process; unset = pyarrow's default
+    TAXI_FILES_AT_ONCE  pyarrow's I/O threads when TAXI_THREADS is set: at
+                    least this many reads in flight (default 8)
     RAY_ADDRESS     the cluster; unset = a local Ray started here
 """
 
@@ -43,7 +45,10 @@ def _threads():
     n = os.environ.get("TAXI_THREADS")
     if n:
         pa.set_cpu_count(int(n))
-        pa.set_io_thread_count(int(n))
+        # One CPU thread still gets several reads in flight: pyarrow's way
+        # to overlap object-store waits is its I/O pool.
+        files = int(os.environ.get("TAXI_FILES_AT_ONCE", "8"))
+        pa.set_io_thread_count(max(int(n), files))
 
 
 def _s3_properties():

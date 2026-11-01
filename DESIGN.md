@@ -281,3 +281,23 @@ Ray exports Prometheus metrics from every node, runs a dashboard on the head, an
 OpenTelemetry tracing waits for the pipeline work, where one trace should cover the orchestrator, the driver and its tasks. OTLP over HTTP with JSON needs no gRPC, and can go out through objectstore's libcurl client.
 
 Restate stays out of phase 3. It's the candidate for durable workflows built on actors later, and for phase 4's recovery.
+
+## Order of work, from 2026-11-01
+
+1. **Measure on one host and on many**, to check the performance is where it should be. The one-process references run on 16 threads and on 1 thread with best settings (each framework one decoding thread with 8 files' reads in flight). Then the 3, 6 and 12 node matrix. Every number goes into `bench/cloud/results/NUMBERS.md`.
+2. **Fix what those runs turn up**: bugs and performance regressions.
+3. **Finish the actors** (PRs 5 to 7 above) and metrics (PR 8), then the remaining phases.
+
+### To do: what a shuffle needs
+
+The taxi benchmark is mostly reading Parquet from S3. A second benchmark should spend its time in user code and in moving data between tasks: per-trip features in each framework's own code, a group-by on pickup zone × dropoff zone × hour (about 1.7 million groups, too many to send to the driver) as map tasks partitioning by key and reduce tasks taking their partition from every map task, then a top-k. dista doesn't have what that needs yet. Ray has all of it:
+
+| | What's missing | Why a shuffle needs it |
+|---|---|---|
+| 1 | **Several results from one task.** A `Task` that declares N results; `remote` returns N `ObjectRef`s, each stored and fetched on its own (Ray's `num_returns`). | A map task makes one partition per reducer. With one result per task, each reducer fetches every map task's whole output, or each partition is a separate task that re-reads its input. |
+| 2 | **Fetching part of an object.** A reducer fetches element *j* of a stored `Seq` without the rest. | The alternative to 1 when a task's partitions are one value. |
+| 3 | **Refs inside arguments.** A task's argument can mix values and `ObjectRef`s, and the refs resolve before it runs. Today a task takes either one value, one ref or a list of refs. | "Reduce partition *j* over these map outputs" is a number and a list of refs. |
+| 4 | **Placement by data location.** A task goes to the node holding most of its inputs' bytes, rather than round-robin. | Reducers read megabytes from every node; sending them where the bytes are halves the traffic or better. |
+| 5 | **Spilling.** Results that don't fit in memory or `/dev/shm` go to local disk or object storage. | A shuffle's intermediate data can be larger than memory. |
+
+1 and 3 come first, before the second benchmark; 4 and 5 once it shows they matter.

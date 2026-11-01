@@ -4,7 +4,7 @@
 memory-region.mojo https://github.com/magmalake/memory-region.mojo.git 40068c4f95ea659e9b78aa91ced45420b07e3e6e
 arrow-mlake.mojo https://github.com/magmalake/arrow-mlake.mojo.git 928a2435371c82395879779225df284e581dfb21
 parquet.mojo https://github.com/magmalake/parquet.mojo.git 9a596283d3612d1ebeca199f9e48f1c1a7eaab51
-iceberg.mojo https://github.com/magmalake/iceberg.mojo.git 557ecdde5b6ead3a32da1580769378ca99365aeb
+iceberg.mojo https://github.com/magmalake/iceberg.mojo.git 7e69e18afdaa1811efcdc178458023d914da6d12
 threads.mojo https://github.com/magmalake/threads.mojo.git c8c658dfa6fac00b7d5ab89a0277f248a7a79457
 thrift.mojo https://github.com/magmalake/thrift.mojo.git 21cdbce67d22d72e88e88a60e2f168b05b4ef9fa
 hashes.mojo https://github.com/magmalake/hashes.mojo.git 395aca597f9410bd0511df44d972f14b10a8b01d
@@ -12,7 +12,7 @@ snappy.mojo https://github.com/magmalake/snappy.mojo.git b8172ed0a4ef13911cc225d
 deflate.mojo https://github.com/magmalake/deflate.mojo.git aeb571e54ac736b97c826a23f44501715fddc656
 avro.mojo https://github.com/magmalake/avro.mojo.git 479c9d390b5c12c2497e05f84b64bf690a8cfea3
 roaring.mojo https://github.com/magmalake/roaring.mojo.git a90a7bd30cf1c21403a29059282072e93fbeeee2
-objectstore.mojo https://github.com/magmalake/objectstore.mojo.git 1781d56ae908798a835e9178fa6b046c86d5ff27
+objectstore.mojo https://github.com/magmalake/objectstore.mojo.git 748e2d31450a7793592e439d6c69d8c6598d2129
 zstd.mojo https://github.com/magmalake/zstd.mojo.git 53655623ca8585fd5b36b1239842913ec308ae69
 lz4.mojo https://github.com/magmalake/lz4.mojo.git 64502eeeabed37515cd479bc421fc2920504cac5
 brotli.mojo https://github.com/magmalake/brotli.mojo.git aa6d14985baf82ad4b934f14136b95a291b55faf

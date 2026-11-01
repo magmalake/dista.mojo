@@ -71,7 +71,8 @@ of spot instances with `SPOT=1`.
 bench/cloud/aws.sh up 0              # the head node alone: ~3 minutes
 bench/cloud/data.sh load             # the table, once: it stays in S3
 bench/cloud/build.sh                 # timed builds, on the head node alone
-bench/cloud/run.sh local             # the one-process references, ~1-2 hours
+bench/cloud/run.sh local             # the one-process references, one thread
+THREADS=16 bench/cloud/run.sh local  # ...and on all 16 cores
 bench/cloud/aws.sh up 12             # add the workers
 bench/cloud/build.sh load            # the same images, onto the workers
 bench/cloud/run.sh                   # 3 x 3 runs, 5 passes each

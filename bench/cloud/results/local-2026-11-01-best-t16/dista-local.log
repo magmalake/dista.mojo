@@ -1,0 +1,19 @@
+# dista local, 16 threads
+# metadata=s3://dista-bench-617847241090-us-east-2/warehouse/taxi/trips/metadata/00168-6ca1a160-53d8-4ae9-a692-b3f88d78a536.metadata.json
+ANSWER q1_scan_count 1426837047 0.0 0.0 0.0
+q1_scan_count : 1426837047 rows, sum 0.0 | distributed - , one process 9095 ms
+ANSWER q2_month_range 10820685 299443390.91862446 0.0 0.0
+q2_month_range : 10820685 rows, sum 299443390.91862446 | distributed - , one process 331 ms
+ANSWER q3_payment_sum 556168189 7104909941.443372 0.0 0.0
+q3_payment_sum : 556168189 rows, sum 7104909941.443372 | distributed - , one process 10309 ms
+ANSWER q4_tip_ratio 78963270 477912778.6366782 3644792856.849406 0.0
+q4_tip_ratio : 78963270 rows, sum 477912778.6366782 | distributed - , one process 11138 ms
+ANSWER q5_top_zones 1426837047 0.0 0.0 1426837047.0
+q5_top_zones : 1426837047 rows, sum 0.0 | distributed - , one process 26788 ms
+ANSWER q6_zone_revenue 41169300 0.0 0.0 1145855820.87954
+q6_zone_revenue : 41169300 rows, sum 0.0 | distributed - , one process 1067 ms
+ANSWER q7_wide 3539142 0.0 0.0 0.0
+q7_wide : 3539142 rows, sum 0.0 | distributed - , one process 880 ms
+ANSWER q8_selective 3172858 256998447.13338125 0.0 0.0
+q8_selective : 3172858 rows, sum 256998447.13338125 | distributed - , one process 12048 ms
+PASS taxi: 8 queries in one process; one process 71656 ms
