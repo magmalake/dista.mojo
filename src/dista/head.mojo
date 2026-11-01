@@ -66,6 +66,7 @@ from dista.frame import (
     KIND_TASK_INPUTS,
     KIND_TIMELINE,
     KIND_WELCOME,
+    ROLE_CLIENT,
     ROLE_DRIVER,
     ROLE_WORKER,
     Frame,
@@ -208,6 +209,9 @@ struct Head(Movable):
     """Actors waiting for a worker, oldest first."""
     var _hosting: List[UInt64]
     """For a worker, the actor it hosts, or 0."""
+    var _clients: Dict[Int, Bool]
+    """Driver connections that are workers' clients (`ROLE_CLIENT`): they
+    don't keep a local-mode head alive."""
 
     def __init__(
         out self,
@@ -253,6 +257,7 @@ struct Head(Movable):
         self._actors = Dict[UInt64, _Actor]()
         self._unplaced = List[UInt64]()
         self._hosting = List[UInt64]()
+        self._clients = Dict[Int, Bool]()
 
     def run(mut self) raises:
         """Serves until the last driver leaves, in local mode; else forever."""
@@ -260,7 +265,7 @@ struct Head(Movable):
             self._release_waiting()
             self._dispatch()
             if self._exit_when_idle and self._drivers_seen:
-                if len(self._driver_conn) == 0:
+                if len(self._driver_conn) == len(self._clients):
                     self._shutdown()
                     return
             var fds: List[c_int] = [self._listener.fd]
@@ -637,7 +642,7 @@ struct Head(Movable):
             self._roles[i] = _ROLE_GONE
             self._conns[i].stream.close()
             return
-        if f.payload[0] == ROLE_DRIVER:
+        if f.payload[0] == ROLE_DRIVER or f.payload[0] == ROLE_CLIENT:
             var n = self._next_driver
             if len(f.payload) == 17:
                 # A driver resuming after a head restart keeps its number.
@@ -651,7 +656,10 @@ struct Head(Movable):
                 self._next_driver += 1
             self._roles[i] = ROLE_DRIVER
             self._driver_conn[n] = i
-            self._drivers_seen = True
+            if f.payload[0] == ROLE_CLIENT:
+                self._clients[i] = True
+            else:
+                self._drivers_seen = True
             var body = List[UInt8]()
             put_scalar[DType.uint64](body, n)
             self._conns[i].send(KIND_WELCOME, 0, 0, body)
@@ -809,6 +817,7 @@ struct Head(Movable):
         self._roles[i] = _ROLE_GONE
         self._conns[i].stream.close()
         if role == ROLE_DRIVER:
+            _ = self._clients.pop(i, False)
             var gone = UInt64(0)
             for entry in self._driver_conn.items():
                 if entry.value == i:

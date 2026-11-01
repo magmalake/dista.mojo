@@ -7,7 +7,17 @@ from std.testing import (
     assert_true,
 )
 
-from dista import Actor, Method, ObjectRef, Runtime, Task
+from dista import (
+    Actor,
+    ActorHandle,
+    Client,
+    CtxMethod,
+    CtxTask,
+    Method,
+    ObjectRef,
+    Runtime,
+    Task,
+)
 
 
 @fieldwise_init
@@ -39,7 +49,52 @@ comptime CounterActor = Actor[Counter, Int, new_counter]
 comptime Add = Method[CounterActor, Int, Int, add]
 comptime Pad = Method[CounterActor, Int, String, pad]
 comptime Square = Task[Int, Int, square]
-comptime RT = Runtime[CounterActor, Add, Pad, Square]
+
+
+def bump(mut c: Client, h: ActorHandle[CounterActor]) raises -> Int:
+    """A task that calls the actor it was handed, and returns its answer."""
+    var r = c.call[Add](h, 1)
+    var n = c.get(r)
+    c.release(r)
+    return n
+
+
+def pad_length(mut c: Client, h: ActorHandle[CounterActor]) raises -> Int:
+    """A large method result, fetched from the actor's worker by a task."""
+    var r = c.call[Pad](h, 100_000)
+    var n = c.get(r).byte_length()
+    c.release(r)
+    return n
+
+
+@fieldwise_init
+struct Relay(Movable):
+    """An actor that forwards to a counter: what it hands on, it counts."""
+
+    var counter: ActorHandle[CounterActor]
+    var forwarded: Int
+
+
+def new_relay(counter: ActorHandle[CounterActor]) -> Relay:
+    return Relay(counter, 0)
+
+
+def forward(mut r: Relay, mut c: Client, n: Int) raises -> Int:
+    """Calls the counter from inside an actor's method."""
+    r.forwarded += 1
+    var ref_ = c.call[Add](r.counter, n)
+    var got = c.get(ref_)
+    c.release(ref_)
+    return got
+
+
+comptime RelayActor = Actor[Relay, ActorHandle[CounterActor], new_relay]
+comptime Forward = CtxMethod[RelayActor, Int, Int, forward]
+comptime Bump = CtxTask[ActorHandle[CounterActor], Int, bump]
+comptime PadLength = CtxTask[ActorHandle[CounterActor], Int, pad_length]
+comptime RT = Runtime[
+    CounterActor, Add, Pad, Square, Bump, PadLength, RelayActor, Forward
+]
 
 
 def test_1000_calls_in_order() raises:
@@ -137,6 +192,53 @@ def test_released_call_results_leave_nothing_at_the_head() raises:
     rt.release(refs)
     rt.kill(c)
     assert_equal(rt.stats().objects, 0)
+
+
+def test_100_tasks_share_one_actor() raises:
+    """PR 5's gate: 100 tasks, each handed the same actor, each call it once.
+    The actor sees every call exactly once, and each task gets back a count
+    no other task got."""
+    var rt = RT(workers=4)
+    var c = rt.create[CounterActor](0)
+    var refs = List[ObjectRef[Int]]()
+    for _ in range(100):
+        refs.append(rt.remote[Bump](c))
+    var seen = List[Bool](length=101, fill=False)
+    for r in refs:
+        var n = rt.get(r)
+        assert_true(n >= 1 and n <= 100, String("count ", n))
+        assert_true(not seen[n], String("count ", n, " twice"))
+        seen[n] = True
+    assert_equal(rt.get(rt.call[Add](c, 0)), 100)
+
+
+def test_a_task_fetches_a_large_method_result() raises:
+    """A method's result too large for the head comes to the task from the
+    actor's worker."""
+    var rt = RT(workers=2)
+    var c = rt.create[CounterActor](0)
+    assert_equal(rt.get(rt.remote[PadLength](c)), 100_000)
+
+
+def test_a_task_calling_a_killed_actor_fails() raises:
+    var rt = RT(workers=2)
+    var c = rt.create[CounterActor](0)
+    rt.kill(c)
+    with assert_raises(contains="no such actor"):
+        _ = rt.get(rt.remote[Bump](c))
+
+
+def test_an_actor_calls_another() raises:
+    """A relay actor's method calls the counter actor; the counter sees each
+    forwarded call once, in order."""
+    var rt = RT(workers=3)
+    var counter = rt.create[CounterActor](0)
+    var relay = rt.create[RelayActor](counter)
+    var last = 0
+    for i in range(1, 21):
+        last = rt.get(rt.call[Forward](relay, i))
+    assert_equal(last, 210)
+    assert_equal(rt.get(rt.call[Add](counter, 0)), 210)
 
 
 def main() raises:
