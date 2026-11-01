@@ -95,7 +95,7 @@ format-check = { cmd = "mojo format src tests bench examples deploy fuzz && git 
 # the package is what installs the C shim each one links.
 [feature.data.dependencies]
 mojo-compiler = "==1.2.0"
-objectstore-mojo = { git = "https://github.com/magmalake/objectstore.mojo", rev = "ad16cc3edc419cf23d7360a579836ffd621b36f1" }
+objectstore-mojo = { git = "https://github.com/magmalake/objectstore.mojo", rev = "ff2ac089c5de0ea4986327115caa8b97b3272cb0" }
 zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "53655623ca8585fd5b36b1239842913ec308ae69" }
 lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "64502eeeabed37515cd479bc421fc2920504cac5" }
 brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "aa6d14985baf82ad4b934f14136b95a291b55faf" }
@@ -112,6 +112,7 @@ DEP_INC = "-I ../memory-region.mojo/src -I ../arrow-mlake.mojo/src -I ../parquet
 test-parquet = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_parquet_tasks.mojo -o build/test-parquet && ./build/test-parquet" }
 test-iceberg = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_iceberg_scan.mojo -o build/test-iceberg && ./build/test-iceberg" }
 test-data = { depends-on = ["test-parquet", "test-iceberg"] }
+bench-readpath = { cmd = "mkdir -p build && mojo build -I src $DEP_INC bench/readpath.mojo -o build/readpath && ./build/readpath" }
 
 # Fuzzing with mozz (packaged for magmalake as mozz_mlake), as flare does: one
 # harness per parser or protocol under fuzz/, built with every bounds check
