@@ -14,9 +14,10 @@ test-codec = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_co
 test-frame = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_frame.mojo -o build/test-frame && ./build/test-frame" }
 test-runtime = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_runtime.mojo -o build/test-runtime && ./build/test-runtime" }
 test-batches = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_batches.mojo -o build/test-batches && ./build/test-batches" }
+test-free = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_free.mojo -o build/test-free && ./build/test-free" }
 test-cluster = { cmd = "tests/cluster.sh" }
 test-kind = { cmd = "tests/kind.sh" }
-test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-batches", "test-cluster"] }
+test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-cluster"] }
 bench = { cmd = "mkdir -p build && mojo build -I src $DEP_INC bench/fanout.mojo -o build/bench-fanout && ./build/bench-fanout" }
 
 [package]

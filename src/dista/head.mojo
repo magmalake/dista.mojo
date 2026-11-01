@@ -17,6 +17,12 @@ that computed it: the head records where, tells the owning driver, and sends
 a task that needs it as task-inputs, so the worker running that task fetches
 it from its peer. A worker that goes away fails the tasks it had in flight
 and loses the results it held.
+
+Every object is reference counted: its driver holds it until it releases it
+(or disconnects), and each submitted task taking it as input holds it until
+that task settles. At zero the head forgets the object and tells the worker
+holding it, if one does, to delete it. An object released before its task
+finishes is freed when the task settles.
 """
 
 from std.ffi import c_int
@@ -26,9 +32,12 @@ from dista.conn import Conn
 from dista.frame import (
     ADDR_SIZE,
     KIND_ERROR,
+    KIND_FREE,
     KIND_HELLO,
     KIND_LOCATED,
+    KIND_RELEASE,
     KIND_RESULT,
+    KIND_STATS,
     KIND_STORED,
     KIND_TASK,
     KIND_TASK_AFTER,
@@ -101,6 +110,15 @@ struct Head(Movable):
     """
     var _where: Dict[UInt64, List[UInt8]]
     """Those results' encoded locations, as the worker reported them."""
+    var _refs: Dict[UInt64, Int]
+    """Every live object's reference count."""
+    var _held: Dict[UInt64, Bool]
+    """Objects whose driver hasn't released them; each counts once in `_refs`.
+    """
+    var _deps_of: Dict[UInt64, List[UInt64]]
+    """A waiting task's inputs, each holding a reference until it settles."""
+    var _dead: Dict[UInt64, Bool]
+    """Objects freed before their task settled: dropped when it does."""
 
     def __init__(
         out self,
@@ -135,6 +153,10 @@ struct Head(Movable):
         self._worker_addr = List[List[UInt8]]()
         self._location = Dict[UInt64, Int]()
         self._where = Dict[UInt64, List[UInt8]]()
+        self._refs = Dict[UInt64, Int]()
+        self._held = Dict[UInt64, Bool]()
+        self._deps_of = Dict[UInt64, List[UInt64]]()
+        self._dead = Dict[UInt64, Bool]()
 
     def run(mut self) raises:
         """Serves until the last driver leaves, in local mode; else forever."""
@@ -197,6 +219,7 @@ struct Head(Movable):
             if f.kind == KIND_TASK:
                 var obj = f.object_id
                 var task = f.task_id
+                self._hold(obj)
                 self._queue.append(_Task(obj, task, f^.take_payload()))
             elif f.kind == KIND_TASK_AFTER:
                 var gather = f.payload[0] != 0
@@ -205,6 +228,20 @@ struct Head(Movable):
                 var deps = List[UInt64](capacity=n)
                 for _ in range(n):
                     deps.append(get_scalar[DType.uint64](f.payload, pos))
+                self._hold(f.object_id)
+                var missing = False
+                for d in deps:
+                    if d not in self._refs:
+                        missing = True
+                if missing:
+                    self._fail(
+                        f.object_id,
+                        String("an input was released before this task ran"),
+                    )
+                    return
+                for d in deps:
+                    self._refs[d] = self._refs.get(d, 0) + 1
+                self._deps_of[f.object_id] = deps.copy()
                 self._waiting.append(
                     _Task(
                         f.object_id,
@@ -214,6 +251,19 @@ struct Head(Movable):
                         gather=gather,
                     )
                 )
+            elif f.kind == KIND_RELEASE:
+                if self._held.pop(f.object_id, False):
+                    self._dec(f.object_id)
+            elif f.kind == KIND_STATS:
+                var body = List[UInt8]()
+                put_scalar[DType.uint64](body, UInt64(len(self._refs)))
+                put_scalar[DType.uint64](body, UInt64(len(self._results)))
+                put_scalar[DType.uint64](body, UInt64(len(self._errors)))
+                put_scalar[DType.uint64](body, UInt64(len(self._location)))
+                put_scalar[DType.uint64](
+                    body, UInt64(self._queued() + len(self._waiting))
+                )
+                self._conns[i].send(KIND_STATS, 0, 0, body)
             else:
                 raise Error("driver sent frame kind ", Int(f.kind))
         elif role == ROLE_WORKER:
@@ -228,16 +278,22 @@ struct Head(Movable):
                 if flight[k] == f.object_id:
                     _ = flight.pop(k)
                     break
-            if f.kind == KIND_RESULT:
-                self._results[f.object_id] = f.payload.copy()
-                self._deliver(f.object_id, f.kind, f.payload)
+            var obj = f.object_id
+            if self._dead.pop(obj, False):
+                # Released while it ran: keep nothing, and free its copy.
+                if f.kind == KIND_STORED:
+                    self._conns[i].send(KIND_FREE, obj, 0, List[UInt8]())
+            elif f.kind == KIND_RESULT:
+                self._results[obj] = f.payload.copy()
+                self._deliver(obj, f.kind, f.payload)
             elif f.kind == KIND_STORED:
-                self._location[f.object_id] = i
-                self._where[f.object_id] = f.payload.copy()
-                self._deliver(f.object_id, KIND_LOCATED, f.payload)
+                self._location[obj] = i
+                self._where[obj] = f.payload.copy()
+                self._deliver(obj, KIND_LOCATED, f.payload)
             else:
-                self._errors[f.object_id] = String(unsafe_from_utf8=f.payload)
-                self._deliver(f.object_id, f.kind, f.payload)
+                self._errors[obj] = String(unsafe_from_utf8=f.payload)
+                self._deliver(obj, f.kind, f.payload)
+            self._settle(obj)
 
     def _hello(mut self, i: Int, var f: Frame) raises:
         if f.kind != KIND_HELLO or len(f.payload) < 9:
@@ -285,8 +341,52 @@ struct Head(Movable):
             self._drop(i)
 
     def _fail(mut self, object_id: UInt64, var msg: String):
-        self._errors[object_id] = msg.copy()
-        self._deliver(object_id, KIND_ERROR, msg.as_bytes())
+        if not self._dead.pop(object_id, False):
+            self._errors[object_id] = msg.copy()
+            self._deliver(object_id, KIND_ERROR, msg.as_bytes())
+        self._settle(object_id)
+
+    # ── reference counts ─────────────────────────────────────────────────
+    def _hold(mut self, object_id: UInt64):
+        """A new object, held by its driver."""
+        self._refs[object_id] = 1
+        self._held[object_id] = True
+
+    def _settle(mut self, object_id: UInt64):
+        """`object_id`'s task is done: it no longer holds its inputs."""
+        var deps = self._deps_of.pop(object_id, List[UInt64]())
+        for d in deps:
+            self._dec(d)
+
+    def _dec(mut self, object_id: UInt64):
+        if object_id not in self._refs:
+            return
+        var n = self._refs.get(object_id, 0) - 1
+        if n > 0:
+            self._refs[object_id] = n
+            return
+        _ = self._refs.pop(object_id, 0)
+        if (
+            object_id in self._results
+            or object_id in self._errors
+            or object_id in self._location
+        ):
+            self._free(object_id)
+        else:
+            self._dead[object_id] = True
+
+    def _free(mut self, object_id: UInt64):
+        """Forgets a settled object, and has its worker delete it."""
+        _ = self._results.pop(object_id, List[UInt8]())
+        _ = self._errors.pop(object_id, String())
+        _ = self._where.pop(object_id, List[UInt8]())
+        var i = self._location.pop(object_id, -1)
+        if i >= 0 and self._roles[i] == ROLE_WORKER:
+            try:
+                self._conns[i].send(KIND_FREE, object_id, 0, List[UInt8]())
+            except e:
+                print("dista head: lost worker:", e)
+                self._drop(i)
 
     def _drop(mut self, i: Int):
         """Forgets connection `i`. A worker's in-flight tasks fail."""
@@ -302,6 +402,14 @@ struct Head(Movable):
                     gone = entry.key
             if gone != 0:
                 _ = self._driver_conn.pop(gone, -1)
+                # A driver that's gone holds nothing.
+                var mine = List[UInt64]()
+                for entry in self._held.items():
+                    if owner_of(entry.key) == gone:
+                        mine.append(entry.key)
+                for obj in mine:
+                    _ = self._held.pop(obj, False)
+                    self._dec(obj)
         elif role == ROLE_WORKER:
             var lost = self._inflight[i].copy()
             self._inflight[i].clear()

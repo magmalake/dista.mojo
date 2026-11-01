@@ -21,12 +21,19 @@ Every frame is a 4-byte little-endian length, then that many bytes:
 | 8 located | head to driver | the address of the worker holding the result |
 | 9 fetch | driver or worker to a worker | none: send that object back as a result frame |
 | 10 task-inputs | head to worker | gather byte, count u64, then per input a tag byte: 0, a length u64 and the bytes; or 1, an address |
+| 11 release | driver to head | none: the driver is done with this object |
+| 12 free | head to worker | none: delete this object |
+| 13 stats | driver to head, head to driver | none; the reply is five u64 counts (see `HeadStats`) |
 
 A task-after frame queues a task whose argument is built from other results:
 the single result as is, or with gather set, a `Seq` of all of them. When
 some of those results live on workers, the head sends the task as
 task-inputs, and the worker fetches them before it runs the task. An address
 is 12 bytes: the IPv4 address, then the port as a u64.
+
+The head counts references to every object: its driver's, until a release,
+and one per submitted task that takes it as input, until that task settles.
+At zero it forgets the object, and sends free to the worker holding it.
 """
 
 from std.memory import bitcast
@@ -44,6 +51,9 @@ comptime KIND_STORED: UInt8 = 7
 comptime KIND_LOCATED: UInt8 = 8
 comptime KIND_FETCH: UInt8 = 9
 comptime KIND_TASK_INPUTS: UInt8 = 10
+comptime KIND_RELEASE: UInt8 = 11
+comptime KIND_FREE: UInt8 = 12
+comptime KIND_STATS: UInt8 = 13
 comptime ADDR_SIZE = 12
 comptime ROLE_DRIVER: UInt8 = 1
 comptime ROLE_WORKER: UInt8 = 2
