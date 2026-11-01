@@ -1,0 +1,20 @@
+date: 2026-11-01T17:28:20Z
+region: us-east-2
+table: s3://dista-bench-617847241090-us-east-2/warehouse/taxi/trips/metadata/00168-6ca1a160-53d8-4ae9-a692-b3f88d78a536.metadata.json
+passes: 5
+slots per node: 16
+instances: 13 c7g.4xlarge
+NAME               STATUS   ROLES                  AGE     VERSION         INTERNAL-IP     EXTERNAL-IP   OS-IMAGE             KERNEL-VERSION   CONTAINER-RUNTIME            ROLE     RANK
+ip-172-31-0-167    Ready    <none>                 7m36s   v1.33.13+k3s2   172.31.0.167    <none>        Ubuntu 24.04.5 LTS   7.0.0-1014-aws   containerd://2.2.5-k3s1.33   worker   0
+ip-172-31-1-76     Ready    <none>                 7m37s   v1.33.13+k3s2   172.31.1.76     <none>        Ubuntu 24.04.5 LTS   7.0.0-1014-aws   containerd://2.2.5-k3s1.33   worker   1
+ip-172-31-10-250   Ready    <none>                 7m42s   v1.33.13+k3s2   172.31.10.250   <none>        Ubuntu 24.04.5 LTS   7.0.0-1014-aws   containerd://2.2.5-k3s1.33   worker   2
+ip-172-31-10-77    Ready    <none>                 7m37s   v1.33.13+k3s2   172.31.10.77    <none>        Ubuntu 24.04.5 LTS   7.0.0-1014-aws   containerd://2.2.5-k3s1.33   worker   3
+ip-172-31-12-225   Ready    <none>                 7m38s   v1.33.13+k3s2   172.31.12.225   <none>        Ubuntu 24.04.5 LTS   7.0.0-1014-aws   containerd://2.2.5-k3s1.33   worker   4
+ip-172-31-15-7     Ready    <none>                 7m39s   v1.33.13+k3s2   172.31.15.7     <none>        Ubuntu 24.04.5 LTS   7.0.0-1014-aws   containerd://2.2.5-k3s1.33   worker   5
+ip-172-31-3-239    Ready    <none>                 7m35s   v1.33.13+k3s2   172.31.3.239    <none>        Ubuntu 24.04.5 LTS   7.0.0-1014-aws   containerd://2.2.5-k3s1.33   worker   6
+ip-172-31-3-66     Ready    <none>                 7m42s   v1.33.13+k3s2   172.31.3.66     <none>        Ubuntu 24.04.5 LTS   7.0.0-1014-aws   containerd://2.2.5-k3s1.33   worker   7
+ip-172-31-5-5      Ready    <none>                 7m36s   v1.33.13+k3s2   172.31.5.5      <none>        Ubuntu 24.04.5 LTS   7.0.0-1014-aws   containerd://2.2.5-k3s1.33   worker   8
+ip-172-31-7-114    Ready    <none>                 7m35s   v1.33.13+k3s2   172.31.7.114    <none>        Ubuntu 24.04.5 LTS   7.0.0-1014-aws   containerd://2.2.5-k3s1.33   worker   9
+ip-172-31-7-82     Ready    control-plane,master   7m45s   v1.33.13+k3s2   172.31.7.82     <none>        Ubuntu 24.04.5 LTS   7.0.0-1014-aws   containerd://2.2.5-k3s1.33   head     
+ip-172-31-8-114    Ready    <none>                 7m40s   v1.33.13+k3s2   172.31.8.114    <none>        Ubuntu 24.04.5 LTS   7.0.0-1014-aws   containerd://2.2.5-k3s1.33   worker   10
+ip-172-31-8-132    Ready    <none>                 7m35s   v1.33.13+k3s2   172.31.8.132    <none>        Ubuntu 24.04.5 LTS   7.0.0-1014-aws   containerd://2.2.5-k3s1.33   worker   11
