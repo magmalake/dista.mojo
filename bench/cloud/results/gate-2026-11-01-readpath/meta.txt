@@ -1,0 +1,11 @@
+date: 2026-11-01T14:02:41Z
+region: us-east-2
+table: s3://dista-bench-617847241090-us-east-2/warehouse/taxi/trips/metadata/00168-6ca1a160-53d8-4ae9-a692-b3f88d78a536.metadata.json
+passes: 2
+slots per node: 16
+instances: 4 c7g.4xlarge
+NAME               STATUS   ROLES                  AGE     VERSION         INTERNAL-IP     EXTERNAL-IP   OS-IMAGE             KERNEL-VERSION   CONTAINER-RUNTIME            ROLE     RANK
+ip-172-31-1-116    Ready    <none>                 7m3s    v1.33.13+k3s2   172.31.1.116    <none>        Ubuntu 24.04.5 LTS   7.0.0-1014-aws   containerd://2.2.5-k3s1.33   worker   0
+ip-172-31-11-54    Ready    <none>                 7m9s    v1.33.13+k3s2   172.31.11.54    <none>        Ubuntu 24.04.5 LTS   7.0.0-1014-aws   containerd://2.2.5-k3s1.33   worker   1
+ip-172-31-13-213   Ready    <none>                 7m3s    v1.33.13+k3s2   172.31.13.213   <none>        Ubuntu 24.04.5 LTS   7.0.0-1014-aws   containerd://2.2.5-k3s1.33   worker   2
+ip-172-31-14-189   Ready    control-plane,master   7m12s   v1.33.13+k3s2   172.31.14.189   <none>        Ubuntu 24.04.5 LTS   7.0.0-1014-aws   containerd://2.2.5-k3s1.33   head     
