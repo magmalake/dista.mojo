@@ -82,6 +82,13 @@ bench/cloud/aws.sh down              # terminate everything but the bucket
 example, `NODES=3 FRAMEWORKS=dista PASSES=1 bench/cloud/run.sh` is a smoke
 test. `data.sh drop` deletes the bucket.
 
+`bench/cloud/gate.sh` is the short run to do before the full matrix, once
+the table is loaded: a head and 3 workers, the timed builds, the three
+frameworks on 3 nodes with 2 passes each, then teardown, whatever fails. It
+takes about 15 minutes, 5 of them queries, and writes
+`results/gate-<date>/`, with dista's task timeline
+(`dista-3-timeline.json.gz`, for Perfetto).
+
 The nodes read and write S3 with an IAM role, `dista-bench-node`, which
 aws.sh creates. It's allowed the benchmark bucket and nothing else. Each
 reader takes the role's credentials from the instance metadata service, as

@@ -1,0 +1,4 @@
+image	total_s	deps_s	compile_s	disk_mb	gzip_mb	instance
+dista	116	35.6	50.6	92	32	c7g.4xlarge
+ray	44	17.3	-	607	204	c7g.4xlarge
+rust	168	92.3	57.4	132	41	c7g.4xlarge
