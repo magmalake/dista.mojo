@@ -52,8 +52,23 @@ struct Rng:
         return Int((self.state >> 33) % UInt64(n))
 
 
+def _progress(path: String, n: Int):
+    """Writes how far the driver has got, for chaos.sh to kill only after
+    some: a head killed faster than the driver can recover never lets it
+    finish, which is a livelock of the test, not of dista."""
+    if path == "":
+        return
+    try:
+        with open(path, "w") as f:
+            f.write(String(n))
+    except:
+        pass
+
+
 def main() raises:
     var seed = Int(getenv("CHAOS_SEED", "1"))
+    var progress = getenv("CHAOS_PROGRESS")
+    var steps = 0
     var rng = Rng(seed)
     var rt = Runtime[Make, Join](workers=4)
     var refs = List[ObjectRef[String]]()
@@ -82,6 +97,8 @@ def main() raises:
                     rt.release(refs[d])
                     released[d] = True
         released.append(False)
+        steps += 1
+        _progress(progress, steps)
     var checked = 0
     for k in range(n):
         if released[k]:
@@ -90,4 +107,6 @@ def main() raises:
         if got != local[k]:
             raise Error("seed ", seed, ": result ", k, " differs")
         checked += 1
+        steps += 1
+        _progress(progress, steps)
     print("PASS chaos seed", seed, ":", n, "tasks,", checked, "checked")

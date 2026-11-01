@@ -33,7 +33,10 @@ for seed in ${CHAOS_SEEDS:-1 2 3}; do
     DISTA_ROLE=worker DISTA_HEAD=localhost:$port ./build/chaos-driver >> build/chaos-workers.log 2>&1 &
     pids+=($!)
   done
-  CHAOS_SEED=$seed DISTA_HEAD=localhost:$port ./build/chaos-driver > build/chaos-driver.log 2>&1 &
+  progress=build/chaos-progress
+  : > "$progress"
+  CHAOS_SEED=$seed CHAOS_PROGRESS=$progress DISTA_HEAD=localhost:$port \
+    ./build/chaos-driver > build/chaos-driver.log 2>&1 &
   driver=$!
   pids+=($driver)
 
@@ -41,6 +44,7 @@ for seed in ${CHAOS_SEEDS:-1 2 3}; do
   # CHAOS_FAST=1 makes it every 0.1-0.5 s, CHAOS_FAST=2 every 0.05-0.2 s.
   RANDOM=$seed
   kills=0
+  last_progress=
   started=$SECONDS
   lo=3 spread=9
   [ "${CHAOS_FAST:-0}" = 1 ] && lo=1 spread=5
@@ -70,6 +74,17 @@ for seed in ${CHAOS_SEEDS:-1 2 3}; do
     else
       sleep "0.$((lo + RANDOM % spread))"
     fi
+    kill -0 "$driver" 2>/dev/null || break
+    # Kill only once the driver has got further since the last kill (or 2 s
+    # on): heads killed faster than the driver can recover would keep it
+    # from ever finishing, a livelock of the test rather than a bug. A real
+    # deadlock still makes no progress and runs into CHAOS_TIMEOUT.
+    for _ in $(seq 20); do
+      [ "$(cat "$progress" 2>/dev/null)" != "${last_progress:-}" ] && break
+      kill -0 "$driver" 2>/dev/null || break
+      sleep 0.1
+    done
+    last_progress=$(cat "$progress" 2>/dev/null)
     kill -0 "$driver" 2>/dev/null || break
     kill -9 "$head" 2>/dev/null || true
     sleep 0.2
