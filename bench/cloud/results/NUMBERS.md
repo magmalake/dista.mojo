@@ -62,6 +62,32 @@ in-region): 17.9 s with the 168 manifests read one by one, 1.7 s read at once.
 Four row groups of one column with 30 ms of latency added per request on
 loopback: 145 ms one by one, 43 ms at once.
 
+## 2b. Distributed, 3, 6 and 12 nodes, after the read path
+
+`matrix-2026-11-01/`, 5 passes, the first run of `bench matrix`. Every answer
+identical across the nine runs (three frameworks × three node counts).
+
+| query | dista ×3 | rust ×3 | ray ×3 | dista ×6 | rust ×6 | ray ×6 | dista ×12 | rust ×12 | ray ×12 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| q1_scan_count | 1,981 | 2,306 | 4,128 | 804 | 1,116 | 1,751 | 817 | 620 | 1,330 |
+| q2_month_range | 157 | 429 | 409 | 165 | 435 | 405 | 161 | 411 | 421 |
+| q3_payment_sum | 1,599 | 3,347 | 4,168 | 1,016 | 1,678 | 1,810 | 832 | 914 | 1,395 |
+| q4_tip_ratio | 1,980 | 3,538 | 3,528 | 1,279 | 1,826 | 2,083 | 933 | 1,080 | 1,584 |
+| q5_top_zones | 1,889 | 3,481 | 3,483 | 1,184 | 1,761 | 2,072 | 904 | 1,007 | 1,507 |
+| q6_zone_revenue | 247 | 468 | 493 | 244 | 456 | 481 | 243 | 479 | 496 |
+| q7_wide | 1,001 | 1,074 | 1,219 | 1,012 | 1,069 | 1,172 | 1,000 | 1,062 | 1,174 |
+| q8_selective | 2,169 | 3,756 | 3,603 | 1,418 | 1,887 | 2,297 | 1,060 | 1,071 | 1,907 |
+| **total, median pass** | **11,040** | **18,377** | **21,275** | **7,184** | **10,267** | **12,737** | **5,941** | **6,682** | **15,703** |
+
+- Rust's 3-node median (18.4 s) is faster than in the gate (28.7 s): its
+  driver now plans with iceberg-rust's concurrency limit at 8, not 1
+  (`TAXI_FILES_AT_ONCE`, dista#43), as dista fetches manifests at once.
+- dista scales 11.0 → 7.2 → 5.9 s. At 12 nodes a file task's median is 155 ms
+  (p90 249 ms), and planning each query takes 0.31 s on the driver: about
+  2.5 s of the 5.9 s pass. iceberg-rust caches manifests between plans; dista
+  reads them again for every query. That is the next limit.
+- Ray is slower on 12 nodes (15.7 s) than on 6 (12.7 s).
+
 ## 3. Distributed, 3 and 6 nodes, before the read path
 
 `2026-11/`, 5 passes. The 12-node dista run failed its answer check, fixed

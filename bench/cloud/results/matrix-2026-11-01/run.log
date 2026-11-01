@@ -1,0 +1,92 @@
+results: bench/cloud/results/matrix-2026-11-01
+== up 12 16:28:08
+launching the head (c7g.4xlarge)
+launching 12 workers (c7g.4xlarge)
+waiting for the head's API
+waiting for 12 workers to join
+NAME               STATUS   ROLES                  AGE   VERSION         ROLE     RANK
+ip-172-31-0-44     Ready    <none>                 9s    v1.33.13+k3s2   worker   0
+ip-172-31-12-103   Ready    <none>                 10s   v1.33.13+k3s2   worker   1
+ip-172-31-12-108   Ready    <none>                 10s   v1.33.13+k3s2   worker   2
+ip-172-31-13-157   Ready    <none>                 10s   v1.33.13+k3s2   worker   3
+ip-172-31-14-56    Ready    control-plane,master   19s   v1.33.13+k3s2   head     
+ip-172-31-15-45    Ready    <none>                 10s   v1.33.13+k3s2   worker   4
+ip-172-31-15-54    Ready    <none>                 9s    v1.33.13+k3s2   worker   5
+ip-172-31-2-90     Ready    <none>                 15s   v1.33.13+k3s2   worker   6
+ip-172-31-3-137    Ready    <none>                 8s    v1.33.13+k3s2   worker   7
+ip-172-31-5-59     Ready    <none>                 9s    v1.33.13+k3s2   worker   8
+ip-172-31-6-20     Ready    <none>                 9s    v1.33.13+k3s2   worker   9
+ip-172-31-7-173    Ready    <none>                 14s   v1.33.13+k3s2   worker   10
+ip-172-31-9-173    Ready    <none>                 12s   v1.33.13+k3s2   worker   11
+KUBECONFIG=build/cloud/kubeconfig
+== build 16:29:35
+== building dista:taxi on c7g.4xlarge
+dista	120	35.4	53.7	93	32	c7g.4xlarge
+== loading dista:taxi into every node
+== building dista-ray:taxi on c7g.4xlarge
+ray	44	17.8	-	607	204	c7g.4xlarge
+== loading dista-ray:taxi into every node
+== building dista-rust:taxi on c7g.4xlarge
+rust	168	92.3	58.1	132	41	c7g.4xlarge
+== loading dista-rust:taxi into every node
+image  total_s  deps_s  compile_s  disk_mb  gzip_mb  instance
+dista  120      35.4    53.7       93       32       c7g.4xlarge
+ray    44       17.8    -          607      204      c7g.4xlarge
+rust   168      92.3    58.1       132      41       c7g.4xlarge
+== run 16:36:30
+== dista on 3 nodes, 16 slots each
+tasks ran on 3 nodes: ip-172-31-0-44 ip-172-31-12-103 ip-172-31-12-108
+PASS taxi: 8 queries + 1 as batches, distributed passes agree; distributed 12422 ms
+== rust on 3 nodes, 16 slots each
+tasks ran on 3 nodes: ip-172-31-0-44 ip-172-31-12-108 ip-172-31-12-103
+PASS rust taxi: 8 queries + 1 as batches, distributed passes agree; distributed 21538 ms
+== ray on 3 nodes, 16 slots each
+tasks ran on 3 nodes: ip-172-31-0-44 ip-172-31-12-103 ip-172-31-12-108
+PASS ray taxi: 8 queries + 1 as batches, distributed passes agree; distributed 26048 ms
+== dista on 6 nodes, 16 slots each
+tasks ran on 6 nodes: ip-172-31-12-103 ip-172-31-15-54 ip-172-31-12-108 ip-172-31-15-45 ip-172-31-0-44 ip-172-31-13-157
+PASS taxi: 8 queries + 1 as batches, distributed passes agree; distributed 7647 ms
+== rust on 6 nodes, 16 slots each
+tasks ran on 6 nodes: ip-172-31-12-108 ip-172-31-15-54 ip-172-31-13-157 ip-172-31-0-44 ip-172-31-15-45 ip-172-31-12-103
+PASS rust taxi: 8 queries + 1 as batches, distributed passes agree; distributed 12318 ms
+== ray on 6 nodes, 16 slots each
+tasks ran on 6 nodes: ip-172-31-0-44 ip-172-31-12-103 ip-172-31-12-108 ip-172-31-13-157 ip-172-31-15-45 ip-172-31-15-54
+PASS ray taxi: 8 queries + 1 as batches, distributed passes agree; distributed 20040 ms
+== dista on 12 nodes, 16 slots each
+tasks ran on 12 nodes: ip-172-31-13-157 ip-172-31-12-108 ip-172-31-0-44 ip-172-31-2-90 ip-172-31-5-59 ip-172-31-15-54 ip-172-31-12-103 ip-172-31-9-173 ip-172-31-6-20 ip-172-31-7-173 ip-172-31-15-45 ip-172-31-3-137
+PASS taxi: 8 queries + 1 as batches, distributed passes agree; distributed 6189 ms
+== rust on 12 nodes, 16 slots each
+tasks ran on 12 nodes: ip-172-31-12-108 ip-172-31-5-59 ip-172-31-15-45 ip-172-31-0-44 ip-172-31-13-157 ip-172-31-9-173 ip-172-31-6-20 ip-172-31-15-54 ip-172-31-12-103 ip-172-31-3-137 ip-172-31-2-90 ip-172-31-7-173
+PASS rust taxi: 8 queries + 1 as batches, distributed passes agree; distributed 8903 ms
+== ray on 12 nodes, 16 slots each
+tasks ran on 12 nodes: ip-172-31-0-44 ip-172-31-12-103 ip-172-31-12-108 ip-172-31-13-157 ip-172-31-15-45 ip-172-31-15-54 ip-172-31-2-90 ip-172-31-3-137 ip-172-31-5-59 ip-172-31-6-20 ip-172-31-7-173 ip-172-31-9-173
+PASS ray taxi: 8 queries + 1 as batches, distributed passes agree; distributed 23162 ms
+## Distributed, median of passes (ms)
+
+| query | dista ×3 | rust ×3 | ray ×3 | dista ×6 | rust ×6 | ray ×6 | dista ×12 | rust ×12 | ray ×12 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| q1_scan_count | 1,981 | 2,306 | 4,128 | 804 | 1,116 | 1,751 | 817 | 620 | 1,330 |
+| q2_month_range | 157 | 429 | 409 | 165 | 435 | 405 | 161 | 411 | 421 |
+| q3_payment_sum | 1,599 | 3,347 | 4,168 | 1,016 | 1,678 | 1,810 | 832 | 914 | 1,395 |
+| q4_tip_ratio | 1,980 | 3,538 | 3,528 | 1,279 | 1,826 | 2,083 | 933 | 1,080 | 1,584 |
+| q5_top_zones | 1,889 | 3,481 | 3,483 | 1,184 | 1,761 | 2,072 | 904 | 1,007 | 1,507 |
+| q6_zone_revenue | 247 | 468 | 493 | 244 | 456 | 481 | 243 | 479 | 496 |
+| q7_wide | 1,001 | 1,074 | 1,219 | 1,012 | 1,069 | 1,172 | 1,000 | 1,062 | 1,174 |
+| q8_selective | 2,169 | 3,756 | 3,603 | 1,418 | 1,887 | 2,297 | 1,060 | 1,071 | 1,907 |
+| total, median pass | **11,040** | **18,377** | **21,275** | **7,184** | **10,267** | **12,737** | **5,941** | **6,682** | **15,703** |
+| total, slowest pass | 12,422 | 21,538 | 26,047 | 7,647 | 12,318 | 20,039 | 6,313 | 8,903 | 23,161 |
+| answers match the reference | no reference | no reference | no reference | no reference | no reference | no reference | no reference | no reference | no reference |
+
+Slots per node: 16. Passes: 5.
+
+## Building the images
+
+| image | whole build (s) | dependencies (s) | compile (s) | unpacked (MB) | gzip (MB) | built on |
+|---|---:|---:|---:|---:|---:|---|
+| dista | 120 | 35.4 | 53.7 | 93 | 32 | c7g.4xlarge |
+| ray | 44 | 17.8 | - | 607 | 204 | c7g.4xlarge |
+| rust | 168 | 92.3 | 58.1 | 132 | 41 | c7g.4xlarge |
+
+== done 16:49:28
+== teardown 16:49:28
+terminated; the bucket stays (bench/cloud/data.sh drop removes it)

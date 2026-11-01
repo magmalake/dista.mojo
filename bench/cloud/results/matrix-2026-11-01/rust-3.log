@@ -1,0 +1,61 @@
+# rust nodes=3 slots=16 passes=5
+# metadata=s3://dista-bench-617847241090-us-east-2/warehouse/taxi/trips/metadata/00168-6ca1a160-53d8-4ae9-a692-b3f88d78a536.metadata.json
+TIME q1_scan_count 1 4637
+TIME q1_scan_count 2 2329
+TIME q1_scan_count 3 2289
+TIME q1_scan_count 4 2261
+TIME q1_scan_count 5 2306
+ANSWER q1_scan_count 1426837047 0.0 0.0 0.0
+q1_scan_count : 416 files, 1426837047 rows, sum 0 | distributed 4637 ms, one process -
+TIME q2_month_range 1 543
+TIME q2_month_range 2 447
+TIME q2_month_range 3 428
+TIME q2_month_range 4 419
+TIME q2_month_range 5 429
+ANSWER q2_month_range 10820685 299443390.9199999 0.0 0.0
+q2_month_range : 3 files, 10820685 rows, sum 299443390.9199999 | distributed 543 ms, one process -
+TIME q3_payment_sum 1 3516
+TIME q3_payment_sum 2 3423
+TIME q3_payment_sum 3 3347
+TIME q3_payment_sum 4 3295
+TIME q3_payment_sum 5 3328
+ANSWER q3_payment_sum 556168189 7104909931.200016 0.0 0.0
+q3_payment_sum : 416 files, 556168189 rows, sum 7104909931.200016 | distributed 3516 ms, one process -
+TIME q4_tip_ratio 1 3706
+TIME q4_tip_ratio 2 3649
+TIME q4_tip_ratio 3 3538
+TIME q4_tip_ratio 4 3496
+TIME q4_tip_ratio 5 3504
+ANSWER q4_tip_ratio 78963270 477912778.6299998 3644792856.849997 0.0
+q4_tip_ratio : 416 files, 78963270 rows, sum 477912778.6299998 | distributed 3706 ms, one process -
+TIME q5_top_zones 1 3518
+TIME q5_top_zones 2 3482
+TIME q5_top_zones 3 3481
+TIME q5_top_zones 4 3469
+TIME q5_top_zones 5 3439
+ANSWER q5_top_zones 1426837047 0.0 0.0 1426837047.0
+q5_top_zones : 416 files, 1426837047 rows, sum 0 | distributed 3518 ms, one process -
+TIME q6_zone_revenue 1 535
+TIME q6_zone_revenue 2 468
+TIME q6_zone_revenue 3 464
+TIME q6_zone_revenue 4 465
+TIME q6_zone_revenue 5 487
+ANSWER q6_zone_revenue 41169300 0.0 0.0 1145855820.8800693
+q6_zone_revenue : 12 files, 41169300 rows, sum 0 | distributed 535 ms, one process -
+TIME q7_wide 1 1190
+TIME q7_wide 2 1068
+TIME q7_wide 3 1074
+TIME q7_wide 4 1064
+TIME q7_wide 5 1076
+ANSWER q7_wide 3539142 0.0 0.0 0.0
+q7_wide : 1 files, 3539142 rows, sum 0 | distributed 1190 ms, one process -
+TIME q8_selective 1 3893
+TIME q8_selective 2 3832
+TIME q8_selective 3 3756
+TIME q8_selective 4 3720
+TIME q8_selective 5 3701
+ANSWER q8_selective 3172858 256998447.12999982 0.0 0.0
+q8_selective : 416 files, 3172858 rows, sum 256998447.12999982 | distributed 3893 ms, one process -
+q2_as_batches : 10820685 rows as Arrow, 88595352 bytes over sockets, 981 ms
+tasks ran on 3 nodes: ip-172-31-0-44 ip-172-31-12-108 ip-172-31-12-103
+PASS rust taxi: 8 queries + 1 as batches, distributed passes agree; distributed 21538 ms
