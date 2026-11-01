@@ -3,8 +3,10 @@ distributed one task per data file, against the same scans in one process.
 
 79.5 million trips, 24 monthly data files. For each query the driver plans
 the scan, sends one task per surviving file, and adds the tasks' partial
-results together. A task carries its planned file, so a worker reads the
-table's metadata and that file and nothing else: no manifests. Then it runs the same scan itself, in this process, and
+results together. A task carries its planned file and the table's metadata
+for reading (its schema and current snapshot, without the history), so a
+worker reads that one data file and nothing else: no metadata file, no
+manifests. Then the driver runs the same scan itself, in this process, and
 checks the answers agree: counts exactly, sums to 1e-9 relative (a sum's
 rounding depends on the order its terms are added in). One more query sends
 whole Arrow batches back instead of partial sums, so columnar data crosses
@@ -34,7 +36,14 @@ from std.os import getenv
 from std.time import perf_counter_ns
 
 from arrow_mlake import RecordBatch
-from iceberg import DataFile, FileIO, FileScanTask, ScanOptions, TableScan
+from iceberg import (
+    DataFile,
+    FileIO,
+    FileScanTask,
+    ScanOptions,
+    TableMetadata,
+    TableScan,
+)
 from iceberg.manifest import CONTENT_DATA
 from iceberg.catalog.filesystem import read_metadata_file
 
@@ -133,6 +142,10 @@ struct FileQuery(Copyable, Movable):
 
     var query: Query
     var file: PlannedFile
+    var metadata: String
+    """The table's metadata for reading, `TableMetadata.for_reading()` as
+    JSON: the schema and the current snapshot, so the worker doesn't fetch
+    the table's whole metadata file for every task."""
 
 
 @fieldwise_init
@@ -171,9 +184,13 @@ def _io() -> FileIO:
     return io^
 
 
-def _scan(q: Query) raises -> TableScan:
-    var io = _io()
-    var scan = TableScan(read_metadata_file(io, getenv("TAXI_METADATA")), io^)
+def _table() raises -> TableMetadata:
+    """The table's metadata, read once by the driver."""
+    return read_metadata_file(_io(), getenv("TAXI_METADATA"))
+
+
+def _scan(q: Query, var table: TableMetadata) raises -> TableScan:
+    var scan = TableScan(table^, _io())
     scan = scan.filter(q.filter)
     if len(q.columns) > 0:
         var cols = List[String]()
@@ -236,7 +253,8 @@ def fold_file(t: FileQuery) raises -> Partial:
     """Task: one query over one data file, folded where it was read."""
     var tasks: List[FileScanTask] = [t.file.task()]
     var p = Partial.zero()
-    for b in _scan(t.query).to_batches_for_tasks(tasks^):
+    var table = TableMetadata.parse(t.metadata)
+    for b in _scan(t.query, table^).to_batches_for_tasks(tasks^):
         fold(p, t.query, b)
     p.node = _node()
     return p^
@@ -245,7 +263,8 @@ def fold_file(t: FileQuery) raises -> Partial:
 def read_file(t: FileQuery) raises -> Seq[RecordBatch]:
     """Task: one query over one data file, returned as Arrow batches."""
     var tasks: List[FileScanTask] = [t.file.task()]
-    return Seq[RecordBatch](_scan(t.query).to_batches_for_tasks(tasks^))
+    var table = TableMetadata.parse(t.metadata)
+    return Seq[RecordBatch](_scan(t.query, table^).to_batches_for_tasks(tasks^))
 
 
 comptime FoldFile = Task[FileQuery, Partial, fold_file]
@@ -375,16 +394,23 @@ def _ms(t0: Int) -> Int:
 
 
 def _distributed(
-    mut rt: Runtime[FoldFile, ReadFile], q: Query, mut nodes: List[String]
+    mut rt: Runtime[FoldFile, ReadFile],
+    q: Query,
+    mut nodes: List[String],
+    table: TableMetadata,
+    reading: String,
 ) raises -> Tuple[Partial, Int]:
-    """Query `q` as one task per planned file; the answer and how many files."""
+    """Query `q` as one task per planned file; the answer and how many files.
+    `reading` is the table's metadata for reading, sent with each task."""
     var t = rt.clock()
-    var tasks = _scan(q).plan_files()
+    var tasks = _scan(q, table.copy()).plan_files()
     rt.span(String("plan ", q.name), t)
     t = rt.clock()
     var refs = List[ObjectRef[Partial]]()
     for f in tasks:
-        refs.append(rt.remote[FoldFile](FileQuery(q.copy(), PlannedFile.of(f))))
+        refs.append(
+            rt.remote[FoldFile](FileQuery(q.copy(), PlannedFile.of(f), reading))
+        )
     rt.span(String("submit ", q.name), t)
     t = rt.clock()
     var got = Partial.zero()
@@ -397,11 +423,11 @@ def _distributed(
     return (got^, len(tasks))
 
 
-def _local(q: Query) raises -> Tuple[Partial, Int]:
+def _local(q: Query, table: TableMetadata) raises -> Tuple[Partial, Int]:
     """Query `q` scanned in this process; the answer and its milliseconds."""
     var t = Int(perf_counter_ns())
     var want = Partial.zero()
-    var reader = _scan(q).to_batch_reader()
+    var reader = _scan(q, table.copy()).to_batch_reader()
     while True:
         var b = reader.next_batch()
         if not b:
@@ -419,9 +445,10 @@ def _answer(name: String, p: Partial):
 
 
 def _local_only() raises:
+    var table = _table()
     var total = 0
     for q in queries():
-        var local = _local(q)
+        var local = _local(q, table)
         _answer(q.name, local[0])
         total += local[1]
         print(
@@ -444,13 +471,15 @@ def main() raises:
     if mode != "both" and mode != "distributed":
         raise Error("TAXI_MODE must be both, distributed or local, got ", mode)
     var rt = Runtime[FoldFile, ReadFile](workers=4)
+    var table = _table()
+    var reading = table.for_reading().to_json()
     var passes = Int(getenv("TAXI_PASSES", "1"))
     var nodes = List[String]()
     var total_dist = 0
     var total_local = 0
     for q in queries():
         var t0 = Int(perf_counter_ns())
-        var first = _distributed(rt, q, nodes)
+        var first = _distributed(rt, q, nodes, table, reading)
         var dist_ms = _ms(t0)
         ref got = first[0]
         print("TIME", q.name, 1, dist_ms)
@@ -458,7 +487,7 @@ def main() raises:
         var local_ms = String("-")
         if mode == "both":
             var lt = rt.clock()
-            var local = _local(q)
+            var local = _local(q, table)
             rt.span(String("one process ", q.name), lt)
             _check(q.name, got, local[0])
             total_local += local[1]
@@ -466,7 +495,7 @@ def main() raises:
         _answer(q.name, got)
         for k in range(2, passes + 1):
             var t = Int(perf_counter_ns())
-            var again = _distributed(rt, q, nodes)
+            var again = _distributed(rt, q, nodes, table, reading)
             print("TIME", q.name, k, _ms(t))
             _check(q.name, again[0], got)
         total_dist += dist_ms
@@ -490,8 +519,10 @@ def main() raises:
     var t2 = Int(perf_counter_ns())
     var bt = rt.clock()
     var refs = List[ObjectRef[Seq[RecordBatch]]]()
-    for t in _scan(q).plan_files():
-        refs.append(rt.remote[ReadFile](FileQuery(q.copy(), PlannedFile.of(t))))
+    for t in _scan(q, table.copy()).plan_files():
+        refs.append(
+            rt.remote[ReadFile](FileQuery(q.copy(), PlannedFile.of(t), reading))
+        )
     rt.span("plan and submit q2_as_batches", bt)
     bt = rt.clock()
     var got = Partial.zero()
@@ -502,7 +533,7 @@ def main() raises:
     rt.span("fetch and fold q2_as_batches", bt)
     bt = rt.clock()
     var want = Partial.zero()
-    for b in _scan(q).to_batches():
+    for b in _scan(q, table.copy()).to_batches():
         fold(want, q, b)
     rt.span("check q2_as_batches in the driver", bt)
     _check("q2_as_batches", got, want)
