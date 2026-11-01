@@ -468,6 +468,10 @@ struct Runtime[*Ts: TaskLike](Movable):
                 )
             elif id in self._located:
                 write_frame(self._head, KIND_CLAIM, id, 0, List[UInt8]())
+                # Where it was may be stale: a task run twice across restarts
+                # leaves copies, and the new head may keep the other one. It
+                # says where it has the result in reply.
+                _ = self._located.pop(id, List[UInt8]())
             elif id in self._subs:
                 ref sub = self._subs[id]
                 write_frame(self._head, sub.kind, id, sub.task_id, sub.payload)

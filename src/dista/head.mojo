@@ -285,8 +285,16 @@ struct Head(Movable):
                 else:
                     self._errors[obj] = message(f.payload)
             elif f.kind == KIND_CLAIM:
-                self._hold(f.object_id)
-                _ = self._orphans.pop(f.object_id, False)
+                var obj = f.object_id
+                self._hold(obj)
+                _ = self._orphans.pop(obj, False)
+                # The driver forgot where it was; say where this head has it.
+                # If no worker has reported it yet, `_holding` says when one
+                # does.
+                if obj in self._location:
+                    self._deliver(
+                        obj, KIND_LOCATED, self._where.get(obj, List[UInt8]())
+                    )
             elif f.kind == KIND_RESUMED:
                 var d = owner_of(f.object_id)
                 self._resumed[d] = True

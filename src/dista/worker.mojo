@@ -204,6 +204,8 @@ struct Worker[dispatch: DispatchFn](Movable):
     var _fetched: Dict[UInt64, Bool]
     """Objects in `_objects` that are copies of inputs, not results made here.
     """
+    var _debug: Bool
+    """`DISTA_DEBUG=1`: log each task's inputs as they're assembled."""
 
     def __init__(out self, var head: Stream, registry_hash: UInt64) raises:
         """Starts the object server and says hello to the head on `head`."""
@@ -231,6 +233,7 @@ struct Worker[dispatch: DispatchFn](Movable):
         self._files = Dict[UInt64, Location]()
         self._token = worker_token()
         self._fetched = Dict[UInt64, Bool]()
+        self._debug = getenv("DISTA_DEBUG") == "1"
 
     @staticmethod
     def _hello(
@@ -460,6 +463,20 @@ struct Worker[dispatch: DispatchFn](Movable):
                 var args = List[UInt8]()
                 if p.gather:
                     put_scalar[DType.int64](args, Int64(len(p.inputs)))
+                if self._debug:
+                    print("dista worker: task", p.object_id, "inputs:", end="")
+                    for ref inp in p.inputs:
+                        var n = len(inp.bytes) if inp.have else len(
+                            self._objects.get(inp.object_id, List[UInt8]())
+                        )
+                        print(
+                            " ",
+                            inp.object_id,
+                            "inline" if inp.have else "fetched",
+                            n,
+                            end="",
+                        )
+                    print()
                 for ref inp in p.inputs:
                     if inp.have:
                         args.extend(inp.bytes.copy())
@@ -491,6 +508,14 @@ struct Worker[dispatch: DispatchFn](Movable):
 
     def _run_one(mut self) raises:
         var t = self._ready.pop(0)
+        if t.object_id in self._files:
+            # A task resubmitted across a head restart, whose result this
+            # worker already has. Tasks are pure, so report that copy rather
+            # than run it again and rewrite a file someone may be reading.
+            self._to_head(
+                KIND_STORED, t.object_id, self._files[t.object_id].encode()
+            )
+            return
         var out = List[UInt8]()
         try:
             Self.dispatch(t.task_id, t.args, out)

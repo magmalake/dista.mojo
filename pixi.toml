@@ -17,7 +17,7 @@ test-batches = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_
 test-free = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_free.mojo -o build/test-free && ./build/test-free" }
 test-cluster = { cmd = "tests/cluster.sh" }
 test-restart = { cmd = "tests/head_restart.sh" }
-test-chaos = { cmd = "tests/chaos.sh" }
+test-chaos = { cmd = "CHAOS_FAST=1 tests/chaos.sh" }
 test-kind = { cmd = "tests/kind.sh" }
 test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-cluster", "test-restart", "test-chaos"] }
 bench = { cmd = "mkdir -p build && mojo build -I src $DEP_INC bench/fanout.mojo -o build/bench-fanout && ./build/bench-fanout" }

@@ -33,11 +33,14 @@ for seed in ${CHAOS_SEEDS:-1 2 3}; do
   driver=$!
   pids+=($driver)
 
-  # Kill the head every 0.3-1.2 s (seeded) while the driver runs.
+  # Kill the head every 0.3-1.2 s (seeded) while the driver runs;
+  # CHAOS_FAST=1 makes it every 0.1-0.5 s.
   RANDOM=$seed
   kills=0
+  lo=3 spread=9
+  [ "${CHAOS_FAST:-0}" = 1 ] && lo=1 spread=5
   while kill -0 "$driver" 2>/dev/null; do
-    sleep "0.$((3 + RANDOM % 9))"
+    sleep "0.$((lo + RANDOM % spread))"
     kill -0 "$driver" 2>/dev/null || break
     kill -9 "$head" 2>/dev/null || true
     sleep 0.2
