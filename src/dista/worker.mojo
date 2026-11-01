@@ -17,6 +17,10 @@ the current task finishes.
 A result here lives until the head says free, once nothing references it.
 Inputs fetched from peers are copies, kept only until the tasks waiting on
 them have their arguments.
+
+If the head goes away, `run` returns and the results here stay. `rejoin`
+introduces the worker to a new head and reports what it holds; the tasks it
+had queued are dropped, since their drivers resubmit them.
 """
 
 from std.ffi import c_int, external_call
@@ -29,6 +33,7 @@ from dista.frame import (
     KIND_FETCH,
     KIND_FREE,
     KIND_HELLO,
+    KIND_HOLDING,
     KIND_RESULT,
     KIND_STORED,
     KIND_TASK,
@@ -151,12 +156,11 @@ struct Worker[dispatch: DispatchFn](Movable):
         var listener = Listener(0, any_interface=True)
         var advertise = getenv("DISTA_ADVERTISE")
         var ip = resolve_ipv4(advertise) if advertise != "" else head.local_ip()
-        var hello: List[UInt8] = [ROLE_WORKER]
-        put_scalar[DType.uint64](hello, registry_hash)
-        hello.extend(encode_addr(ip, listener.port))
         self._key = addr_key(ip, listener.port)
         self._head = Conn(head^)
-        self._head.send(KIND_HELLO, 0, 0, hello)
+        self._head.send(
+            KIND_HELLO, 0, 0, Self._hello(registry_hash, ip, listener.port)
+        )
         self._listener = listener^
         self._serving = List[Conn]()
         self._peers = List[Conn]()
@@ -173,6 +177,43 @@ struct Worker[dispatch: DispatchFn](Movable):
         self._files = Dict[UInt64, Location]()
         self._token = worker_token()
         self._fetched = Dict[UInt64, Bool]()
+
+    @staticmethod
+    def _hello(
+        registry_hash: UInt64, ip: Array[UInt8, 4], port: Int
+    ) -> List[UInt8]:
+        var hello: List[UInt8] = [ROLE_WORKER]
+        put_scalar[DType.uint64](hello, registry_hash)
+        hello.extend(encode_addr(ip, port))
+        return hello^
+
+    def rejoin(mut self, var head: Stream, registry_hash: UInt64) raises:
+        """Says hello to a new head and reports the results held here."""
+        self._head = Conn(head^)
+        self._ready.clear()
+        self._parked.clear()
+        self._requested.clear()
+        for entry in self._fetched.items():
+            _ = self._objects.pop(entry.key, List[UInt8]())
+        self._fetched.clear()
+        self._head.send(
+            KIND_HELLO, 0, 0, Self._hello(registry_hash, self._ip, self._port)
+        )
+        var body = List[UInt8]()
+        put_scalar[DType.uint64](
+            body, UInt64(len(self._files) + len(self._objects))
+        )
+        for entry in self._files.items():
+            put_scalar[DType.uint64](body, entry.key)
+            body.extend(entry.value.encode())
+        for entry in self._objects.items():
+            put_scalar[DType.uint64](body, entry.key)
+            body.extend(
+                Location(
+                    self._ip, self._port, self._node, "", len(entry.value)
+                ).encode()
+            )
+        self._head.send(KIND_HOLDING, 0, 0, body)
 
     def __deinit__(deinit self):
         # Results in the node store are files: remove them with the worker.
@@ -204,7 +245,11 @@ struct Worker[dispatch: DispatchFn](Movable):
         var n_peers = len(self._peers)
         var rev = poll(fds, events, timeout_ms)
         if rev[0] != 0:
-            self._pump(self._head, rev[0])
+            try:
+                self._pump(self._head, rev[0])
+            except:
+                # A reset from a head that died: the same as it hanging up.
+                self._head.closed = True
             while True:
                 var f = self._head.next_frame()
                 if not f:
@@ -408,7 +453,7 @@ struct Worker[dispatch: DispatchFn](Movable):
             self._report_error(t.object_id, String(e))
             return
         if len(out) <= INLINE_LIMIT:
-            self._head.send(KIND_RESULT, t.object_id, 0, out)
+            self._to_head(KIND_RESULT, t.object_id, out)
         else:
             var path = String()
             if self._dir != "":
@@ -425,4 +470,11 @@ struct Worker[dispatch: DispatchFn](Movable):
                 self._files[t.object_id] = loc.copy()
             else:
                 self._objects[t.object_id] = out^
-            self._head.send(KIND_STORED, t.object_id, 0, loc.encode())
+            self._to_head(KIND_STORED, t.object_id, loc.encode())
+
+    def _to_head(mut self, kind: UInt8, obj: UInt64, payload: Span[UInt8, _]):
+        """Sends to the head; a head that's gone is noticed by `run`."""
+        try:
+            self._head.send(kind, obj, 0, payload)
+        except:
+            self._head.closed = True

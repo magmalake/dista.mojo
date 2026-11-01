@@ -23,6 +23,12 @@ Every object is reference counted: its driver holds it until it releases it
 that task settles. At zero the head forgets the object and tells the worker
 holding it, if one does, to delete it. An object released before its task
 finishes is freed when the task settles.
+
+The head keeps nothing on disk. When it restarts, its state comes back from
+its peers: workers rejoin and report the results they hold, and each driver
+reconnects under its old number and restores, claims or resubmits everything
+it still needs (see `frame.mojo`). A reported result no resumed driver
+claimed is freed. A task that was running when the head died may run again.
 """
 
 from std.ffi import c_int
@@ -31,12 +37,15 @@ from dista.codec import get_scalar, put_scalar
 from dista.conn import Conn
 from dista.frame import (
     ADDR_SIZE,
+    KIND_CLAIM,
     KIND_ERROR,
     KIND_FREE,
     KIND_HELLO,
+    KIND_HOLDING,
     KIND_LOCATED,
     KIND_RELEASE,
     KIND_RESULT,
+    KIND_RESUMED,
     KIND_STATS,
     KIND_STORED,
     KIND_TASK,
@@ -48,6 +57,7 @@ from dista.frame import (
     Frame,
 )
 from dista.socket import POLLERR, POLLHUP, POLLIN, POLLOUT, Listener, poll
+from dista.store import Location
 
 comptime DRIVER_SHIFT = 40
 """Object IDs carry their driver's number above this bit."""
@@ -119,6 +129,10 @@ struct Head(Movable):
     """A waiting task's inputs, each holding a reference until it settles."""
     var _dead: Dict[UInt64, Bool]
     """Objects freed before their task settled: dropped when it does."""
+    var _orphans: Dict[UInt64, Bool]
+    """Results a rejoining worker reported that no driver has claimed yet."""
+    var _resumed: Dict[UInt64, Bool]
+    """Drivers that have finished resuming with this head."""
 
     def __init__(
         out self,
@@ -157,6 +171,8 @@ struct Head(Movable):
         self._held = Dict[UInt64, Bool]()
         self._deps_of = Dict[UInt64, List[UInt64]]()
         self._dead = Dict[UInt64, Bool]()
+        self._orphans = Dict[UInt64, Bool]()
+        self._resumed = Dict[UInt64, Bool]()
 
     def run(mut self) raises:
         """Serves until the last driver leaves, in local mode; else forever."""
@@ -220,6 +236,8 @@ struct Head(Movable):
                 var obj = f.object_id
                 var task = f.task_id
                 self._hold(obj)
+                if self._adopt(obj):
+                    return
                 self._queue.append(_Task(obj, task, f^.take_payload()))
             elif f.kind == KIND_TASK_AFTER:
                 var gather = f.payload[0] != 0
@@ -229,6 +247,8 @@ struct Head(Movable):
                 for _ in range(n):
                     deps.append(get_scalar[DType.uint64](f.payload, pos))
                 self._hold(f.object_id)
+                if self._adopt(f.object_id):
+                    return
                 var missing = False
                 for d in deps:
                     if d not in self._refs:
@@ -251,6 +271,28 @@ struct Head(Movable):
                         gather=gather,
                     )
                 )
+            elif f.kind == KIND_RESULT or f.kind == KIND_ERROR:
+                # Resuming: a small result or error the driver kept.
+                var obj = f.object_id
+                self._hold(obj)
+                if f.kind == KIND_RESULT:
+                    self._results[obj] = f^.take_payload()
+                else:
+                    self._errors[obj] = String(unsafe_from_utf8=f.payload)
+            elif f.kind == KIND_CLAIM:
+                self._hold(f.object_id)
+                _ = self._orphans.pop(f.object_id, False)
+            elif f.kind == KIND_RESUMED:
+                var d = owner_of(f.object_id)
+                self._resumed[d] = True
+                var unclaimed = List[UInt64]()
+                for entry in self._orphans.items():
+                    if owner_of(entry.key) == d:
+                        unclaimed.append(entry.key)
+                for obj in unclaimed:
+                    _ = self._orphans.pop(obj, False)
+                    if obj not in self._refs:
+                        self._free(obj)
             elif f.kind == KIND_RELEASE:
                 if self._held.pop(f.object_id, False):
                     self._dec(f.object_id)
@@ -267,6 +309,9 @@ struct Head(Movable):
             else:
                 raise Error("driver sent frame kind ", Int(f.kind))
         elif role == ROLE_WORKER:
+            if f.kind == KIND_HOLDING:
+                self._holding(i, f.payload)
+                return
             if (
                 f.kind != KIND_RESULT
                 and f.kind != KIND_ERROR
@@ -287,13 +332,52 @@ struct Head(Movable):
                 self._results[obj] = f.payload.copy()
                 self._deliver(obj, f.kind, f.payload)
             elif f.kind == KIND_STORED:
-                self._location[obj] = i
-                self._where[obj] = f.payload.copy()
-                self._deliver(obj, KIND_LOCATED, f.payload)
+                if obj in self._location:
+                    # A task run twice across a head restart: keep one copy.
+                    # On the same worker it's the same copy, rewritten.
+                    if self._location.get(obj, -1) != i:
+                        self._conns[i].send(KIND_FREE, obj, 0, List[UInt8]())
+                else:
+                    self._location[obj] = i
+                    self._where[obj] = f.payload.copy()
+                    self._deliver(obj, KIND_LOCATED, f.payload)
             else:
                 self._errors[obj] = String(unsafe_from_utf8=f.payload)
                 self._deliver(obj, f.kind, f.payload)
             self._settle(obj)
+
+    def _adopt(mut self, obj: UInt64) -> Bool:
+        """A resubmitted task whose result a rejoining worker already reported:
+        settle it with that result instead of running it again."""
+        if not self._orphans.pop(obj, False):
+            return False
+        self._deliver(obj, KIND_LOCATED, self._where.get(obj, List[UInt8]()))
+        return True
+
+    def _holding(mut self, i: Int, payload: Span[UInt8, _]) raises:
+        """A rejoining worker's results: keep the claimed, free the rest."""
+        var pos = 0
+        var n = Int(get_scalar[DType.uint64](payload, pos))
+        for _ in range(n):
+            var obj = get_scalar[DType.uint64](payload, pos)
+            var start = pos
+            _ = Location.decode(payload, pos)
+            var loc = List[UInt8](payload[start:pos])
+            if obj in self._location:
+                # The task ran again first: one copy is enough. On the same
+                # worker it's the same copy, rewritten.
+                if self._location.get(obj, -1) != i:
+                    self._conns[i].send(KIND_FREE, obj, 0, List[UInt8]())
+                continue
+            self._location[obj] = i
+            self._where[obj] = loc.copy()
+            if obj in self._refs:
+                # Claimed already: tell the driver where it is again.
+                self._deliver(obj, KIND_LOCATED, loc)
+            elif owner_of(obj) in self._resumed:
+                self._free(obj)
+            else:
+                self._orphans[obj] = True
 
     def _hello(mut self, i: Int, var f: Frame) raises:
         if f.kind != KIND_HELLO or len(f.payload) < 9:
@@ -310,7 +394,16 @@ struct Head(Movable):
             return
         if f.payload[0] == ROLE_DRIVER:
             var n = self._next_driver
-            self._next_driver += 1
+            if len(f.payload) == 17:
+                # A driver resuming after a head restart keeps its number.
+                var p = 9
+                n = get_scalar[DType.uint64](f.payload, p)
+                if n in self._driver_conn:
+                    raise Error("driver ", n, " is already connected")
+                if n >= self._next_driver:
+                    self._next_driver = n + 1
+            else:
+                self._next_driver += 1
             self._roles[i] = ROLE_DRIVER
             self._driver_conn[n] = i
             self._drivers_seen = True
@@ -422,6 +515,8 @@ struct Head(Movable):
             for obj in held:
                 _ = self._location.pop(obj, -1)
                 _ = self._where.pop(obj, List[UInt8]())
+                if self._orphans.pop(obj, False):
+                    continue
                 self._fail(obj, String("result lost: its worker went away"))
 
     def _shutdown(mut self):
