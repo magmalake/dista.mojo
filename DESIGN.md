@@ -257,15 +257,26 @@ Actors and methods go in `Runtime[...]` with the tasks, so the registry hash sti
 
 ### PRs
 
-Stacked, at most about 2,000 lines each, in order. Once a worker re-registers its actor after a head restart (from PR 3 on), actors survive a head restart too:
+Stacked, at most about 2,000 lines each, in order. Once a worker re-registers its actor after a head restart (from PR 4 on), actors survive a head restart too:
 
 | # | PR | Gate | Size |
 |---|---|---|---|
 | 1 | **Freeing results.** Reference counts at the head; `rt.release`; workers delete a freed result from memory or the node store. | A loop of 10,000 tasks with 1 MB results finishes with the stores empty. | ~500 |
 | 2 | **Head restart, version 0.** Workers re-register what they hold; the driver resubmits what it hasn't got; head throughput in `bench/fanout.mojo`. | The head is killed mid-fan-out on kind; the job finishes with every answer right. Tasks per second with 16, 64 and 192 workers are recorded. | ~600 |
-| 3 | **Actors: declare, place, call.** `Actor`, `Method`, `rt.create`, `rt.call`, `rt.kill`; one worker per actor; ordered calls; results as `ObjectRef`s. | A counter actor takes 1,000 calls from the driver and returns 1,000 in order; a task uses a method's result. | ~900 |
-| 4 | **Handles as values.** `ActorHandle` through the codec; method calls from tasks and other actors, routed by the head. | 100 tasks each call one shared actor; the actor sees every call once. | ~400 |
-| 5 | **Restart from the constructor.** The head notices the worker is gone, places the actor elsewhere, and replays the calls since it was created. | The counter's worker is killed after 500 of 1,000 calls; the final count is still 1,000. | ~600 |
-| 6 | **Checkpoints.** `checkpoint_every`, `rt.checkpoint`, state through the codec to `DISTA_CHECKPOINT_URI`; restore plus replay of the calls since; the head drops calls a checkpoint covers. | Phase 3's gate: on kind, the counter's pod is deleted mid-run; the actor restores from its checkpoint and the count is exact. | ~700 |
+| 3 | **A task timeline.** Head and worker timestamps per task; `rt.timeline(path)` writes Chrome's trace format. | A fan-out's trace opens in Perfetto with one track per worker, and every task's span sits inside its submit and settle. | ~400 |
+| 4 | **Actors: declare, place, call.** `Actor`, `Method`, `rt.create`, `rt.call`, `rt.kill`; one worker per actor; ordered calls; results as `ObjectRef`s. | A counter actor takes 1,000 calls from the driver and returns 1,000 in order; a task uses a method's result. | ~900 |
+| 5 | **Handles as values.** `ActorHandle` through the codec; method calls from tasks and other actors, routed by the head. | 100 tasks each call one shared actor; the actor sees every call once. | ~400 |
+| 6 | **Restart from the constructor.** The head notices the worker is gone, places the actor elsewhere, and replays the calls since it was created. | The counter's worker is killed after 500 of 1,000 calls; the final count is still 1,000. | ~600 |
+| 7 | **Checkpoints.** `checkpoint_every`, `rt.checkpoint`, state through the codec to `DISTA_CHECKPOINT_URI`; restore plus replay of the calls since; the head drops calls a checkpoint covers. | Phase 3's gate: on kind, the counter's pod is deleted mid-run; the actor restores from its checkpoint and the count is exact. | ~700 |
+| 8 | **Prometheus metrics.** `/metrics` on the head and every worker: task counters, queue depth, objects and store bytes, actors, a task-duration histogram. | `curl` on each pod's `/metrics` during a kind run shows tasks done climbing to the total. | ~500 |
+
+### Telemetry
+
+Ray exports Prometheus metrics from every node, runs a dashboard on the head, and dumps a task timeline in Chrome's trace format (`ray timeline`). dista has stdout and `Runtime.stats`. Two pieces, in the order they pay off:
+
+- **A task timeline** (PR 3), before the actor work, so the next AWS runs have it. The head stamps each task's submit, dispatch and settle times, worker and node; the worker adds its start and end, split into fetching inputs and running. `rt.timeline(path)` writes Chrome's trace format, which Perfetto and the browser's trace viewer open. It shows where a slow run spends its time: dispatch at the head, waiting on inputs, S3 reads inside a task, or stragglers.
+- **Prometheus metrics** (PR 8), once actors exist. A `/metrics` endpoint on the head and each worker. Counters: tasks submitted, done and failed; bytes fetched. Gauges: queue depth, objects held, node-store bytes, actors. A histogram: task duration. It's plain text over a minimal HTTP responder on dista's sockets, and Kubernetes monitoring scrapes it as it is.
+
+OpenTelemetry tracing waits for the pipeline work, where one trace should cover the orchestrator, the driver and its tasks. OTLP over HTTP with JSON needs no gRPC, and can go out through objectstore's libcurl client.
 
 Restate stays out of phase 3. It's the candidate for durable workflows built on actors later, and for phase 4's recovery.
