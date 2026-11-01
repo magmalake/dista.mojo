@@ -103,6 +103,17 @@ before. Counts identical across the three frameworks.
 Nothing changed for Ray between the two runs; its 12-node result moved by
 37%, so Ray's 12-node numbers are noisy.
 
+## 2d. 12 nodes with row-group splitting
+
+`matrix-2026-11-01-3/`: a query planning fewer than 64 files is planned
+again with files split at row-group boundaries (dista only; the Rust and Ray
+benchmarks don't split). q7 954 → 316 ms.
+
+| total, median pass (ms) | dista | rust | ray |
+|---|---:|---:|---:|
+| 12 nodes, with the cache (`matrix-2026-11-01-2`) | 4,446 | 6,745 | 9,955 |
+| **12 nodes, cache + splitting** | **3,751** | **6,691** | **15,395** |
+
 ## 3. Distributed, 3 and 6 nodes, before the read path
 
 `2026-11/`, 5 passes. The 12-node dista run failed its answer check, fixed
@@ -177,6 +188,34 @@ Open questions these raise, for the next round:
   188), where its distributed runs lead: the single-thread decode is the next
   thing to profile.
 - Rust on 16 threads (195 s) is barely faster than on one (210 s).
+
+### 4c. After step 2's fixes
+
+`local-2026-11-01/` (dista and Ray on 16 threads; all three on one) and
+`local-2026-11-01-2/` (Rust on 16 threads, re-run after its first try
+failed loading S3 credentials). Fixes in this round: arrow-mlake's integer
+column copies about 4x faster (arrow-mlake#14), iceberg fetching the next
+files on a second thread while one decodes (`overlap_io`), and the Rust
+benchmark decoding on every core instead of on the one task polling
+iceberg-rust's stream.
+
+| query | dista ×16 | rust ×16 | ray ×16 | dista ×1 | rust ×1 | ray ×1 |
+|---|---:|---:|---:|---:|---:|---:|
+| q1_scan_count | 7,828 | 15,597 | 9,192 | 28,022 | 34,318 | 17,537 |
+| q2_month_range | 315 | 830 | 446 | 391 | 834 | 533 |
+| q3_payment_sum | 9,229 | 18,365 | 14,937 | 38,329 | 39,690 | 29,969 |
+| q4_tip_ratio | 10,663 | 18,360 | 22,689 | 50,365 | 42,206 | 44,095 |
+| q5_top_zones | 15,309 | 19,907 | 16,625 | 41,525 | 46,057 | 31,709 |
+| q6_zone_revenue | 747 | 919 | 1,233 | 1,718 | 1,696 | 1,945 |
+| q7_wide | 888 | 1,026 | 706 | 1,132 | 1,097 | 1,211 |
+| q8_selective | 11,401 | 21,229 | 28,676 | 50,405 | 42,443 | 57,328 |
+| **total** | **56,380** | **96,233** | **94,504** | **211,887** | **208,341** | **184,327** |
+
+- 16 threads: dista 71.7 → 56.4 s (q5 26.8 → 15.3 s); Rust 195.1 → 96.2 s
+  once it decodes on every core.
+- One thread: dista 230.2 → 211.9 s with the overlap, level with Rust, 15%
+  behind Ray. Overlapping the fetch barely helped, so what's left is decode
+  speed on one core.
 
 The first one-process session's 16-thread dista run crashed in curl
 (`local-2026-11-01-t16-crash/`, fixed in objectstore#15).
