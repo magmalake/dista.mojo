@@ -35,8 +35,14 @@ tasks in flight, as soon as it's created; the worker builds it once those
 tasks finish. From then on the head sends that worker only the actor's calls,
 each as it arrives, so they run in order. An actor created when every worker
 hosts one waits for a worker to join or an actor to be killed. Killing an
-actor, or its driver leaving, frees its worker for tasks; a worker that goes
-away fails its actor and the calls it had.
+actor, or its driver leaving, frees its worker for tasks.
+
+The head keeps every call made to an actor. When the actor's worker goes
+away, the actor is placed on another worker, built again from its
+constructor, and every call is run again in order, so its state is rebuilt:
+calls run at least once. Each call is answered once: a call answered before
+the restart keeps its first answer, and the replay's is dropped. A head
+restart still loses actors, since the call log is the head's.
 """
 
 from std.ffi import c_int
@@ -152,6 +158,9 @@ struct _Actor(Copyable, Movable):
     var killed: Bool
     """Killed before it was placed: placed anyway, to run its calls, then
     killed."""
+    var log: List[_Task]
+    """Every call made to it, in order: what a restart replays."""
+    var restarts: Int
 
     def __init__(out self, type_id: UInt64, var args: List[UInt8]):
         self.type_id = type_id
@@ -160,6 +169,8 @@ struct _Actor(Copyable, Movable):
         self.pending = List[_Task]()
         self.failed = String()
         self.killed = False
+        self.log = List[_Task]()
+        self.restarts = 0
 
 
 struct Head(Movable):
@@ -460,6 +471,22 @@ struct Head(Movable):
                 # Released while it ran: keep nothing, and free its copy.
                 if f.kind == KIND_STORED:
                     self._conns[i].send(KIND_FREE, obj, 0, List[UInt8]())
+            elif self._answered(obj):
+                # A second answer: a restarted actor replaying its calls, or a
+                # task run twice across a head restart. The first one stands.
+                if f.kind == KIND_STORED and self._location.get(obj, -1) != i:
+                    self._conns[i].send(KIND_FREE, obj, 0, List[UInt8]())
+                if (
+                    f.kind == KIND_ERROR
+                    and obj in self._actors
+                    and self._hosting[i] == obj
+                ):
+                    # Its constructor failed on the restart.
+                    self._actors[obj].failed = String(
+                        "actor failed to restart: ", message(f.payload)
+                    )
+                    self._hosting[i] = 0
+                return
             elif f.kind == KIND_RESULT:
                 self._results[obj] = f.payload.copy()
                 self._deliver(obj, f.kind, f.payload)
@@ -483,6 +510,13 @@ struct Head(Movable):
                     )
                     self._hosting[i] = 0
             self._settle(obj)
+
+    def _answered(self, obj: UInt64) -> Bool:
+        """Whether `obj` already has its answer, or nobody wants it any more:
+        a result for it now is a repeat."""
+        if obj in self._results or obj in self._errors or obj in self._location:
+            return True
+        return obj not in self._refs
 
     # ── actors ───────────────────────────────────────────────────────────
     def _call(mut self, var f: Frame) raises:
@@ -509,6 +543,9 @@ struct Head(Movable):
             return
         var method = f.task_id
         var t = _Task(obj, method, f^.take_payload(), kind=KIND_ACTOR_CALL)
+        # Kept for as long as the actor lives, so a restart can rebuild its
+        # state by running every call again from the constructor.
+        act.log.append(t.copy())
         if act.worker < 0:
             act.pending.append(t^)
         else:
@@ -844,16 +881,29 @@ struct Head(Movable):
         elif role == ROLE_WORKER:
             var a = self._hosting[i]
             self._hosting[i] = 0
+            var replays = Dict[UInt64, Bool]()
             if a in self._actors:
                 try:
-                    self._actors[a].failed = String(
-                        "actor lost: its worker went away"
-                    )
+                    ref act = self._actors[a]
+                    if not act.failed:
+                        # Restart it elsewhere from its constructor, and run
+                        # every call again: the calls in flight here get
+                        # their answers from the replay, and the ones already
+                        # answered keep their first answer.
+                        act.worker = -1
+                        act.restarts += 1
+                        act.pending = act.log.copy()
+                        self._unplaced.insert(0, a)
+                        replays[a] = True
+                        for ref t in act.log:
+                            replays[t.object_id] = True
                 except:
                     pass
             var lost = self._inflight[i].copy()
             self._inflight[i].clear()
             for obj in lost:
+                if obj in replays:
+                    continue
                 self._fail(obj, String("worker lost while running this task"))
             var held = List[UInt64]()
             for entry in self._location.items():

@@ -1,5 +1,7 @@
 """Actors: create, ordered calls, results as ObjectRefs, kill."""
 
+from std.os import remove
+from std.os.path import exists
 from std.testing import (
     TestSuite,
     assert_equal,
@@ -7,6 +9,7 @@ from std.testing import (
     assert_true,
 )
 
+from dista.socket import exit_now
 from dista import (
     Actor,
     ActorHandle,
@@ -36,6 +39,20 @@ def add(mut c: Counter, n: Int) -> Int:
     return c.total
 
 
+comptime CRASH_FLAG = "build/test-actors-crashed"
+
+
+def add_or_crash(mut c: Counter, n: Int) raises -> Int:
+    """`add`, except that the worker dies the first time the count reaches
+    500: the flag file says it already has, so the replay goes through."""
+    c.total += n
+    if c.total == 500 and not exists(CRASH_FLAG):
+        with open(CRASH_FLAG, "w") as f:
+            f.write("crashed")
+        exit_now(1)
+    return c.total
+
+
 def pad(mut c: Counter, n: Int) -> String:
     """A result too large to travel through the head."""
     return String("x") * (n + c.total)
@@ -47,6 +64,7 @@ def square(x: Int) -> Int:
 
 comptime CounterActor = Actor[Counter, Int, new_counter]
 comptime Add = Method[CounterActor, Int, Int, add]
+comptime AddOrCrash = Method[CounterActor, Int, Int, add_or_crash]
 comptime Pad = Method[CounterActor, Int, String, pad]
 comptime Square = Task[Int, Int, square]
 
@@ -93,7 +111,15 @@ comptime Forward = CtxMethod[RelayActor, Int, Int, forward]
 comptime Bump = CtxTask[ActorHandle[CounterActor], Int, bump]
 comptime PadLength = CtxTask[ActorHandle[CounterActor], Int, pad_length]
 comptime RT = Runtime[
-    CounterActor, Add, Pad, Square, Bump, PadLength, RelayActor, Forward
+    CounterActor,
+    Add,
+    AddOrCrash,
+    Pad,
+    Square,
+    Bump,
+    PadLength,
+    RelayActor,
+    Forward,
 ]
 
 
@@ -239,6 +265,26 @@ def test_an_actor_calls_another() raises:
         last = rt.get(rt.call[Forward](relay, i))
     assert_equal(last, 210)
     assert_equal(rt.get(rt.call[Add](counter, 0)), 210)
+
+
+def test_an_actor_restarts_when_its_worker_dies() raises:
+    """PR 6's gate: the counter's worker dies after 500 of 1,000 calls. The
+    actor is built again on another worker and its calls replayed: every call
+    gets its answer once, in order, and the final count is 1,000."""
+    if exists(CRASH_FLAG):
+        remove(CRASH_FLAG)
+    var rt = RT(workers=3)
+    var c = rt.create[CounterActor](0)
+    var refs = List[ObjectRef[Int]](capacity=1000)
+    for _ in range(1000):
+        refs.append(rt.call[AddOrCrash](c, 1))
+    for i in range(1000):
+        assert_equal(rt.get(refs[i]), i + 1)
+    assert_true(exists(CRASH_FLAG), "the worker never died")
+    assert_equal(rt.get(rt.call[Add](c, 0)), 1000)
+    # Tasks still run beside the restarted actor.
+    assert_equal(rt.get(rt.remote[Square](12)), 144)
+    remove(CRASH_FLAG)
 
 
 def main() raises:
