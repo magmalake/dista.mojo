@@ -13,6 +13,10 @@ worker keeps serving fetches meanwhile. No worker ever waits on another one
 synchronously, so two workers that need each other's results can't deadlock.
 Running a task does block the loop, so fetches from this worker wait until
 the current task finishes.
+
+A result here lives until the head says free, once nothing references it.
+Inputs fetched from peers are copies, kept only until the tasks waiting on
+them have their arguments.
 """
 
 from std.ffi import c_int, external_call
@@ -23,6 +27,7 @@ from dista.conn import Conn
 from dista.frame import (
     KIND_ERROR,
     KIND_FETCH,
+    KIND_FREE,
     KIND_HELLO,
     KIND_RESULT,
     KIND_STORED,
@@ -137,6 +142,9 @@ struct Worker[dispatch: DispatchFn](Movable):
     """Results this worker wrote into the node store."""
     var _token: UInt64
     """Names this worker's node-store files: `dista-<token>-<object>`."""
+    var _fetched: Dict[UInt64, Bool]
+    """Objects in `_objects` that are copies of inputs, not results made here.
+    """
 
     def __init__(out self, var head: Stream, registry_hash: UInt64) raises:
         """Starts the object server and says hello to the head on `head`."""
@@ -164,6 +172,7 @@ struct Worker[dispatch: DispatchFn](Movable):
         self._dir = store_dir()
         self._files = Dict[UInt64, Location]()
         self._token = worker_token()
+        self._fetched = Dict[UInt64, Bool]()
 
     def __deinit__(deinit self):
         # Results in the node store are files: remove them with the worker.
@@ -269,6 +278,7 @@ struct Worker[dispatch: DispatchFn](Movable):
                     if loc.is_local() and obj not in self._objects:
                         try:
                             self._objects[obj] = read_shared(loc.path, loc.size)
+                            self._fetched[obj] = True
                         except e:
                             self._lost[obj] = String(e)
                     else:
@@ -277,6 +287,10 @@ struct Worker[dispatch: DispatchFn](Movable):
             self._parked.append(
                 _Parked(f.object_id, f.task_id, gather, inputs^)
             )
+        elif f.kind == KIND_FREE:
+            _ = self._objects.pop(f.object_id, List[UInt8]())
+            if f.object_id in self._files:
+                remove_file(self._files.pop(f.object_id).path)
         elif f.kind == KIND_ERROR:
             raise Error(
                 "the head refused this worker: ",
@@ -313,6 +327,7 @@ struct Worker[dispatch: DispatchFn](Movable):
         _ = self._requested.pop(f.object_id, False)
         if f.kind == KIND_RESULT:
             var obj = f.object_id
+            self._fetched[obj] = True
             self._objects[obj] = f^.take_payload()
         else:
             self._lost[f.object_id] = String(unsafe_from_utf8=f.payload)
@@ -364,6 +379,19 @@ struct Worker[dispatch: DispatchFn](Movable):
                         )
                 self._ready.append(_Ready(p.object_id, p.task_id, args^))
         self._parked = still^
+        # Fetched copies nothing parked still waits on have done their job.
+        var done = List[UInt64]()
+        for entry in self._fetched.items():
+            var wanted = False
+            for ref p in self._parked:
+                for ref inp in p.inputs:
+                    if inp.object_id == entry.key:
+                        wanted = True
+            if not wanted:
+                done.append(entry.key)
+        for obj in done:
+            _ = self._fetched.pop(obj, False)
+            _ = self._objects.pop(obj, List[UInt8]())
 
     def _report_error(mut self, obj: UInt64, msg: String):
         try:

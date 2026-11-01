@@ -41,7 +41,9 @@ from dista.frame import (
     KIND_FETCH,
     KIND_HELLO,
     KIND_LOCATED,
+    KIND_RELEASE,
     KIND_RESULT,
+    KIND_STATS,
     KIND_TASK,
     KIND_TASK_AFTER,
     KIND_WELCOME,
@@ -77,6 +79,21 @@ struct ObjectRef[T: AnyType](ImplicitlyCopyable, Movable, Writable):
 
     def write_to(self, mut writer: Some[Writer]):
         writer.write("ObjectRef(", self.id, ")")
+
+
+@fieldwise_init
+struct HeadStats(Copyable, Movable, Writable):
+    """What the head holds, from `Runtime.stats`."""
+
+    var objects: Int
+    """Objects with a live reference: unreleased, or an input still pending."""
+    var results: Int
+    """Small results kept at the head."""
+    var errors: Int
+    var located: Int
+    """Results the head knows live on a worker."""
+    var pending: Int
+    """Tasks queued or waiting on inputs."""
 
 
 def parse_host_port(addr: String) raises -> Tuple[String, Int]:
@@ -121,6 +138,8 @@ struct Runtime[*Ts: TaskLike](Movable):
     var _fetchers: List[Stream]
     var _socket_bytes: Int
     var _fetcher_index: Dict[String, Int]
+    var _released: Dict[UInt64, Bool]
+    var _stats: Optional[HeadStats]
 
     def __init__(out self, workers: Int = 4, pipeline: Int = 2) raises:
         """Starts this process in the role its environment names.
@@ -195,6 +214,8 @@ struct Runtime[*Ts: TaskLike](Movable):
         self._fetchers = List[Stream]()
         self._socket_bytes = 0
         self._fetcher_index = Dict[String, Int]()
+        self._released = Dict[UInt64, Bool]()
+        self._stats = None
 
     def __deinit__(deinit self):
         # In local mode the head exits once its only driver leaves, and closes
@@ -344,6 +365,12 @@ struct Runtime[*Ts: TaskLike](Movable):
             self._errors[frame.object_id] = String(
                 unsafe_from_utf8=frame.payload
             )
+        elif frame.kind == KIND_STATS:
+            var pos = 0
+            var n = List[Int]()
+            for _ in range(5):
+                n.append(Int(get_scalar[DType.uint64](frame.payload, pos)))
+            self._stats = HeadStats(n[0], n[1], n[2], n[3], n[4])
         else:
             raise Error("driver got frame kind ", Int(frame.kind))
 
@@ -357,6 +384,8 @@ struct Runtime[*Ts: TaskLike](Movable):
 
     def get[R: Movable](mut self, r: ObjectRef[R]) raises -> R:
         """Waits for `r`'s task and returns its result, or raises its error."""
+        if r.id in self._released:
+            raise Error(r, " was released")
         while not self._settled(r.id):
             self._read_one()
         if r.id in self._errors:
@@ -372,6 +401,36 @@ struct Runtime[*Ts: TaskLike](Movable):
                 return decode[R](m.bytes()[: loc.size], pos)
             self._fetch(r.id, loc)
         return decode[R](self._results[r.id], pos)
+
+    def release[R: AnyType](mut self, r: ObjectRef[R]) raises:
+        """Says this driver is done with `r`.
+
+        The result is freed, here, at the head and on its worker, once no
+        submitted task still needs it; a task already given `r` as input
+        still gets it. Releasing before the task has finished is fine: the
+        result is dropped when it arrives. `get(r)` raises from now on, and a
+        task submitted on `r` afterwards fails.
+        """
+        if r.id in self._released:
+            return
+        self._released[r.id] = True
+        _ = self._results.pop(r.id, List[UInt8]())
+        _ = self._errors.pop(r.id, String())
+        _ = self._located.pop(r.id, List[UInt8]())
+        write_frame(self._head, KIND_RELEASE, r.id, 0, List[UInt8]())
+
+    def release[R: AnyType](mut self, refs: List[ObjectRef[R]]) raises:
+        """Releases every ref in `refs`."""
+        for r in refs:
+            self.release(r)
+
+    def stats(mut self) raises -> HeadStats:
+        """Asks the head what it holds. Frames that arrive first are kept."""
+        self._stats = None
+        write_frame(self._head, KIND_STATS, 0, 0, List[UInt8]())
+        while not self._stats:
+            self._read_one()
+        return self._stats.value().copy()
 
     def bytes_fetched(self) -> Int:
         """How many result bytes this driver has fetched over sockets."""
