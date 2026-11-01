@@ -13,17 +13,23 @@ WORKDIR /src/dista.mojo
 RUN pixi install --locked -e data
 RUN mkdir -p /out && pixi run -e data bash -c \
     'mojo build -I src $DEP_INC deploy/taxi.mojo -o /out/dista'
-# The binary links the Mojo runtime, and dlopens the codec, object-store and
-# SQL shims from $CONDA_PREFIX/lib at run time. Take those, and what they
-# link, out of the pixi environment.
+# The binary links the Mojo runtime, and dlopens the codec and object-store
+# shims from $CONDA_PREFIX/lib at run time. Take those, and what they link,
+# out of the pixi environment, stripped. The SQL shims' libraries (libpq,
+# libsqlite) stay behind: the taxi gate reads table metadata straight from its
+# file and never opens a SQL catalog, and libpq alone brought ICU's i18n
+# library and most of the image's size with it.
 RUN set -e; env=/src/dista.mojo/.pixi/envs/data; mkdir -p /out/lib; \
-    roots="/out/dista $(ls $env/lib/lib*mojo*.so $env/lib/libsqlite3.so* $env/lib/libpq.so* 2>/dev/null)"; \
+    roots="/out/dista $(ls $env/lib/lib*mojo*.so)"; \
     for f in $roots; do \
         case "$f" in /out/*) ;; *) cp -L "$f" /out/lib/ ;; esac; \
         ldd "$f" | awk '/=> \// {print $3}' | grep "^$env" | xargs -r cp -L -t /out/lib; \
-    done
+    done; \
+    strip --strip-unneeded /out/dista /out/lib/*
 
-FROM debian:bookworm-slim
+# distroless's cc image is glibc and little else: no shell, no package
+# manager. The libraries above bring their own libstdc++, newer than Debian's.
+FROM gcr.io/distroless/cc-debian12@sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa
 COPY --from=build /out/lib /opt/dista/lib
 COPY --from=build /out/dista /opt/dista/bin/dista
 # conda's libcurl looks for its CA bundle at the path its environment was
