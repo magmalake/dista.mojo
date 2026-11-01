@@ -29,8 +29,10 @@
 //! does. S3 is configured from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 //! `AWS_SESSION_TOKEN`, `AWS_REGION` (or `AWS_DEFAULT_REGION`) and
 //! `AWS_ENDPOINT_URL` (a custom endpoint, path style, for MinIO).
-//! `TAXI_THREADS=1` runs each process on a single-threaded runtime with every
-//! iceberg-rust concurrency limit at 1. `TAXI_PASSES` (default 1) runs each
+//! `TAXI_THREADS=1` runs each process on a single-threaded runtime, with
+//! iceberg-rust's concurrency limits at `TAXI_FILES_AT_ONCE` (default 8):
+//! one thread, with that many files' and manifests' reads in flight, which
+//! is the best one thread does on object storage. `TAXI_PASSES` (default 1) runs each
 //! query's distributed part that many times, printing `TIME <query> <pass>
 //! <ms>` after each; pass 1 is checked against one process, later passes
 //! against pass 1.
@@ -232,6 +234,15 @@ fn single_threaded() -> bool {
     env::var("TAXI_THREADS").map(|v| v == "1").unwrap_or(false)
 }
 
+/// Files (and manifests) read at once on a single-threaded runtime.
+fn files_at_once() -> usize {
+    env::var("TAXI_FILES_AT_ONCE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(8)
+}
+
 /// A FileIO for `file://` and `s3://`, with S3 configured from the `AWS_*`
 /// environment.
 fn file_io() -> FileIO {
@@ -275,7 +286,7 @@ fn build_scan(table: &Table, q: &Query) -> R<TableScan> {
         b.select(q.columns.iter().copied())
     };
     if single_threaded() {
-        b = b.with_concurrency_limit(1);
+        b = b.with_concurrency_limit(files_at_once());
     }
     Ok(b.build()?)
 }
@@ -296,7 +307,7 @@ fn shippable(mut t: FileScanTask) -> FileScanTask {
 fn reader(file_io: &FileIO) -> ArrowReaderBuilder {
     let mut reader = ArrowReaderBuilder::new(file_io.clone(), Runtime::current());
     if single_threaded() {
-        reader = reader.with_data_file_concurrency_limit(1);
+        reader = reader.with_data_file_concurrency_limit(files_at_once());
     }
     reader
 }

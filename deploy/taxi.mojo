@@ -23,6 +23,8 @@ nodes too.
                     in Chrome's trace format, before exiting
     TAXI_THREADS    threads for the one-process scan (iceberg's `num_workers`);
                     unset, one per core
+    TAXI_FILES_AT_ONCE  files a one-thread scan reads together (default 8),
+                    as the Rust and Ray references read them
     TAXI_MODE       `both` (default), `distributed` (no one-process scan: the
                     passes are checked against each other) or `local` (only
                     the one-process scan, no workers)
@@ -430,6 +432,7 @@ def _local_options() raises -> ScanOptions:
     references read it; unset, one per core."""
     var opts = ScanOptions()
     opts.num_workers = Int(getenv("TAXI_THREADS", "0"))
+    opts.files_at_once = Int(getenv("TAXI_FILES_AT_ONCE", "8"))
     return opts^
 
 
