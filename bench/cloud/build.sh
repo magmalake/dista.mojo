@@ -3,7 +3,9 @@
 # loads them into every node's k3s. Each build starts from an empty Docker
 # cache, base images included, so the times are what a fresh machine pays.
 #
-#   bench/cloud/build.sh [dista|ray|rust ...]   (default: all three)
+#   bench/cloud/build.sh [dista|ray|rust ...]        build (default: all three)
+#   bench/cloud/build.sh load [dista|ray|rust ...]   load the images built
+#                                                    earlier into every node
 #
 # What gets built is pinned: dista.mojo at this checkout's commit, which must
 # be committed and pushed, and its siblings at the commits in revs.txt. The
@@ -28,7 +30,28 @@ head=$(aws ec2 describe-instances \
   --filters "Name=tag:dista-bench,Values=head" "Name=instance-state-name,Values=running" \
   --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
 on_head() { ssh "${ssh_opts[@]}" "ubuntu@$head" "$@"; }
+load_only=0
+if [ "${1:-}" = load ]; then load_only=1; shift; fi
 images="${*:-dista ray rust}"
+
+# Loads image $1 (a tar on the head node) into the head's and every worker's
+# k3s.
+load_image() {
+  on_head "sudo k3s ctr images import images/$1.tar >/dev/null"
+  for ip in $(kubectl get nodes -l dista-bench/role=worker \
+      -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'); do
+    on_head "ssh -o StrictHostKeyChecking=no -o LogLevel=ERROR ubuntu@$ip 'sudo k3s ctr images import -' < images/$1.tar >/dev/null" &
+  done
+  wait
+}
+
+if [ $load_only = 1 ]; then
+  for image in $images; do
+    echo "== loading $image into every node"
+    load_image "$image"
+  done
+  exit 0
+fi
 
 dista_rev=$(git rev-parse HEAD)
 if ! git diff --quiet HEAD -- . ":(exclude)bench/cloud/results"; then
@@ -93,19 +116,16 @@ for image in $images; do
   deps_s=$(step_s "$deps" "$log")
   compile_s=-
   [ -n "$compile" ] && compile_s=$(step_s "$compile" "$log")
-  # The image as an uncompressed tar: with BuildKit's image store, `docker
-  # image inspect` reports the compressed size instead.
-  disk=$(on_head "docker save $tagname | wc -c")
+  # The image's files, unpacked: with BuildKit's image store both `docker
+  # image inspect` and `docker save` give compressed layer sizes instead.
+  disk=$(on_head "c=\$(docker create $tagname) && docker export \$c | wc -c && docker rm \$c >/dev/null")
   gz=$(on_head "docker save $tagname | gzip -1 | wc -c")
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$image" "$total" "$deps_s" "$compile_s" \
     "$((disk / 1000000))" "$((gz / 1000000))" "$instance" | tee -a "$out"
 
+  # Kept as a file: the next build's cold start prunes every image.
+  on_head "mkdir -p images && docker save $tagname -o images/$image.tar"
   echo "== loading $tagname into every node"
-  on_head "docker save $tagname | sudo k3s ctr images import - >/dev/null"
-  for ip in $(kubectl get nodes -l dista-bench/role=worker \
-      -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'); do
-    on_head "docker save $tagname | ssh -o StrictHostKeyChecking=no -o LogLevel=ERROR ubuntu@$ip 'sudo k3s ctr images import - >/dev/null'" &
-  done
-  wait
+  load_image "$image"
 done
 column -t -s $'\t' "$out"

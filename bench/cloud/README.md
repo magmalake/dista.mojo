@@ -37,11 +37,18 @@ manifest. On kind every task re-planned, which was cheap with local files.
 On S3, with 168 manifests, it would be a request per manifest per task, and
 that would swamp everything else.
 
-**Repetitions.** Every query runs `PASSES` times (default 5) on each
-framework and node count. The tables report each query's median, and the
-median and slowest of the per-pass totals. Pass 1 is checked against a scan
-in one process on the head node; later passes are checked against pass 1.
-Ray's pass 1 includes starting its worker processes.
+**Repetitions and checking.** Every query runs `PASSES` times (default 5)
+on each framework and node count. The tables report each query's median,
+and the median and slowest of the per-pass totals. Ray's pass 1 includes
+starting its worker processes. Correctness comes from reference runs: before
+any workers exist, each framework scans the whole table in one process on
+the head node (`run.sh local`). That takes from minutes for dista to most of
+an hour for Rust and Ray, too long to repeat in every run. Every run prints
+each query's answer, and summarize.py checks it against the references: row
+counts exactly, sums to 1e-6 relative. The three references must also agree
+with each other. Summing 1.4 billion doubles in a different order moves a
+sum by about 1e-9 relative, so 1e-9 was too tight. Within a run, later passes
+are checked against pass 1.
 
 **Building.** [build.sh](build.sh) builds each image on the head node from
 an empty Docker cache, base images included, and records the whole build,
@@ -63,8 +70,10 @@ of spot instances with `SPOT=1`.
 ```sh
 bench/cloud/aws.sh up 0              # the head node alone: ~3 minutes
 bench/cloud/data.sh load             # the table, once: it stays in S3
+bench/cloud/build.sh                 # timed builds, on the head node alone
+bench/cloud/run.sh local             # the one-process references, ~1-2 hours
 bench/cloud/aws.sh up 12             # add the workers
-bench/cloud/build.sh                 # timed builds, loaded into every node
+bench/cloud/build.sh load            # the same images, onto the workers
 bench/cloud/run.sh                   # 3 x 3 runs, 5 passes each
 bench/cloud/aws.sh down              # terminate everything but the bucket
 ```

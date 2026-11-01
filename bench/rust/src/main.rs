@@ -34,6 +34,13 @@
 //! query's distributed part that many times, printing `TIME <query> <pass>
 //! <ms>` after each; pass 1 is checked against one process, later passes
 //! against pass 1.
+//!
+//! `TAXI_MODE` picks what runs: `both` (the default) as above; `distributed`
+//! skips the one-process scan, so pass 1 goes unchecked here and later
+//! passes are checked against it; `local` runs only the one-process scan and
+//! needs no workers. Each query's first answer is printed as `ANSWER <query>
+//! <rows> <sum_a> <sum_b> <zones_total>`, so runs can be checked against each
+//! other afterwards.
 
 mod filter;
 
@@ -466,8 +473,24 @@ async fn run_tasks(
     Ok(out)
 }
 
+// Relative 1e-6: summing ~1.4e9 doubles in different orders differs by
+// about 1e-9 relative (on AWS, q3 came to 7104909931.26 one way and
+// 7104909941.44 the other).
 fn close(a: f64, b: f64) -> bool {
-    (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0)
+    (a - b).abs() <= 1e-6 * a.abs().max(b.abs()).max(1.0)
+}
+
+fn answer(name: &str, p: &Partial) {
+    let zones: f64 = p.zones.iter().sum();
+    println!("ANSWER {} {} {:?} {:?} {:?}", name, p.rows, p.sum_a, p.sum_b, zones);
+}
+
+fn mode() -> R<String> {
+    let m = env::var("TAXI_MODE").unwrap_or_else(|_| "both".into());
+    match m.as_str() {
+        "both" | "distributed" | "local" => Ok(m),
+        _ => Err(format!("TAXI_MODE must be both, distributed or local, got {m}").into()),
+    }
 }
 
 fn check(name: &str, got: &Partial, want: &Partial) -> R<()> {
@@ -520,6 +543,9 @@ fn spawn_local_workers() -> R<Vec<std::process::Child>> {
 }
 
 async fn driver() -> R<()> {
+    if mode()? == "local" {
+        return drive_local().await;
+    }
     let mut kids = Vec::new();
     if env::var("TAXI_WORKERS").is_err() {
         kids = spawn_local_workers()?;
@@ -531,7 +557,27 @@ async fn driver() -> R<()> {
     result
 }
 
+/// `TAXI_MODE=local`: the one-process scans alone, with no workers.
+async fn drive_local() -> R<()> {
+    let table = open_table().await?;
+    let mut total_local = 0u128;
+    for q in QUERIES.iter() {
+        let t1 = Instant::now();
+        let want = local_fold(&table, q).await?;
+        let local = t1.elapsed().as_millis();
+        total_local += local;
+        answer(q.name, &want);
+        println!(
+            "{} : {} rows, sum {} | distributed -, one process {} ms",
+            q.name, want.rows, want.sum_a, local
+        );
+    }
+    println!("PASS rust taxi: 8 queries in one process; one process {total_local} ms");
+    Ok(())
+}
+
 async fn drive() -> R<()> {
+    let check_local = mode()? == "both";
     let mut conns = connect_all().await?;
     let table = open_table().await?;
     let passes: usize = env::var("TAXI_PASSES")
@@ -564,14 +610,20 @@ async fn drive() -> R<()> {
             }
         }
         let (got, n_files, dist) = first.unwrap();
-        let t1 = Instant::now();
-        let want = local_fold(&table, q).await?;
-        let local = t1.elapsed().as_millis();
-        check(q.name, &got, &want)?;
         total_dist += dist;
-        total_local += local;
+        let local = if check_local {
+            let t1 = Instant::now();
+            let want = local_fold(&table, q).await?;
+            let local = t1.elapsed().as_millis();
+            check(q.name, &got, &want)?;
+            total_local += local;
+            format!("{local} ms")
+        } else {
+            "-".to_string()
+        };
+        answer(q.name, &got);
         println!(
-            "{} : {} files, {} rows, sum {} | distributed {} ms, one process {} ms",
+            "{} : {} files, {} rows, sum {} | distributed {} ms, one process {}",
             q.name, n_files, got.rows, got.sum_a, dist, local
         );
     }
@@ -592,7 +644,19 @@ async fn drive() -> R<()> {
             fold(&mut got, q, &b?)?;
         }
     }
-    let want = local_fold(&table, q).await?;
+    // Without the one-process scan, the batches are checked against the
+    // folded answer the distributed q2 gave.
+    let want = if check_local {
+        local_fold(&table, q).await?
+    } else {
+        let scan = build_scan(&table, q)?;
+        let tasks: Vec<FileScanTask> = plan(&scan).await?.into_iter().map(shippable).collect();
+        let mut p = Partial::zero();
+        for reply in run_tasks(&mut conns, 1, tasks, false).await? {
+            p.add(&serde_json::from_slice(&reply)?);
+        }
+        p
+    };
     check("q2_as_batches", &got, &want)?;
     println!(
         "q2_as_batches : {} rows as Arrow, {} bytes over sockets, {} ms",
@@ -609,9 +673,15 @@ async fn drive() -> R<()> {
     if nodes.len() < expect {
         return Err(format!("expected {expect} nodes, saw {}", nodes.len()).into());
     }
-    println!(
-        "PASS rust taxi: 8 queries + 1 as batches, distributed == one process; distributed {total_dist} ms, one process {total_local} ms"
-    );
+    if check_local {
+        println!(
+            "PASS rust taxi: 8 queries + 1 as batches, distributed == one process; distributed {total_dist} ms, one process {total_local} ms"
+        );
+    } else {
+        println!(
+            "PASS rust taxi: 8 queries + 1 as batches, distributed passes agree; distributed {total_dist} ms"
+        );
+    }
     Ok(())
 }
 

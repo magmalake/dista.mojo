@@ -14,6 +14,12 @@ a manifest. The driver adds the partial states together.
     TAXI_PASSES     distributed runs of each query (default 1); the first is
                     checked against one process, the rest against the first,
                     and each prints `TIME <query> <pass> <ms>`
+    TAXI_MODE       `both` (default), `distributed` (no one-process scan: the
+                    passes are checked against each other) or `local` (only
+                    the one-process scan, no Ray cluster)
+
+Each query's answer prints as `ANSWER <query> <rows> <sum_a> <sum_b>
+<zones_total>`, the same line deploy/taxi.mojo prints.
     TAXI_THREADS    pyarrow's CPU and I/O threads per process; unset = pyarrow's default
     RAY_ADDRESS     the cluster; unset = a local Ray started here
 """
@@ -105,7 +111,9 @@ def read_file(metadata, name, task):
 
 
 def _close(a, b):
-    return abs(a - b) <= 1e-9 * max(abs(a), abs(b), 1.0)
+    # Relative 1e-6: summing 1.4 billion doubles in another order moves the
+    # answer by about 1e-9 relative, so a tighter bound fails correct answers.
+    return abs(a - b) <= 1e-6 * max(abs(a), abs(b), 1.0)
 
 
 def _check(name, got, want):
@@ -133,12 +141,45 @@ def _distributed(table, metadata, q, nodes):
     return got, len(tasks)
 
 
+def _local(table, q):
+    """Query `q` scanned in this process; the answer and its milliseconds."""
+    t = time.monotonic()
+    want = q.init()
+    for batch in _scan(table, q).to_arrow_batch_reader():
+        want = q.fold(want, batch)
+    return want, (time.monotonic() - t) * 1000
+
+
+def _answer(name, state):
+    """The ANSWER line deploy/taxi.mojo prints, from taxibench's fold state."""
+    a = state.get("sum", state.get("tip", 0.0))
+    b = state.get("fare", 0.0)
+    zones = float(sum(state.get("acc", [])))
+    print(f"ANSWER {name} {state['n']} {a!r} {float(b)!r} {zones!r}", flush=True)
+
+
+def _local_only(table):
+    total = 0.0
+    for q in queries.ALL:
+        want, ms = _local(table, q)
+        _answer(q.name, want)
+        total += ms
+        print(f"{q.name} : {want['n']} rows, sum {want.get('sum', 0.0)}"
+              f" | distributed - , one process {ms:.0f} ms", flush=True)
+    print(f"PASS ray taxi: 8 queries in one process; one process {total:.0f} ms")
+
+
 def main():
     _threads()
-    ray.init(address=os.environ.get("RAY_ADDRESS"), logging_level="warning")
+    mode = os.environ.get("TAXI_MODE", "both")
     metadata = os.environ["TAXI_METADATA"]
-    passes = int(os.environ.get("TAXI_PASSES", "1"))
     table = _table(metadata)
+    if mode == "local":
+        return _local_only(table)
+    if mode not in ("both", "distributed"):
+        raise SystemExit(f"TAXI_MODE must be both, distributed or local, got {mode}")
+    ray.init(address=os.environ.get("RAY_ADDRESS"), logging_level="warning")
+    passes = int(os.environ.get("TAXI_PASSES", "1"))
     nodes = set()
     total_dist = total_local = 0.0
     for q in queries.ALL:
@@ -146,23 +187,22 @@ def main():
         got, n_files = _distributed(table, metadata, q, nodes)
         dist_ms = (time.monotonic() - t0) * 1000
         print(f"TIME {q.name} 1 {dist_ms:.0f}", flush=True)
-
-        t1 = time.monotonic()
-        want = q.init()
-        for batch in _scan(table, q).to_arrow_batch_reader():
-            want = q.fold(want, batch)
-        local_ms = (time.monotonic() - t1) * 1000
-        _check(q.name, got, want)
+        local = "-"
+        if mode == "both":
+            want, local_ms = _local(table, q)
+            _check(q.name, got, want)
+            total_local += local_ms
+            local = f"{local_ms:.0f}"
+        _answer(q.name, got)
         for k in range(2, passes + 1):
             t = time.monotonic()
             again, _ = _distributed(table, metadata, q, nodes)
             print(f"TIME {q.name} {k} {(time.monotonic() - t) * 1000:.0f}", flush=True)
             _check(q.name, again, got)
         total_dist += dist_ms
-        total_local += local_ms
         print(
             f"{q.name} : {n_files} files, {got['n']} rows, sum {got.get('sum', 0.0)}"
-            f" | distributed {dist_ms:.0f} ms, one process {local_ms:.0f} ms",
+            f" | distributed {dist_ms:.0f} ms, one process {local} ms",
             flush=True,
         )
 
@@ -173,9 +213,7 @@ def main():
     for t in ray.get([read_file.remote(metadata, q.name, task) for task in tasks]):
         for batch in t.to_batches():
             got = q.fold(got, batch)
-    want = q.init()
-    for batch in _scan(table, q).to_arrow_batch_reader():
-        want = q.fold(want, batch)
+    want, _ = _local(table, q)
     _check("q2_as_batches", got, want)
     print(f"q2_as_batches : {got['n']} rows as Arrow, {(time.monotonic() - t2) * 1000:.0f} ms")
 
@@ -183,10 +221,16 @@ def main():
     expect = int(os.environ.get("DISTA_EXPECT_NODES", "1"))
     if len(nodes) < expect:
         raise SystemExit(f"expected {expect} nodes, saw {len(nodes)}")
-    print(
-        f"PASS ray taxi: 8 queries + 1 as batches, distributed == one process;"
-        f" distributed {total_dist:.0f} ms, one process {total_local:.0f} ms"
-    )
+    if mode == "both":
+        print(
+            f"PASS ray taxi: 8 queries + 1 as batches, distributed == one process;"
+            f" distributed {total_dist:.0f} ms, one process {total_local:.0f} ms"
+        )
+    else:
+        print(
+            f"PASS ray taxi: 8 queries + 1 as batches, distributed passes agree;"
+            f" distributed {total_dist:.0f} ms"
+        )
 
 
 if __name__ == "__main__":

@@ -112,5 +112,6 @@ spec:
             - {name: TAXI_METADATA, value: "@TAXI_METADATA@"}
             - {name: TAXI_THREADS, value: "1"}
             - {name: TAXI_PASSES, value: "@PASSES@"}
+            - {name: TAXI_MODE, value: distributed}
           volumeMounts:
             - {name: shm, mountPath: /dev/shm}

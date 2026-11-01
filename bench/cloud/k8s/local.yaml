@@ -1,0 +1,26 @@
+# One framework's one-process reference run on the head node: the driver
+# alone, TAXI_MODE=local, no head service and no workers. bench/cloud/run.sh
+# local fills in the @...@ values.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: taxi
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {app: @APP@, role: driver}
+    spec:
+      restartPolicy: Never
+      nodeSelector: {dista-bench/role: head}
+      containers:
+        - name: driver
+          image: @IMAGE@
+          imagePullPolicy: Never
+          command: @COMMAND@
+          envFrom:
+            - secretRef: {name: aws}
+          env:
+            - {name: TAXI_MODE, value: local}
+            - {name: TAXI_THREADS, value: "1"}
+            - {name: TAXI_METADATA, value: "@TAXI_METADATA@"}
