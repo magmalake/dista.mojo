@@ -1,0 +1,74 @@
+results: bench/cloud/results/matrix-2026-11-01-2
+== up 12 17:19:25
+launching the head (c7g.4xlarge)
+launching 12 workers (c7g.4xlarge)
+waiting for the head's API
+waiting for 12 workers to join
+NAME               STATUS   ROLES                  AGE   VERSION         ROLE     RANK
+ip-172-31-0-167    Ready    <none>                 12s   v1.33.13+k3s2   worker   0
+ip-172-31-1-76     Ready    <none>                 13s   v1.33.13+k3s2   worker   1
+ip-172-31-10-250   Ready    <none>                 18s   v1.33.13+k3s2   worker   2
+ip-172-31-10-77    Ready    <none>                 13s   v1.33.13+k3s2   worker   3
+ip-172-31-12-225   Ready    <none>                 14s   v1.33.13+k3s2   worker   4
+ip-172-31-15-7     Ready    <none>                 15s   v1.33.13+k3s2   worker   5
+ip-172-31-3-239    Ready    <none>                 11s   v1.33.13+k3s2   worker   6
+ip-172-31-3-66     Ready    <none>                 18s   v1.33.13+k3s2   worker   7
+ip-172-31-5-5      Ready    <none>                 12s   v1.33.13+k3s2   worker   8
+ip-172-31-7-114    Ready    <none>                 11s   v1.33.13+k3s2   worker   9
+ip-172-31-7-82     Ready    control-plane,master   21s   v1.33.13+k3s2   head     
+ip-172-31-8-114    Ready    <none>                 16s   v1.33.13+k3s2   worker   10
+ip-172-31-8-132    Ready    <none>                 11s   v1.33.13+k3s2   worker   11
+KUBECONFIG=build/cloud/kubeconfig
+== build 17:20:57
+== building dista:taxi on c7g.4xlarge
+dista	124	35.1	58.7	93	32	c7g.4xlarge
+== loading dista:taxi into every node
+== building dista-ray:taxi on c7g.4xlarge
+ray	46	18.8	-	607	204	c7g.4xlarge
+== loading dista-ray:taxi into every node
+== building dista-rust:taxi on c7g.4xlarge
+rust	185	102.5	64.1	132	41	c7g.4xlarge
+== loading dista-rust:taxi into every node
+image  total_s  deps_s  compile_s  disk_mb  gzip_mb  instance
+dista  124      35.1    58.7       93       32       c7g.4xlarge
+ray    46       18.8    -          607      204      c7g.4xlarge
+rust   185      102.5   64.1       132      41       c7g.4xlarge
+== run 17:28:19
+== dista on 12 nodes, 16 slots each
+tasks ran on 12 nodes: ip-172-31-10-77 ip-172-31-10-250 ip-172-31-7-114 ip-172-31-0-167 ip-172-31-3-239 ip-172-31-12-225 ip-172-31-15-7 ip-172-31-8-114 ip-172-31-3-66 ip-172-31-5-5 ip-172-31-1-76 ip-172-31-8-132
+PASS taxi: 8 queries + 1 as batches, distributed passes agree; distributed 5164 ms
+== rust on 12 nodes, 16 slots each
+tasks ran on 12 nodes: ip-172-31-15-7 ip-172-31-0-167 ip-172-31-5-5 ip-172-31-10-77 ip-172-31-1-76 ip-172-31-7-114 ip-172-31-8-114 ip-172-31-12-225 ip-172-31-8-132 ip-172-31-3-66 ip-172-31-3-239 ip-172-31-10-250
+PASS rust taxi: 8 queries + 1 as batches, distributed passes agree; distributed 8911 ms
+== ray on 12 nodes, 16 slots each
+tasks ran on 12 nodes: ip-172-31-0-167 ip-172-31-1-76 ip-172-31-10-250 ip-172-31-10-77 ip-172-31-12-225 ip-172-31-15-7 ip-172-31-3-239 ip-172-31-3-66 ip-172-31-5-5 ip-172-31-7-114 ip-172-31-8-114 ip-172-31-8-132
+PASS ray taxi: 8 queries + 1 as batches, distributed passes agree; distributed 17976 ms
+## Distributed, median of passes (ms)
+
+| query | dista ×12 | rust ×12 | ray ×12 |
+|---|---:|---:|---:|
+| q1_scan_count | 520 | 634 | 1,253 |
+| q2_month_range | 114 | 435 | 421 |
+| q3_payment_sum | 497 | 980 | 1,440 |
+| q4_tip_ratio | 620 | 987 | 1,608 |
+| q5_top_zones | 597 | 994 | 1,511 |
+| q6_zone_revenue | 181 | 473 | 496 |
+| q7_wide | 954 | 1,070 | 1,173 |
+| q8_selective | 718 | 1,057 | 1,906 |
+| total, median pass | **4,446** | **6,745** | **9,955** |
+| total, slowest pass | 5,164 | 8,911 | 17,976 |
+| answers match the reference | no reference | no reference | no reference |
+
+Slots per node: 16. Passes: 5.
+
+## Building the images
+
+| image | whole build (s) | dependencies (s) | compile (s) | unpacked (MB) | gzip (MB) | built on |
+|---|---:|---:|---:|---:|---:|---|
+| dista | 124 | 35.1 | 58.7 | 93 | 32 | c7g.4xlarge |
+| ray | 46 | 18.8 | - | 607 | 204 | c7g.4xlarge |
+| rust | 185 | 102.5 | 64.1 | 132 | 41 | c7g.4xlarge |
+
+== done 17:31:35
+== teardown 17:31:35
+terminated; the bucket stays (bench/cloud/data.sh drop removes it)

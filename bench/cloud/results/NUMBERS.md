@@ -88,6 +88,21 @@ identical across the nine runs (three frameworks × three node counts).
   reads them again for every query. That is the next limit.
 - Ray is slower on 12 nodes (15.7 s) than on 6 (12.7 s).
 
+## 2c. 12 nodes with the manifest cache
+
+`matrix-2026-11-01-2/`, 5 passes, after the driver kept one `ManifestCache`
+across its queries (iceberg#58, dista#46). Planning a query: 18 ms median
+(the first one, which reads the 168 manifests, 351 ms), against 310 ms
+before. Counts identical across the three frameworks.
+
+| total, median pass (ms) | dista | rust | ray |
+|---|---:|---:|---:|
+| 12 nodes, before (`matrix-2026-11-01`) | 5,941 | 6,682 | 15,703 |
+| **12 nodes, with the cache** | **4,446** | **6,745** | **9,955** |
+
+Nothing changed for Ray between the two runs; its 12-node result moved by
+37%, so Ray's 12-node numbers are noisy.
+
 ## 3. Distributed, 3 and 6 nodes, before the read path
 
 `2026-11/`, 5 passes. The 12-node dista run failed its answer check, fixed

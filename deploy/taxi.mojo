@@ -48,7 +48,7 @@ from iceberg import (
     TableMetadata,
     TableScan,
 )
-from iceberg.manifest import CONTENT_DATA
+from iceberg.manifest import CONTENT_DATA, ManifestCache
 from iceberg.catalog.filesystem import read_metadata_file
 
 from dista import ObjectRef, Runtime, Seq, Task
@@ -403,11 +403,14 @@ def _distributed(
     mut nodes: List[String],
     table: TableMetadata,
     reading: String,
+    mut manifests: ManifestCache,
 ) raises -> Tuple[Partial, Int]:
     """Query `q` as one task per planned file; the answer and how many files.
     `reading` is the table's metadata for reading, sent with each task."""
     var t = rt.clock()
-    var tasks = _scan(q, table.copy()).plan_files()
+    # One cache across every query: the table doesn't change, so after the
+    # first plan its manifests are never read again.
+    var tasks = _scan(q, table.copy()).plan_files_with(manifests)
     rt.span(String("plan ", q.name), t)
     t = rt.clock()
     var refs = List[ObjectRef[Partial]]()
@@ -486,13 +489,14 @@ def main() raises:
     var rt = Runtime[FoldFile, ReadFile](workers=4)
     var table = _table()
     var reading = table.for_reading().to_json()
+    var manifests = ManifestCache()
     var passes = Int(getenv("TAXI_PASSES", "1"))
     var nodes = List[String]()
     var total_dist = 0
     var total_local = 0
     for q in queries():
         var t0 = Int(perf_counter_ns())
-        var first = _distributed(rt, q, nodes, table, reading)
+        var first = _distributed(rt, q, nodes, table, reading, manifests)
         var dist_ms = _ms(t0)
         ref got = first[0]
         print("TIME", q.name, 1, dist_ms)
@@ -508,7 +512,7 @@ def main() raises:
         _answer(q.name, got)
         for k in range(2, passes + 1):
             var t = Int(perf_counter_ns())
-            var again = _distributed(rt, q, nodes, table, reading)
+            var again = _distributed(rt, q, nodes, table, reading, manifests)
             print("TIME", q.name, k, _ms(t))
             _check(q.name, again[0], got)
         total_dist += dist_ms
@@ -532,7 +536,7 @@ def main() raises:
     var t2 = Int(perf_counter_ns())
     var bt = rt.clock()
     var refs = List[ObjectRef[Seq[RecordBatch]]]()
-    for t in _scan(q, table.copy()).plan_files():
+    for t in _scan(q, table.copy()).plan_files_with(manifests):
         refs.append(
             rt.remote[ReadFile](FileQuery(q.copy(), PlannedFile.of(t), reading))
         )
