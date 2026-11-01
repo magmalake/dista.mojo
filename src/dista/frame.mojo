@@ -87,6 +87,9 @@ comptime KIND_ACTOR_KILL: UInt8 = 21
 comptime ADDR_SIZE = 12
 comptime ROLE_DRIVER: UInt8 = 1
 comptime ROLE_WORKER: UInt8 = 2
+comptime ROLE_CLIENT: UInt8 = 3
+"""A driver inside a worker, for a task that calls actors: the head treats
+it as a driver, except that it doesn't keep a local-mode head alive."""
 comptime HEADER = 17
 comptime MAX_FRAME = 1 << 30
 

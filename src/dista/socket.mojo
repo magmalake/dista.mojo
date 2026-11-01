@@ -519,3 +519,9 @@ def exit_now(code: Int):
     `main` or flushes the driver's buffered output a second time.
     """
     external_call["_exit", NoneType](c_int(code))
+
+
+def addr_key(ip: Array[UInt8, 4], port: Int) -> String:
+    return String(
+        Int(ip[0]), ".", Int(ip[1]), ".", Int(ip[2]), ".", Int(ip[3]), ":", port
+    )

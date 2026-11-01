@@ -33,6 +33,18 @@ See DESIGN.md for how it works.
 """
 
 from dista.codec import Codec, decode, encode
-from dista.runtime import ActorHandle, HeadStats, ObjectRef, Runtime, TaskSpan
+from dista.client import (
+    ActorHandle,
+    Client,
+    CtxMethod,
+    CtxMethodLike,
+    CtxTask,
+    CtxTaskLike,
+    HeadStats,
+    ObjectRef,
+    TaskContext,
+    TaskSpan,
+)
+from dista.runtime import Runtime
 from dista.seq import Seq
 from dista.task import Actor, ActorLike, Method, MethodLike, Task, TaskLike

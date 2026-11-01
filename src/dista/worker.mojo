@@ -52,6 +52,7 @@ from dista.frame import (
     Frame,
     encode_addr,
 )
+from dista.client import TaskContext
 from dista.task import StatePtr
 from dista.store import (
     Location,
@@ -69,6 +70,7 @@ from dista.socket import (
     POLLOUT,
     Listener,
     Stream,
+    addr_key,
     poll,
     resolve_ipv4,
     wall_ns,
@@ -77,25 +79,22 @@ from dista.socket import (
 comptime INLINE_LIMIT = 64 * 1024
 """Results up to this size travel through the head; larger ones stay put."""
 
-comptime DispatchFn = def(UInt64, List[UInt8], mut List[UInt8]) thin raises
-"""Runs task `task_id` on encoded arguments, appending the encoded result."""
+comptime DispatchFn = def(
+    UInt64, List[UInt8], mut List[UInt8], mut TaskContext
+) thin raises
+"""Runs task `task_id` on encoded arguments, appending the encoded result; a
+`CtxTask` gets the worker's `TaskContext`."""
 
 comptime CreateFn = def(UInt64, List[UInt8]) thin raises -> StatePtr
 """Builds actor type `type_id`'s state from its encoded argument."""
 
 comptime CallFn = def(
-    UInt64, UInt64, StatePtr, List[UInt8], mut List[UInt8]
+    UInt64, UInt64, StatePtr, List[UInt8], mut List[UInt8], mut TaskContext
 ) thin raises
 """Runs method `method_id` on the state of an actor of type `type_id`."""
 
 comptime DestroyFn = def(UInt64, StatePtr) thin
 """Destroys the state of an actor of type `type_id`."""
-
-
-def addr_key(ip: Array[UInt8, 4], port: Int) -> String:
-    return String(
-        Int(ip[0]), ".", Int(ip[1]), ".", Int(ip[2]), ".", Int(ip[3]), ":", port
-    )
 
 
 @fieldwise_init
@@ -253,9 +252,20 @@ struct Worker[
     """Its state, unless its constructor failed."""
     var _actor_error: String
     """Why its constructor failed."""
+    var _ctx: TaskContext
+    """The client a `CtxTask` calls actors through, opened on first use."""
 
-    def __init__(out self, var head: Stream, registry_hash: UInt64) raises:
-        """Starts the object server and says hello to the head on `head`."""
+    def __init__(
+        out self,
+        var head: Stream,
+        registry_hash: UInt64,
+        head_addr: String = "",
+        resume_at: String = "",
+    ) raises:
+        """Starts the object server and says hello to the head on `head`.
+
+        `head_addr` is where a task's client connects, and `resume_at` where
+        it reconnects after a head restart ("" in local mode)."""
         var listener = Listener(0, any_interface=True)
         var advertise = getenv("DISTA_ADVERTISE")
         var ip = resolve_ipv4(advertise) if advertise != "" else head.local_ip()
@@ -285,6 +295,7 @@ struct Worker[
         self._actor_type = 0
         self._state = None
         self._actor_error = String()
+        self._ctx = TaskContext(head_addr, resume_at, registry_hash)
 
     @staticmethod
     def _hello(
@@ -609,6 +620,7 @@ struct Worker[
                     self._state.value(),
                     List[UInt8](t.args[8:]),
                     out,
+                    self._ctx,
                 )
             except e:
                 self._span(t.object_id, t.arrived, started)
@@ -632,7 +644,7 @@ struct Worker[
         var out = List[UInt8]()
         var started = wall_ns()
         try:
-            Self.dispatch(t.task_id, t.args, out)
+            Self.dispatch(t.task_id, t.args, out, self._ctx)
         except e:
             self._span(t.object_id, t.arrived, started)
             self._report_error(t.object_id, String(e))
