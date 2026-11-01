@@ -17,6 +17,13 @@ nodes too.
     TAXI_PASSES     distributed runs of each query (default 1); the first is
                     checked against one process, the rest against the first,
                     and each prints `TIME <query> <pass> <ms>`
+    TAXI_MODE       `both` (default), `distributed` (no one-process scan: the
+                    passes are checked against each other) or `local` (only
+                    the one-process scan, no workers)
+
+Each query's answer prints as `ANSWER <query> <rows> <sum_a> <sum_b>
+<zones_total>`, so runs that skip the one-process scan can be checked
+against one that didn't, or against another framework.
 
 `tests/kind_taxi.sh` runs it on a 3-node kind cluster.
 """
@@ -330,8 +337,11 @@ def queries() -> List[Query]:
 
 
 def _close(a: Float64, b: Float64) -> Bool:
+    # Relative 1e-6: summing 1.4 billion doubles in another order moves the
+    # answer by about 1e-9 relative (q3 on AWS: 7104909931.26 vs
+    # 7104909941.44), so a tighter bound fails on correct answers.
     var scale = max(abs(a), abs(b), 1.0)
-    return abs(a - b) <= 1e-9 * scale
+    return abs(a - b) <= 1e-6 * scale
 
 
 def _check(name: String, got: Partial, want: Partial) raises:
@@ -379,7 +389,52 @@ def _distributed(
     return (got^, len(tasks))
 
 
+def _local(q: Query) raises -> Tuple[Partial, Int]:
+    """Query `q` scanned in this process; the answer and its milliseconds."""
+    var t = Int(perf_counter_ns())
+    var want = Partial.zero()
+    var reader = _scan(q).to_batch_reader()
+    while True:
+        var b = reader.next_batch()
+        if not b:
+            break
+        fold(want, q, b.value())
+    reader.raise_if_failed()
+    return (want^, _ms(t))
+
+
+def _answer(name: String, p: Partial):
+    var zones = 0.0
+    for i in range(ZONES):
+        zones += p.zones[i]
+    print("ANSWER", name, p.rows, p.sum_a, p.sum_b, zones)
+
+
+def _local_only() raises:
+    var total = 0
+    for q in queries():
+        var local = _local(q)
+        _answer(q.name, local[0])
+        total += local[1]
+        print(
+            q.name,
+            ":",
+            local[0].rows,
+            "rows, sum",
+            local[0].sum_a,
+            "| distributed - , one process",
+            local[1],
+            "ms",
+        )
+    print("PASS taxi: 8 queries in one process;", "one process", total, "ms")
+
+
 def main() raises:
+    var mode = getenv("TAXI_MODE", "both")
+    if mode == "local":
+        return _local_only()
+    if mode != "both" and mode != "distributed":
+        raise Error("TAXI_MODE must be both, distributed or local, got ", mode)
     var rt = Runtime[FoldFile, ReadFile](workers=4)
     var passes = Int(getenv("TAXI_PASSES", "1"))
     var nodes = List[String]()
@@ -392,24 +447,19 @@ def main() raises:
         ref got = first[0]
         print("TIME", q.name, 1, dist_ms)
 
-        var t1 = Int(perf_counter_ns())
-        var want = Partial.zero()
-        var reader = _scan(q).to_batch_reader()
-        while True:
-            var b = reader.next_batch()
-            if not b:
-                break
-            fold(want, q, b.value())
-        reader.raise_if_failed()
-        var local_ms = _ms(t1)
-        _check(q.name, got, want)
+        var local_ms = String("-")
+        if mode == "both":
+            var local = _local(q)
+            _check(q.name, got, local[0])
+            total_local += local[1]
+            local_ms = String(local[1])
+        _answer(q.name, got)
         for k in range(2, passes + 1):
             var t = Int(perf_counter_ns())
             var again = _distributed(rt, q, nodes)
             print("TIME", q.name, k, _ms(t))
             _check(q.name, again[0], got)
         total_dist += dist_ms
-        total_local += local_ms
         print(
             q.name,
             ":",
@@ -457,11 +507,19 @@ def main() raises:
     var expect = Int(getenv("DISTA_EXPECT_NODES", "1"))
     if len(nodes) < expect:
         raise Error("expected ", expect, " nodes, saw ", len(nodes))
-    print(
-        "PASS taxi: 8 queries + 1 as batches, distributed == one process;",
-        "distributed",
-        total_dist,
-        "ms, one process",
-        total_local,
-        "ms",
-    )
+    if mode == "both":
+        print(
+            "PASS taxi: 8 queries + 1 as batches, distributed == one process;",
+            "distributed",
+            total_dist,
+            "ms, one process",
+            total_local,
+            "ms",
+        )
+    else:
+        print(
+            "PASS taxi: 8 queries + 1 as batches, distributed passes agree;",
+            "distributed",
+            total_dist,
+            "ms",
+        )

@@ -98,3 +98,4 @@ spec:
             - {name: DISTA_EXPECT_NODES, value: "@NODES@"}
             - {name: TAXI_METADATA, value: "@TAXI_METADATA@"}
             - {name: TAXI_PASSES, value: "@PASSES@"}
+            - {name: TAXI_MODE, value: distributed}
