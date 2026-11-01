@@ -30,6 +30,10 @@ host it fetches it from that worker directly. A task can take
 another task's result: pass an `ObjectRef[A]` instead of an `A`, or a
 `List[ObjectRef[X]]` to a task that takes a `Seq[X]`. The head runs it once
 every input exists, and fails it if an input failed.
+
+`create` starts an actor on a worker of its own and returns its handle;
+`call` runs one of its methods there, in the order of the calls, and returns
+an `ObjectRef` like a task does; `kill` destroys it.
 """
 
 from std.os import getenv
@@ -38,6 +42,9 @@ from std.time import perf_counter_ns, sleep
 from dista.codec import decode, encode, get_scalar, put_scalar
 from dista.frame import (
     message,
+    KIND_ACTOR_CALL,
+    KIND_ACTOR_CREATE,
+    KIND_ACTOR_KILL,
     KIND_CLAIM,
     KIND_ERROR,
     KIND_FETCH,
@@ -67,7 +74,7 @@ from dista.socket import (
     poll_readable,
     wait_child,
 )
-from dista.task import TaskLike, fnv1a64
+from dista.task import ActorLike, MethodLike, StatePtr, TaskLike, fnv1a64
 from dista.store import Location
 from dista.worker import Worker, addr_key
 from memory_region import SharedMapping
@@ -85,6 +92,18 @@ struct ObjectRef[T: AnyType](ImplicitlyCopyable, Movable, Writable):
 
     def write_to(self, mut writer: Some[Writer]):
         writer.write("ObjectRef(", self.id, ")")
+
+
+struct ActorHandle[T: ActorLike](ImplicitlyCopyable, Movable, Writable):
+    """A handle to an actor of type `T`, from `Runtime.create`."""
+
+    var id: UInt64
+
+    def __init__(out self, id: UInt64):
+        self.id = id
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write("ActorHandle(", self.id, ")")
 
 
 @fieldwise_init
@@ -242,6 +261,10 @@ struct Runtime[*Ts: TaskLike](Movable):
     """Results claimed from a restarted head that hasn't said where yet."""
     var _spans: List[TaskSpan]
     var _timeline_answered: Bool
+    var _actors: Dict[UInt64, Bool]
+    """Actors this driver created and hasn't killed."""
+    var _lost_actors: Dict[UInt64, Bool]
+    """Actors a head restart took with it."""
 
     def __init__(out self, workers: Int = 4, pipeline: Int = 2) raises:
         """Starts this process in the role its environment names.
@@ -327,6 +350,8 @@ struct Runtime[*Ts: TaskLike](Movable):
         self._claimed = Dict[UInt64, Bool]()
         self._spans = List[TaskSpan]()
         self._timeline_answered = False
+        self._actors = Dict[UInt64, Bool]()
+        self._lost_actors = Dict[UInt64, Bool]()
 
     def __deinit__(deinit self):
         # In local mode the head exits once its only driver leaves, and closes
@@ -393,6 +418,39 @@ struct Runtime[*Ts: TaskLike](Movable):
         raise Error("unknown task ID ", task_id)
 
     @staticmethod
+    def _create(type_id: UInt64, args: List[UInt8]) raises -> StatePtr:
+        comptime for i in range(Self.Ts.length):
+            if Self.Ts[i].is_actor() and Self.Ts[i].id() == type_id:
+                return Self.Ts[i].create(args)
+        raise Error("unknown actor ID ", type_id)
+
+    @staticmethod
+    def _call(
+        method_id: UInt64,
+        type_id: UInt64,
+        state: StatePtr,
+        args: List[UInt8],
+        mut out: List[UInt8],
+    ) raises:
+        comptime for i in range(Self.Ts.length):
+            if Self.Ts[i].id() == method_id:
+                # The state is only valid as its own actor's type.
+                if Self.Ts[i].owner() != type_id:
+                    raise Error(
+                        Self.Ts[i].name(), " is not a method of this actor"
+                    )
+                Self.Ts[i].call(state, args, out)
+                return
+        raise Error("unknown method ID ", method_id)
+
+    @staticmethod
+    def _destroy(type_id: UInt64, state: StatePtr):
+        comptime for i in range(Self.Ts.length):
+            if Self.Ts[i].is_actor() and Self.Ts[i].id() == type_id:
+                Self.Ts[i].destroy(state)
+                return
+
+    @staticmethod
     def _dispatch_list(
         task_id: UInt64, args: List[UInt8], mut out: List[UInt8]
     ) raises:
@@ -406,7 +464,9 @@ struct Runtime[*Ts: TaskLike](Movable):
         (for up to `DISTA_CONNECT_TIMEOUT` seconds) and rejoins it with its
         results, so a restarted head picks up where it left off.
         """
-        var w = Worker[Self._dispatch_list](head^, Self._registry_hash())
+        var w = Worker[
+            Self._dispatch_list, Self._create, Self._call, Self._destroy
+        ](head^, Self._registry_hash())
         while True:
             w.run()
             if rejoin_at == "":
@@ -456,6 +516,46 @@ struct Runtime[*Ts: TaskLike](Movable):
         for r in args:
             deps.append(r.id)
         return self._submit_after[T.R](T.id(), deps, True)
+
+    def create[T: ActorLike](mut self, arg: T.A) raises -> ActorHandle[T]:
+        """Starts actor `T` on a worker of its own, built from `arg`.
+
+        It returns at once; calls made before the actor is up wait for it.
+        If the constructor raises, every call fails with its error.
+        """
+        Self._check_registered[T]()
+        var args = List[UInt8]()
+        encode(arg, args)
+        var id = self._new_id()
+        self._actors[id] = True
+        self._submit(id, KIND_ACTOR_CREATE, T.id(), args^, List[UInt64]())
+        return ActorHandle[T](id)
+
+    def call[
+        M: MethodLike
+    ](mut self, actor: ActorHandle[M.Act], arg: M.A) raises -> ObjectRef[M.R]:
+        """Calls method `M` on `actor` with `arg`, after every earlier call."""
+        Self._check_registered[M]()
+        if actor.id in self._lost_actors:
+            raise Error(actor, " was lost when the head restarted")
+        if actor.id not in self._actors:
+            raise Error(actor, " was killed")
+        var body = List[UInt8]()
+        put_scalar[DType.uint64](body, actor.id)
+        encode(arg, body)
+        var id = self._new_id()
+        self._submit(id, KIND_ACTOR_CALL, M.id(), body^, List[UInt64]())
+        return ObjectRef[M.R](id)
+
+    def kill[T: ActorLike](mut self, actor: ActorHandle[T]) raises:
+        """Destroys `actor` once its earlier calls have run, and frees its
+        worker. Their results stay until released."""
+        if not self._actors.pop(actor.id, False):
+            return
+        _ = self._lost_actors.pop(actor.id, False)
+        self._released[actor.id] = True
+        self._drop_local(actor.id)
+        self._send(KIND_ACTOR_KILL, actor.id, List[UInt8]())
 
     def _submit_after[
         R: AnyType
@@ -548,10 +648,24 @@ struct Runtime[*Ts: TaskLike](Movable):
         var f = read_frame(self._head)
         if not f or f.value().kind != KIND_WELCOME:
             raise Error("the restarted head didn't welcome this driver back")
+        # Actors don't survive a head restart yet: this driver's are lost,
+        # with their unfinished calls.
+        for entry in self._actors.items():
+            self._lost_actors[entry.key] = True
         # Oldest first, so every task's inputs are back before it is.
         for n in range(1, Int(self._counter) + 1):
             var id = (self._driver << DRIVER_SHIFT) | UInt64(n)
             if id not in self._live:
+                continue
+            if id in self._lost_actors:
+                _ = self._subs.pop(id, _Submission(0, 0, [], []))
+                self._drop_local(id)
+                continue
+            if id in self._subs and self._subs[id].kind == KIND_ACTOR_CALL:
+                self._errors[id] = String(
+                    "actor lost: the head restarted before this call finished"
+                )
+                self._settle(id)
                 continue
             if id in self._results:
                 write_frame(self._head, KIND_RESULT, id, 0, self._results[id])

@@ -29,6 +29,14 @@ its peers: workers rejoin and report the results they hold, and each driver
 reconnects under its old number and restores, claims or resubmits everything
 it still needs (see `frame.mojo`). A reported result no resumed driver
 claimed is freed. A task that was running when the head died may run again.
+
+An actor is placed on a worker that hosts no other, the one with the fewest
+tasks in flight, as soon as it's created; the worker builds it once those
+tasks finish. From then on the head sends that worker only the actor's calls,
+each as it arrives, so they run in order. An actor created when every worker
+hosts one waits for a worker to join or an actor to be killed. Killing an
+actor, or its driver leaving, frees its worker for tasks; a worker that goes
+away fails its actor and the calls it had.
 """
 
 from std.ffi import c_int
@@ -38,6 +46,9 @@ from dista.conn import Conn
 from dista.frame import (
     message,
     ADDR_SIZE,
+    KIND_ACTOR_CALL,
+    KIND_ACTOR_CREATE,
+    KIND_ACTOR_KILL,
     KIND_CLAIM,
     KIND_ERROR,
     KIND_FREE,
@@ -127,6 +138,29 @@ struct _Task(Copyable, Movable):
         self.kind = kind
 
 
+struct _Actor(Copyable, Movable):
+    var type_id: UInt64
+    var args: List[UInt8]
+    var worker: Int
+    """The connection hosting it, or -1 until it's placed."""
+    var pending: List[_Task]
+    """Calls that arrived before it was placed."""
+    var failed: String
+    """Why it can't take calls, once its constructor failed or its worker
+    went away."""
+    var killed: Bool
+    """Killed before it was placed: placed anyway, to run its calls, then
+    killed."""
+
+    def __init__(out self, type_id: UInt64, var args: List[UInt8]):
+        self.type_id = type_id
+        self.args = args^
+        self.worker = -1
+        self.pending = List[_Task]()
+        self.failed = String()
+        self.killed = False
+
+
 struct Head(Movable):
     var _listener: Listener
     var _registry_hash: UInt64
@@ -168,6 +202,12 @@ struct Head(Movable):
     """Tasks in progress, by object."""
     var _finished: Dict[UInt64, List[_Span]]
     """Settled tasks' spans, by driver, until the driver asks for them."""
+    var _actors: Dict[UInt64, _Actor]
+    """Live actors, by ID."""
+    var _unplaced: List[UInt64]
+    """Actors waiting for a worker, oldest first."""
+    var _hosting: List[UInt64]
+    """For a worker, the actor it hosts, or 0."""
 
     def __init__(
         out self,
@@ -210,6 +250,9 @@ struct Head(Movable):
         self._resumed = Dict[UInt64, Bool]()
         self._spans = Dict[UInt64, _Span]()
         self._finished = Dict[UInt64, List[_Span]]()
+        self._actors = Dict[UInt64, _Actor]()
+        self._unplaced = List[UInt64]()
+        self._hosting = List[UInt64]()
 
     def run(mut self) raises:
         """Serves until the last driver leaves, in local mode; else forever."""
@@ -263,6 +306,7 @@ struct Head(Movable):
         self._roles.append(_ROLE_NONE)
         self._inflight.append(List[UInt64]())
         self._worker_addr.append(List[UInt8]())
+        self._hosting.append(0)
 
     def _handle(mut self, i: Int, var f: Frame) raises:
         var role = self._roles[i]
@@ -272,6 +316,8 @@ struct Head(Movable):
             if f.kind == KIND_TASK:
                 var obj = f.object_id
                 var task = f.task_id
+                if self._known(obj):
+                    return
                 self._hold(obj)
                 if self._adopt(obj):
                     return
@@ -289,6 +335,8 @@ struct Head(Movable):
                 var deps = List[UInt64](capacity=n)
                 for _ in range(n):
                     deps.append(get_scalar[DType.uint64](f.payload, pos))
+                if self._known(f.object_id):
+                    return
                 self._hold(f.object_id)
                 if self._adopt(f.object_id):
                     return
@@ -318,6 +366,8 @@ struct Head(Movable):
             elif f.kind == KIND_RESULT or f.kind == KIND_ERROR:
                 # Resuming: a small result or error the driver kept.
                 var obj = f.object_id
+                if self._known(obj):
+                    return
                 self._hold(obj)
                 if f.kind == KIND_RESULT:
                     self._results[obj] = f^.take_payload()
@@ -325,6 +375,8 @@ struct Head(Movable):
                     self._errors[obj] = message(f.payload)
             elif f.kind == KIND_CLAIM:
                 var obj = f.object_id
+                if self._known(obj):
+                    return
                 self._hold(obj)
                 _ = self._orphans.pop(obj, False)
                 # The driver forgot where it was; say where this head has it.
@@ -348,6 +400,19 @@ struct Head(Movable):
             elif f.kind == KIND_RELEASE:
                 if self._held.pop(f.object_id, False):
                     self._dec(f.object_id)
+            elif f.kind == KIND_ACTOR_CREATE:
+                var a = f.object_id
+                var type_id = f.task_id
+                if self._known(a):
+                    return
+                self._hold(a)
+                self._open_span(a, type_id)
+                self._actors[a] = _Actor(type_id, f^.take_payload())
+                self._unplaced.append(a)
+            elif f.kind == KIND_ACTOR_CALL:
+                self._call(f^)
+            elif f.kind == KIND_ACTOR_KILL:
+                self._kill(f.object_id)
             elif f.kind == KIND_TIMELINE:
                 self._send_timeline(i)
             elif f.kind == KIND_STATS:
@@ -406,7 +471,125 @@ struct Head(Movable):
             else:
                 self._errors[obj] = message(f.payload)
                 self._deliver(obj, f.kind, f.payload)
+                if obj in self._actors and self._hosting[i] == obj:
+                    # Its constructor failed: the worker hosts nothing.
+                    self._actors[obj].failed = String(
+                        "actor failed to start: ", message(f.payload)
+                    )
+                    self._hosting[i] = 0
             self._settle(obj)
+
+    # ── actors ───────────────────────────────────────────────────────────
+    def _call(mut self, var f: Frame) raises:
+        """A method call: to the actor's worker, or held until it's placed."""
+        if len(f.payload) < 8:
+            raise Error("truncated actor-call")
+        var obj = f.object_id
+        var pos = 0
+        var a = get_scalar[DType.uint64](f.payload, pos)
+        if self._known(obj):
+            return
+        self._hold(obj)
+        self._open_span(obj, f.task_id)
+        self._stamp_queued(obj)
+        if a not in self._actors:
+            self._fail(obj, String("no such actor: killed, or never created"))
+            return
+        ref act = self._actors[a]
+        if act.killed:
+            self._fail(obj, String("no such actor: killed, or never created"))
+            return
+        if act.failed:
+            self._fail(obj, act.failed.copy())
+            return
+        var method = f.task_id
+        var t = _Task(obj, method, f^.take_payload(), kind=KIND_ACTOR_CALL)
+        if act.worker < 0:
+            act.pending.append(t^)
+        else:
+            self._send_to(act.worker, t)
+
+    def _send_to(mut self, i: Int, t: _Task):
+        """Sends a task or call to worker `i` and counts it in flight there."""
+        self._inflight[i].append(t.object_id)
+        if t.object_id in self._spans:
+            try:
+                ref sp = self._spans[t.object_id]
+                sp.worker = i
+                sp.dispatched = wall_ns()
+            except:
+                pass
+        try:
+            self._conns[i].send(t.kind, t.object_id, t.task_id, t.args)
+        except e:
+            print("dista head: lost worker:", e)
+            self._drop(i)
+
+    def _place(mut self) raises:
+        """Gives each waiting actor a worker of its own, while there are any."""
+        while len(self._unplaced) > 0:
+            var best = -1
+            for i in range(len(self._conns)):
+                if self._roles[i] != ROLE_WORKER or self._hosting[i] != 0:
+                    continue
+                if best < 0 or len(self._inflight[i]) < len(
+                    self._inflight[best]
+                ):
+                    best = i
+            if best < 0:
+                return
+            var a = self._unplaced.pop(0)
+            if a not in self._actors:
+                continue  # killed before it was placed
+            self._hosting[best] = a
+            ref act = self._actors[a]
+            act.worker = best
+            var create = _Task(
+                a, act.type_id, act.args.copy(), kind=KIND_ACTOR_CREATE
+            )
+            var calls = act.pending.copy()
+            act.pending.clear()
+            var killed = act.killed
+            self._send_to(best, create)
+            for ref t in calls:
+                if self._roles[best] != ROLE_WORKER:
+                    # Lost sending: `_drop` failed the actor; fail the rest.
+                    self._fail(
+                        t.object_id, String("actor lost: its worker went away")
+                    )
+                else:
+                    self._send_to(best, t)
+            if killed:
+                self._kill(a)
+
+    def _kill(mut self, a: UInt64) raises:
+        """Destroys actor `a` and frees its worker; its driver's done with it.
+        """
+        if a in self._actors and self._actors[a].worker < 0:
+            ref act = self._actors[a]
+            if len(act.pending) > 0 and not act.failed:
+                # Its calls were sent first: they run, then it's killed.
+                act.killed = True
+            else:
+                _ = self._actors.pop(a)
+        elif a in self._actors:
+            var act = self._actors.pop(a)
+            var i = act.worker
+            if i >= 0 and self._hosting[i] == a:
+                self._hosting[i] = 0
+                if self._roles[i] == ROLE_WORKER:
+                    # After its calls: the worker runs frames in order.
+                    try:
+                        self._conns[i].send(
+                            KIND_ACTOR_KILL, a, 0, List[UInt8]()
+                        )
+                    except e:
+                        print("dista head: lost worker:", e)
+                        self._drop(i)
+            for ref t in act.pending:
+                self._fail(t.object_id, String("the actor was killed"))
+        if self._held.pop(a, False):
+            self._dec(a)
 
     def _adopt(mut self, obj: UInt64) -> Bool:
         """A resubmitted task whose result a rejoining worker already reported:
@@ -502,6 +685,22 @@ struct Head(Movable):
         self._settle(object_id)
 
     # ── reference counts ─────────────────────────────────────────────────
+    def _known(mut self, object_id: UInt64) -> Bool:
+        """Whether a driver's new object is one this head already has: sent
+        again, as by a driver that lost its connection. It's the same object,
+        held by its driver again, not a second one."""
+        if self._dead.pop(object_id, False):
+            # Its driver let go while its task ran: held again, kept when the
+            # task settles.
+            self._hold(object_id)
+            return True
+        if object_id not in self._refs:
+            return False
+        if not self._held.get(object_id, False):
+            self._held[object_id] = True
+            self._refs[object_id] = self._refs.get(object_id, 0) + 1
+        return True
+
     def _hold(mut self, object_id: UInt64):
         """A new object, held by its driver."""
         self._refs[object_id] = 1
@@ -621,10 +820,28 @@ struct Head(Movable):
                 for entry in self._held.items():
                     if owner_of(entry.key) == gone:
                         mine.append(entry.key)
+                var actors = List[UInt64]()
+                for entry in self._actors.items():
+                    if owner_of(entry.key) == gone:
+                        actors.append(entry.key)
+                for a in actors:
+                    try:
+                        self._kill(a)
+                    except:
+                        pass
                 for obj in mine:
-                    _ = self._held.pop(obj, False)
-                    self._dec(obj)
+                    if self._held.pop(obj, False):
+                        self._dec(obj)
         elif role == ROLE_WORKER:
+            var a = self._hosting[i]
+            self._hosting[i] = 0
+            if a in self._actors:
+                try:
+                    self._actors[a].failed = String(
+                        "actor lost: its worker went away"
+                    )
+                except:
+                    pass
             var lost = self._inflight[i].copy()
             self._inflight[i].clear()
             for obj in lost:
@@ -700,12 +917,17 @@ struct Head(Movable):
         return len(self._queue) - self._queue_head
 
     def _dispatch(mut self):
-        """Hands queued tasks to workers, one round per pipeline slot."""
+        """Places waiting actors, then hands queued tasks to the workers that
+        host none, one round per pipeline slot."""
+        try:
+            self._place()
+        except e:
+            print("dista head: placing an actor:", e)
         for depth in range(self._pipeline):
             for i in range(len(self._conns)):
                 if self._queued() == 0:
                     break
-                if self._roles[i] != ROLE_WORKER:
+                if self._roles[i] != ROLE_WORKER or self._hosting[i] != 0:
                     continue
                 if len(self._inflight[i]) != depth:
                     continue

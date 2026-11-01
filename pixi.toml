@@ -15,12 +15,13 @@ test-frame = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_fr
 test-runtime = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_runtime.mojo -o build/test-runtime && ./build/test-runtime" }
 test-batches = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_batches.mojo -o build/test-batches && ./build/test-batches" }
 test-free = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_free.mojo -o build/test-free && ./build/test-free" }
+test-actors = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_actors.mojo -o build/test-actors && ./build/test-actors" }
 test-timeline = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_timeline.mojo -o build/test-timeline && ./build/test-timeline" }
 test-cluster = { cmd = "tests/cluster.sh" }
 test-restart = { cmd = "tests/head_restart.sh" }
 test-chaos = { cmd = "CHAOS_FAST=1 tests/chaos.sh" }
 test-kind = { cmd = "tests/kind.sh" }
-test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-timeline", "test-cluster", "test-restart", "test-chaos"] }
+test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-timeline", "test-actors", "test-cluster", "test-restart", "test-chaos"] }
 bench = { cmd = "mkdir -p build && mojo build -I src $DEP_INC bench/fanout.mojo -o build/bench-fanout && ./build/bench-fanout" }
 
 [package]

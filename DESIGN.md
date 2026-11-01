@@ -236,9 +236,9 @@ var r = rt.call[Add](c, 5)                               # an ObjectRef[Int], as
 
 Actors and methods go in `Runtime[...]` with the tasks, so the registry hash still proves every process runs the same code.
 
-**One actor, one worker process.** The head places an actor on a free worker, and that worker serves only that actor until the actor is killed. This is Ray's model. It keeps a single-threaded worker simple: the actor's state is owned by one process, and nothing else runs beside it.
+**One actor, one worker process.** The head places an actor on a worker that hosts no other, the one with the fewest tasks in flight, and that worker serves only that actor until the actor is killed. An actor created when every worker hosts one waits for a worker to join or another actor to be killed. This is Ray's model. It keeps a single-threaded worker simple: the actor's state is owned by one process, and nothing else runs beside it.
 
-**Calls run one at a time, in order.** The head numbers each actor's calls and sends them in that order. The worker runs them one after another. A method's result is an `ObjectRef` like a task's: it stays on the worker if it's large, and it can be another task's argument.
+**Calls run one at a time, in order.** The head sends each actor's calls to its worker as they arrive, on one connection, so they keep the driver's order. The worker runs them one after another. A method's result is an `ObjectRef` like a task's: it stays on the worker if it's large, and it can be another task's argument.
 
 **Handles are values.** An `ActorHandle` goes through the codec, so a task or another actor can call methods. Calls from workers go through the head, which keeps the order.
 
@@ -257,7 +257,7 @@ Actors and methods go in `Runtime[...]` with the tasks, so the registry hash sti
 
 ### PRs
 
-Stacked, at most about 2,000 lines each, in order. Once a worker re-registers its actor after a head restart (from PR 4 on), actors survive a head restart too:
+Stacked, at most about 2,000 lines each, in order. In PR 4 a head restart loses the actors: the resuming driver fails their unfinished calls, and a rejoining worker destroys its actor. From PR 6 on, the restarted head places them again and replays their calls, as it does when a worker dies:
 
 | # | PR | Gate | Size |
 |---|---|---|---|
