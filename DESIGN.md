@@ -301,3 +301,16 @@ The taxi benchmark is mostly reading Parquet from S3. A second benchmark should 
 | 5 | **Spilling.** Results that don't fit in memory or `/dev/shm` go to local disk or object storage. | A shuffle's intermediate data can be larger than memory. |
 
 1 and 3 come first, before the second benchmark; 4 and 5 once it shows they matter.
+
+### To do: a `dista` command for operating a cluster
+
+With the metrics (PR 8): the one binary already runs as head, worker or driver, so it grows subcommands, as `ray start`, `ray status` and `ray timeline` do:
+
+| Command | What it does |
+|---|---|
+| `dista head`, `dista worker --head host:port` | What `DISTA_ROLE` does today. |
+| `dista status` | The head's view: workers, actors, objects held, queue depth (the stats frame, extended). |
+| `dista timeline -o trace.json` | Every driver's finished tasks, not only the caller's own. |
+| `dista stop` | Asks the head to shut down, and its workers with it. |
+
+`status` and `timeline` need an observer role: a peer that says hello to the head and asks, without being a driver that owns objects. The benchmark's own command, `bench/cloud/bench`, is separate: it runs the AWS clusters and the frameworks on them.
