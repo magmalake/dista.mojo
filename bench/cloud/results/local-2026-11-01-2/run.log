@@ -1,0 +1,43 @@
+results: bench/cloud/results/local-2026-11-01-2
+== up 0 18:47:42
+launching the head (c7g.4xlarge)
+waiting for the head's API
+waiting for 0 workers to join
+NAME              STATUS   ROLES                  AGE   VERSION         ROLE   RANK
+ip-172-31-6-111   Ready    control-plane,master   8s    v1.33.13+k3s2   head   
+KUBECONFIG=build/cloud/kubeconfig
+== build 18:48:55
+== building dista:taxi on c7g.4xlarge
+dista	120	35.1	53.6	93	32	c7g.4xlarge
+== loading dista:taxi into every node
+== building dista-ray:taxi on c7g.4xlarge
+ray	45	18.3	-	607	204	c7g.4xlarge
+== loading dista-ray:taxi into every node
+== building dista-rust:taxi on c7g.4xlarge
+rust	169	91.7	58.0	132	41	c7g.4xlarge
+== loading dista-rust:taxi into every node
+image  total_s  deps_s  compile_s  disk_mb  gzip_mb  instance
+dista  120      35.1    53.6       93       32       c7g.4xlarge
+ray    45       18.3    -          607      204      c7g.4xlarge
+rust   169      91.7    58.0       132      41       c7g.4xlarge
+== one process, 16 threads 18:55:28
+== rust, one process on the head node
+PASS rust taxi: 8 queries in one process; one process 96233 ms
+## One process, on the head node (ms)
+
+| query | rust |
+|---|---:|
+| q1_scan_count | 15,597 |
+| q2_month_range | 830 |
+| q3_payment_sum | 18,365 |
+| q4_tip_ratio | 18,360 |
+| q5_top_zones | 19,907 |
+| q6_zone_revenue | 919 |
+| q7_wide | 1,026 |
+| q8_selective | 21,229 |
+| total | **96,233** |
+
+All answers agree with the one-process references (rust).
+== done 18:57:13
+== teardown 18:57:13
+terminated; the bucket stays (bench/cloud/data.sh drop removes it)
