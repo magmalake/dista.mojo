@@ -77,17 +77,28 @@ def test_timeline_file() raises:
     if not exists("build"):
         makedirs("build")
     var rt = Runtime[Nap, Blob, Length, Fail](workers=3)
+    var t = rt.clock()
     var refs = List[ObjectRef[Int]]()
     for i in range(30):
         refs.append(rt.remote[Nap](i % 3))
+    rt.span("submit", t)
+    t = rt.clock()
     for r in refs:
         _ = rt.get(r)
+    rt.span("wait", t)
     assert_equal(rt.timeline("build/test-timeline.json"), 30)
     var text = open("build/test-timeline.json", "r").read()
     assert_true(text.startswith("[\n"))
     assert_true(text.endswith("]\n"))
-    assert_equal(text.count('"ph":"X"') - text.count('"name":"inputs"'), 30)
-    assert_true(text.count('"process_name"') >= 2)
+    # 30 tasks and the driver's 2 spans.
+    assert_equal(text.count('"ph":"X"') - text.count('"name":"inputs"'), 32)
+    assert_true(text.count('"process_name"') >= 3)
+    assert_equal(text.count('"name":"driver"'), 2)
+    assert_equal(text.count('"name":"submit"'), 1)
+    # Driver spans are written once.
+    _ = rt.timeline("build/test-timeline-2.json")
+    var again = open("build/test-timeline-2.json", "r").read()
+    assert_equal(again.count('"name":"submit"'), 0)
 
 
 def test_a_task_that_never_ran() raises:

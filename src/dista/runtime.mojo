@@ -73,6 +73,7 @@ from dista.socket import (
     fork,
     poll_readable,
     wait_child,
+    wall_ns,
 )
 from dista.task import ActorLike, MethodLike, StatePtr, TaskLike, fnv1a64
 from dista.store import Location
@@ -154,6 +155,17 @@ struct HeadStats(Copyable, Movable, Writable):
     """Results the head knows live on a worker."""
     var pending: Int
     """Tasks queued or waiting on inputs."""
+
+
+comptime MAX_DRIVER_SPANS = 1_000_000
+"""Driver spans kept until `timeline` writes them; later ones are dropped."""
+
+
+@fieldwise_init
+struct _DriverSpan(Copyable, Movable):
+    var name: String
+    var start: UInt64
+    var end: UInt64
 
 
 def _us(ns: UInt64) -> String:
@@ -265,6 +277,7 @@ struct Runtime[*Ts: TaskLike](Movable):
     """Actors this driver created and hasn't killed."""
     var _lost_actors: Dict[UInt64, Bool]
     """Actors a head restart took with it."""
+    var _driver_spans: List[_DriverSpan]
 
     def __init__(out self, workers: Int = 4, pipeline: Int = 2) raises:
         """Starts this process in the role its environment names.
@@ -352,6 +365,7 @@ struct Runtime[*Ts: TaskLike](Movable):
         self._timeline_answered = False
         self._actors = Dict[UInt64, Bool]()
         self._lost_actors = Dict[UInt64, Bool]()
+        self._driver_spans = List[_DriverSpan]()
 
     def __deinit__(deinit self):
         # In local mode the head exits once its only driver leaves, and closes
@@ -853,22 +867,56 @@ struct Runtime[*Ts: TaskLike](Movable):
         self._spans = List[TaskSpan]()
         return out^
 
+    @staticmethod
+    def clock() -> UInt64:
+        """Wall-clock nanoseconds, the clock the timeline uses: the start to
+        give `span`."""
+        return wall_ns()
+
+    def span(mut self, name: String, start: UInt64, end: UInt64 = 0):
+        """Records a stretch of this driver's own work for the timeline, from
+        `start` (from `clock`) to `end`, or to now. `timeline` draws these as
+        the driver's track, above the workers."""
+        if len(self._driver_spans) < MAX_DRIVER_SPANS:
+            self._driver_spans.append(
+                _DriverSpan(name, start, end if end != 0 else wall_ns())
+            )
+
     def timeline(mut self, path: String) raises -> Int:
         """Writes the finished tasks' timeline to `path` in Chrome's trace
         format, for Perfetto (ui.perfetto.dev) or chrome://tracing, and
         returns how many tasks it holds.
 
         Each worker is a process with two tracks: its tasks running, and its
-        tasks waiting for their inputs. Times are microseconds from the first
-        submission; each run's arguments carry the head's waits too.
+        tasks waiting for their inputs. The driver's own spans, from `span`,
+        are a process above them. Times are microseconds from the first
+        submission or driver span; each run's arguments carry the head's
+        waits too. Driver spans are written once, like task spans.
         """
         var spans = self.spans()
+        var mine = self._driver_spans^
+        self._driver_spans = List[_DriverSpan]()
         var t0 = UInt64(0)
         for ref sp in spans:
             if t0 == 0 or sp.submitted < t0:
                 t0 = sp.submitted
+        for ref d in mine:
+            if t0 == 0 or d.start < t0:
+                t0 = d.start
         var pids = Dict[String, Int]()
         var out = String("[\n")
+        if len(mine) > 0:
+            out += _meta(0, "process_name", "driver")
+            out += _meta(0, "thread_name", "driver", 1)
+        for ref d in mine:
+            out += _event(
+                d.name,
+                0,
+                1,
+                d.start - t0,
+                d.end - d.start if d.end > d.start else 0,
+                String("{}"),
+            )
         for ref sp in spans:
             if sp.worker == "" or sp.started == 0:
                 continue
