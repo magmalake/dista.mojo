@@ -31,6 +31,7 @@ comptime KEYS = ZONES * ZONES * HOURS
 comptime HOUR_US: Int64 = 3_600_000_000
 comptime MAX_DURATION_US: Int64 = 4 * HOUR_US
 comptime TOP = 10
+comptime SLOT = 4
 
 
 def _columns() -> List[String]:
@@ -115,21 +116,40 @@ struct Groups(Codec, Copyable, Movable, Sized):
 
 struct Dense(Movable):
     """Every key's group, indexed by key: what a map task, or the one
-    process, adds trips into."""
+    process, adds trips into.
 
-    var n: List[Int32]
-    var speed: List[Float64]
-    var tip: List[Float64]
-    var fare: List[Float64]
+    A key's four numbers sit together (`SLOT` floats: n, speed, tip, fare),
+    so adding a trip touches one cache line, not four arrays' worth. Counts
+    are stored as floats, exact far past any table's trip count.
+    """
+
+    var slots: List[Float64]
+    var keys: List[Int]
+    """Scratch for `add`: the batch's kept trips' keys..."""
+    var weights: List[Float64]
+    """...and their speed, tip and fare, three per kept trip."""
 
     def __init__(out self):
-        self.n = List[Int32](length=KEYS, fill=0)
-        self.speed = List[Float64](length=KEYS, fill=0.0)
-        self.tip = List[Float64](length=KEYS, fill=0.0)
-        self.fare = List[Float64](length=KEYS, fill=0.0)
+        self.slots = List[Float64](length=KEYS * SLOT, fill=0.0)
+        self.keys = List[Int]()
+        self.weights = List[Float64]()
+
+    def n(self, key: Int) -> Int:
+        return Int(self.slots[key * SLOT])
+
+    def speed(self, key: Int) -> Float64:
+        return self.slots[key * SLOT + 1]
+
+    def tip(self, key: Int) -> Float64:
+        return self.slots[key * SLOT + 2]
+
+    def fare(self, key: Int) -> Float64:
+        return self.slots[key * SLOT + 3]
 
     def add(mut self, b: RecordBatch) raises:
-        """Adds batch `b`'s trips that count (see the README)."""
+        """Adds batch `b`'s trips that count (see the README), in two
+        passes: first every row's key and features, without branches, keeping
+        the trips that count; then those added into their keys' slots."""
         var pu = b.column_i64(_column(b, "PULocationID"))
         var do_ = b.column_i64(_column(b, "DOLocationID"))
         var start = b.column_i64(_column(b, "tpep_pickup_datetime"))
@@ -137,38 +157,70 @@ struct Dense(Movable):
         var dist = b.column_f64(_column(b, "trip_distance"))
         var fare = b.column_f64(_column(b, "fare_amount"))
         var tip = b.column_f64(_column(b, "tip_amount"))
-        for i in range(b.num_rows):
-            if not (
-                pu[1][i]
-                and do_[1][i]
-                and start[1][i]
-                and end[1][i]
-                and dist[1][i]
-                and fare[1][i]
-                and tip[1][i]
-            ):
-                continue
-            var p = Int(pu[0][i])
-            var d = Int(do_[0][i])
-            if p < 1 or p > 265 or d < 1 or d > 265:
-                continue
-            var miles = dist[0][i]
-            var dollars = fare[0][i]
-            var us = end[0][i] - start[0][i]
-            if (
-                miles <= 0.0
-                or dollars <= 0.0
-                or us <= 0
-                or us > MAX_DURATION_US
-            ):
-                continue
-            var t = start[0][i]
+        var rows = b.num_rows
+        self.keys.resize(rows, 0)
+        self.weights.resize(rows * 3, 0.0)
+        var keys = self.keys.unsafe_ptr()
+        var weights = self.weights.unsafe_ptr()
+        # Pass 1. Every row is written at `kept`, which only moves past the
+        # trips that count, so the dropped ones are overwritten.
+        var pu_v = pu[0].unsafe_ptr()
+        var pu_ok = pu[1].unsafe_ptr()
+        var do_v = do_[0].unsafe_ptr()
+        var do_ok = do_[1].unsafe_ptr()
+        var start_v = start[0].unsafe_ptr()
+        var start_ok = start[1].unsafe_ptr()
+        var end_v = end[0].unsafe_ptr()
+        var end_ok = end[1].unsafe_ptr()
+        var dist_v = dist[0].unsafe_ptr()
+        var dist_ok = dist[1].unsafe_ptr()
+        var fare_v = fare[0].unsafe_ptr()
+        var fare_ok = fare[1].unsafe_ptr()
+        var tip_v = tip[0].unsafe_ptr()
+        var tip_ok = tip[1].unsafe_ptr()
+        var kept = 0
+        for i in range(rows):
+            var p = pu_v[unsafe_offset=i]
+            var d = do_v[unsafe_offset=i]
+            var miles = dist_v[unsafe_offset=i]
+            var dollars = fare_v[unsafe_offset=i]
+            var t = start_v[unsafe_offset=i]
+            var us = end_v[unsafe_offset=i] - t
+            var keep = (
+                pu_ok[unsafe_offset=i]
+                & do_ok[unsafe_offset=i]
+                & start_ok[unsafe_offset=i]
+                & end_ok[unsafe_offset=i]
+                & dist_ok[unsafe_offset=i]
+                & fare_ok[unsafe_offset=i]
+                & tip_ok[unsafe_offset=i]
+                & (p >= 1)
+                & (p <= 265)
+                & (d >= 1)
+                & (d <= 265)
+                & (miles > 0.0)
+                & (dollars > 0.0)
+                & (us > 0)
+                & (us <= MAX_DURATION_US)
+            )
             var hour = Int((t // HOUR_US) % 24)
-            var key = (p * ZONES + d) * HOURS + hour
-            self.n[key] += 1
-            self.speed[key] += miles / (Float64(us) / Float64(HOUR_US))
-            self.tip[key] += tip[0][i] / dollars
-            self.fare[key] += dollars
+            keys[unsafe_offset=kept] = (Int(p) * ZONES + Int(d)) * HOURS + hour
+            weights[unsafe_offset=kept * 3] = miles / (
+                Float64(us) / Float64(HOUR_US)
+            )
+            weights[unsafe_offset=kept * 3 + 1] = (
+                tip_v[unsafe_offset=i] / dollars
+            )
+            weights[unsafe_offset=kept * 3 + 2] = dollars
+            kept += Int(keep)
+        # Pass 2: the kept trips into their slots.
+        var slots = self.slots.unsafe_ptr()
+        for j in range(kept):
+            var s = slots.unsafe_offset(keys[unsafe_offset=j] * SLOT)
+            s[unsafe_offset=0] += 1.0
+            s[unsafe_offset=1] += weights[unsafe_offset=j * 3]
+            s[unsafe_offset=2] += weights[unsafe_offset=j * 3 + 1]
+            s[unsafe_offset=3] += weights[unsafe_offset=j * 3 + 2]
 
     def partitions(self, r: Int) -> Seq[Groups]:
         """The groups with trips, split into `r` partitions by key."""
@@ -176,13 +228,13 @@ struct Dense(Movable):
         for _ in range(r):
             parts.append(Groups())
         for key in range(KEYS):
-            if self.n[key] > 0:
+            if self.n(key) > 0:
                 parts[key % r].append(
                     key,
-                    Int(self.n[key]),
-                    self.speed[key],
-                    self.tip[key],
-                    self.fare[key],
+                    self.n(key),
+                    self.speed(key),
+                    self.tip(key),
+                    self.fare(key),
                 )
         return Seq[Groups](parts^)
 
@@ -252,18 +304,18 @@ def _answer_of(dense: Dense) -> Answer:
     var a = Answer.zero()
     var all = Groups()
     for key in range(KEYS):
-        if dense.n[key] > 0:
+        if dense.n(key) > 0:
             a.groups += 1
-            a.trips += Int(dense.n[key])
-            a.speed += dense.speed[key]
-            a.tip += dense.tip[key]
-            a.fare += dense.fare[key]
+            a.trips += dense.n(key)
+            a.speed += dense.speed(key)
+            a.tip += dense.tip(key)
+            a.fare += dense.fare(key)
             all.append(
                 key,
-                Int(dense.n[key]),
-                dense.speed[key],
-                dense.tip[key],
-                dense.fare[key],
+                dense.n(key),
+                dense.speed(key),
+                dense.tip(key),
+                dense.fare(key),
             )
     a.top = _top(all)
     return a^
