@@ -301,7 +301,7 @@ The taxi benchmark is mostly reading Parquet from S3. A second benchmark should 
 | 4 | **Placement by data location.** A task goes to the node holding most of its inputs' bytes, rather than round-robin. | Reducers read megabytes from every node; sending them where the bytes are halves the traffic or better. |
 | 5 | **Spilling.** Results that don't fit in memory or `/dev/shm` go to local disk or object storage. | A shuffle's intermediate data can be larger than memory. |
 
-1 and 3 come first, before the second benchmark; 4 and 5 once it shows they matter. `tests/test_shuffle.mojo` runs a group-by as 8 map tasks partitioning their rows by key for 4 reducers, each reducer taking its partition from every map task, and checks the sums against one process's. A `TaskMany` takes values only, not refs, for now.
+1 and 3 come first, before the second benchmark; 4 and 5 once it shows they matter. The second benchmark is [bench/shuffle](bench/shuffle/README.md), on dista (`deploy/shuffle.mojo`) and Ray (`bench/ray/shuffle_ray.py`) only: the Rust reference's workers can't fetch from each other. `JOB=shuffle bench/cloud/bench matrix` runs it on AWS. `tests/test_shuffle.mojo` runs a group-by as 8 map tasks partitioning their rows by key for 4 reducers, each reducer taking its partition from every map task, and checks the sums against one process's. A `TaskMany` takes values only, not refs, for now.
 
 ### The `dista` command (done)
 

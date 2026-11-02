@@ -1,6 +1,7 @@
 #!/bin/bash
 # bench/ray/taxi_ray.py on the kind cluster tests/kind_taxi.sh uses: the same
-# nodes, the same warehouse copy at /data/wh, one worker per node. Run
+# nodes, the same warehouse copy at /data/wh, one worker per node.
+# RAY_SCRIPT=shuffle_ray.py runs the shuffle benchmark instead. Run
 # tests/kind_taxi.sh with KEEP_CLUSTER=1 first, or this creates the cluster
 # and copies the warehouse itself.
 #
@@ -16,7 +17,7 @@ metadata=$(cat "$warehouse/metadata_location.txt")
 
 stage=build/ray-context
 rm -rf "$stage" && mkdir -p "$stage/dista.mojo/bench/ray" "$stage/taxibench.example/python"
-cp bench/ray/taxi_ray.py "$stage/dista.mojo/bench/ray/"
+cp bench/ray/taxi_ray.py bench/ray/shuffle_ray.py "$stage/dista.mojo/bench/ray/"
 rsync -a --exclude __pycache__ ../taxibench.example/python/taxibench "$stage/taxibench.example/python/"
 docker build -f bench/ray/Dockerfile -t dista-ray:taxi "$stage"
 
@@ -34,7 +35,8 @@ done
 
 ctx=(--context "kind-$cluster")
 sed -e "s|@TAXI_METADATA@|$metadata|" -e "s|@WAREHOUSE@|$warehouse|" \
-  -e "s|@TAXI_THREADS@|$threads|" bench/ray/k8s.yaml > build/ray.yaml
+  -e "s|@TAXI_THREADS@|$threads|" -e "s|@RAY_SCRIPT@|${RAY_SCRIPT:-taxi_ray.py}|" \
+  bench/ray/k8s.yaml > build/ray.yaml
 kubectl "${ctx[@]}" delete -f build/ray.yaml --ignore-not-found --wait
 kubectl "${ctx[@]}" apply -f build/ray.yaml
 kubectl "${ctx[@]}" rollout status statefulset/ray-head --timeout=180s

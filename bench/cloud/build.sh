@@ -103,7 +103,7 @@ while read -r dir url rev; do
     *.mojo) rsync -a --exclude .git "src/$dir/" "ctx/dista/$dir/" ;;
   esac
 done < revs.txt
-cp src/dista.mojo/bench/ray/taxi_ray.py ctx/ray/dista.mojo/bench/ray/
+cp src/dista.mojo/bench/ray/taxi_ray.py src/dista.mojo/bench/ray/shuffle_ray.py ctx/ray/dista.mojo/bench/ray/
 cp src/dista.mojo/bench/ray/Dockerfile ctx/ray/Dockerfile
 rsync -a --exclude __pycache__ src/taxibench.example/python/taxibench ctx/ray/taxibench.example/python/
 rsync -a --exclude .git src/dista.mojo/bench/rust/ ctx/rust/

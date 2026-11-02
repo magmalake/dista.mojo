@@ -102,11 +102,12 @@ spec:
         - name: driver
           image: dista-ray:taxi
           imagePullPolicy: Never
-          command: [sh, -c, "until ray start --address=ray-head:6379 --num-cpus=0 --disable-usage-stats; do sleep 1; done && python /app/taxi_ray.py"]
+          command: [sh, -c, "until ray start --address=ray-head:6379 --num-cpus=0 --disable-usage-stats; do sleep 1; done && python /app/@RAY_SCRIPT@"]
           envFrom:
             - secretRef: {name: aws}
           env:
             - {name: RAY_AUTH_MODE, value: disabled}
+            - {name: SHUFFLE_REDUCERS, value: "@REDUCERS@"}
             - {name: RAY_ADDRESS, value: auto}
             - {name: DISTA_EXPECT_NODES, value: "@NODES@"}
             - {name: TAXI_METADATA, value: "@TAXI_METADATA@"}

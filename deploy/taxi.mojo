@@ -44,18 +44,17 @@ from std.time import perf_counter_ns
 
 from arrow_mlake import RecordBatch
 from iceberg import (
-    DataFile,
     FileIO,
     FileScanTask,
     ScanOptions,
     TableMetadata,
     TableScan,
 )
-from iceberg.manifest import CONTENT_DATA, ManifestCache
-from iceberg.catalog.filesystem import read_metadata_file
+from iceberg.manifest import ManifestCache
 
 from dista import ObjectRef, Runtime, Seq, Task
-from dista.store import node_name
+
+from taxi_table import PlannedFile, taxi_io, taxi_table, worker_node
 
 comptime K_COUNT = 0
 comptime K_SUM = 1
@@ -72,82 +71,6 @@ struct Query(Copyable, Movable):
     var columns: Seq[String]
     var kind: Int
     var sum_column: String
-
-
-@fieldwise_init
-struct PlannedFile(Copyable, Movable):
-    """What the driver planned for one data file, so the worker doesn't plan
-    again. The taxi table has no delete files and no identity partitions,
-    which is what lets this leave out the deletes and the partition values."""
-
-    var path: String
-    var format: String
-    var size: Int64
-    var records: Int64
-    var residual: String
-    var start: Int64
-    var length: Int64
-    var spec_id: Int
-    var sequence: Int64
-    var split_offsets: Seq[Int64]
-    """Where each row group starts: what lets a task own only the row groups
-    in its byte range. Without them a split task reads the whole file."""
-
-    @staticmethod
-    def of(t: FileScanTask) raises -> PlannedFile:
-        if len(t.delete_files) > 0:
-            raise Error(t.data_file.file_path, " has deletes")
-        ref f = t.data_file
-        return PlannedFile(
-            f.file_path.copy(),
-            f.file_format.copy(),
-            f.file_size_in_bytes,
-            f.record_count,
-            t.residual.copy(),
-            t.start,
-            t.length,
-            t.spec_id,
-            t.data_sequence_number,
-            Seq[Int64](f.split_offsets.copy()),
-        )
-
-    def task(self) -> FileScanTask:
-        var offsets = List[Int64](capacity=len(self.split_offsets))
-        for i in range(len(self.split_offsets)):
-            offsets.append(self.split_offsets[i])
-        var f = DataFile(
-            CONTENT_DATA,
-            self.path.copy(),
-            self.format.copy(),
-            [],
-            self.records,
-            self.size,
-            [],
-            [],
-            [],
-            False,
-            offsets^,
-            [],
-            0,
-            False,
-            0,
-            False,
-            String(),
-            False,
-            0,
-            False,
-            0,
-            False,
-        )
-        return FileScanTask(
-            f^,
-            [],
-            self.residual.copy(),
-            self.start,
-            self.length,
-            self.spec_id,
-            self.sequence,
-        )
 
 
 @fieldwise_init
@@ -189,22 +112,8 @@ struct Partial(Copyable, Movable):
         self.zones = Seq[Float64](z^)
 
 
-def _io() -> FileIO:
-    var io = FileIO.local()
-    var prefix = getenv("TAXI_PREFIX")
-    var root = getenv("TAXI_ROOT", prefix)
-    if prefix != "" and root != prefix:
-        io.rebase(prefix, root)
-    return io^
-
-
-def _table() raises -> TableMetadata:
-    """The table's metadata, read once by the driver."""
-    return read_metadata_file(_io(), getenv("TAXI_METADATA"))
-
-
 def _scan(q: Query, var table: TableMetadata) raises -> TableScan:
-    var scan = TableScan(table^, _io())
+    var scan = TableScan(table^, taxi_io())
     scan = scan.filter(q.filter)
     if len(q.columns) > 0:
         var cols = List[String]()
@@ -258,11 +167,6 @@ def fold(mut p: Partial, q: Query, b: RecordBatch) raises:
         p.zones = Seq[Float64](z^)
 
 
-def _node() -> String:
-    var n = getenv("NODE_NAME")
-    return n if n != "" else node_name()
-
-
 def fold_file(t: FileQuery) raises -> Partial:
     """Task: one query over one data file, folded where it was read."""
     var tasks: List[FileScanTask] = [t.file.task()]
@@ -270,7 +174,7 @@ def fold_file(t: FileQuery) raises -> Partial:
     var table = TableMetadata.parse(t.metadata)
     for b in _scan(t.query, table^).to_batches_for_tasks(tasks^):
         fold(p, t.query, b)
-    p.node = _node()
+    p.node = worker_node()
     return p^
 
 
@@ -482,7 +386,7 @@ def _answer(name: String, p: Partial):
 
 
 def _local_only() raises:
-    var table = _table()
+    var table = taxi_table()
     var total = 0
     for q in queries():
         var local = _local(q, table)
@@ -508,7 +412,7 @@ def main() raises:
     if mode != "both" and mode != "distributed":
         raise Error("TAXI_MODE must be both, distributed or local, got ", mode)
     var rt = Runtime[FoldFile, ReadFile](workers=4)
-    var table = _table()
+    var table = taxi_table()
     var reading = table.for_reading().to_json()
     var manifests = ManifestCache()
     var passes = Int(getenv("TAXI_PASSES", "1"))

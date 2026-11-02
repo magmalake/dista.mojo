@@ -31,8 +31,8 @@ spec:
         - name: head
           image: dista:taxi
           imagePullPolicy: IfNotPresent
-          env:
-            - {name: DISTA_ROLE, value: head}
+          # The generic head: it serves the taxi job and the shuffle job.
+          command: ["/opt/dista/bin/dista", "head", "--port", "6390"]
           readinessProbe:
             tcpSocket: {port: 6390}
             periodSeconds: 2
@@ -63,6 +63,7 @@ spec:
         - name: worker
           image: dista:taxi
           imagePullPolicy: IfNotPresent
+          command: ["@PROGRAM@"]
           volumeMounts:
             - {name: warehouse, mountPath: /data/wh, readOnly: true}
           env:
@@ -95,6 +96,7 @@ spec:
         - name: driver
           image: dista:taxi
           imagePullPolicy: IfNotPresent
+          command: ["@PROGRAM@"]
           volumeMounts:
             - {name: warehouse, mountPath: /data/wh, readOnly: true}
           env:

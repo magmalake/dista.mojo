@@ -32,8 +32,8 @@ spec:
         - name: head
           image: dista:taxi
           imagePullPolicy: Never
-          env:
-            - {name: DISTA_ROLE, value: head}
+          # The generic head serves the taxi job and the shuffle job alike.
+          command: ["/opt/dista/bin/dista", "head", "--port", "6390"]
           readinessProbe:
             tcpSocket: {port: 6390}
             periodSeconds: 2
@@ -69,6 +69,7 @@ spec:
         - name: worker
           image: dista:taxi
           imagePullPolicy: Never
+          command: ["@DISTA_PROGRAM@"]
           volumeMounts:
             - {name: shm, mountPath: /dev/shm}
           envFrom:
@@ -104,6 +105,7 @@ spec:
         - name: driver
           image: dista:taxi
           imagePullPolicy: Never
+          command: ["@DISTA_PROGRAM@"]
           volumeMounts:
             - {name: shm, mountPath: /dev/shm}
             - {name: results, mountPath: /results}
@@ -114,5 +116,6 @@ spec:
             - {name: DISTA_EXPECT_NODES, value: "@NODES@"}
             - {name: TAXI_METADATA, value: "@TAXI_METADATA@"}
             - {name: TAXI_PASSES, value: "@PASSES@"}
+            - {name: SHUFFLE_REDUCERS, value: "@REDUCERS@"}
             - {name: TAXI_MODE, value: distributed}
             - {name: TAXI_TIMELINE, value: "/results/dista-@NODES@-timeline.json"}
