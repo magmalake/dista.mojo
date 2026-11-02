@@ -74,3 +74,12 @@ spec:
               valueFrom: {fieldRef: {fieldPath: status.podIP}}
             - name: NODE_NAME
               valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            # Actor checkpoints. On kind every node mounts one host
+            # directory here (deploy/kind.yaml); a real cluster points this
+            # at object storage, s3://bucket/prefix, instead.
+            - {name: DISTA_CHECKPOINT_URI, value: /checkpoints}
+          volumeMounts:
+            - {name: checkpoints, mountPath: /checkpoints}
+      volumes:
+        - name: checkpoints
+          hostPath: {path: /dista-checkpoints, type: DirectoryOrCreate}

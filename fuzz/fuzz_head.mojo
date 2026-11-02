@@ -7,8 +7,9 @@ IDs from a small range (so they collide with submitted tasks), random
 payloads. A frame the head rejects drops that peer, as the real loop does.
 
 After every step the head's bookkeeping must hold together: counts positive,
-every held object counted, every location naming a worker connection, and
-nothing pending for an object that no longer exists.
+every held object counted, every location naming a worker connection,
+every actor's call log holding just the calls its checkpoint doesn't cover,
+and nothing pending for an object that no longer exists.
 
     pixi run -e fuzz fuzz-head
 """
@@ -50,6 +51,11 @@ def _check(head: Head) raises:
         var w = entry.value.worker
         if w >= 0 and head._hosting[w] != entry.key and not entry.value.failed:
             raise Error("assertion failed: placed actor not hosted")
+        ref act = entry.value
+        if len(act.log) != act.calls - max(act.saved, 0):
+            raise Error("assertion failed: the call log lost or kept a call")
+        if act.saved > act.calls:
+            raise Error("assertion failed: a checkpoint covers unmade calls")
     for i in range(len(head._hosting)):
         if head._hosting[i] != 0 and head._hosting[i] not in head._actors:
             raise Error("assertion failed: worker hosts a gone actor")
@@ -90,7 +96,7 @@ def target(data: List[UInt8]) raises:
     while pos + 5 <= len(data):
         var who = Int(data[pos] & 1)
         var hang_up = (data[pos] & 2) != 0
-        var kind = data[pos + 1] % 22
+        var kind = data[pos + 1] % 25
         var obj = (UInt64(1) << DRIVER_SHIFT) | UInt64(data[pos + 2] % 16)
         var task = UInt64(data[pos + 3] % 4)
         var n = min(Int(data[pos + 4]), len(data) - pos - 5)

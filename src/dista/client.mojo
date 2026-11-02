@@ -23,6 +23,7 @@ from dista.frame import (
     KIND_ACTOR_CALL,
     KIND_ACTOR_CREATE,
     KIND_ACTOR_KILL,
+    KIND_CHECKPOINT,
     KIND_CLAIM,
     KIND_ERROR,
     KIND_FETCH,
@@ -365,13 +366,20 @@ struct Client(Movable):
             deps.append(r.id)
         return self._submit_after[T.R](T.id(), deps, True)
 
-    def create[T: ActorLike](mut self, arg: T.A) raises -> ActorHandle[T]:
+    def create[
+        T: ActorLike
+    ](mut self, arg: T.A, checkpoint_every: Int = 0) raises -> ActorHandle[T]:
         """Starts actor `T` on a worker of its own, built from `arg`.
 
         It returns at once; calls made before the actor is up wait for it.
-        If the constructor raises, every call fails with its error.
+        If the constructor raises, every call fails with its error. With
+        `checkpoint_every` set, its state is checkpointed after every that
+        many calls.
         """
+        if checkpoint_every < 0:
+            raise Error("checkpoint_every can't be negative")
         var args = List[UInt8]()
+        put_scalar[DType.uint64](args, UInt64(checkpoint_every))
         encode(arg, args)
         var id = self._new_id()
         self._actors[id] = True
@@ -392,6 +400,21 @@ struct Client(Movable):
         var id = self._new_id()
         self._submit(id, KIND_ACTOR_CALL, M.id(), body^, List[UInt64]())
         return ObjectRef[M.R](id)
+
+    def checkpoint[
+        T: ActorLike
+    ](mut self, actor: ActorHandle[T]) raises -> ObjectRef[Int]:
+        """Checkpoints `actor` after the calls made to it so far. The result
+        is the number of calls the checkpoint covers, once it's written."""
+        if actor.id in self._lost_actors:
+            raise Error(actor, " was lost when the head restarted")
+        if actor.id in self._killed:
+            raise Error(actor, " was killed")
+        var body = List[UInt8]()
+        put_scalar[DType.uint64](body, actor.id)
+        var id = self._new_id()
+        self._submit(id, KIND_CHECKPOINT, 0, body^, List[UInt64]())
+        return ObjectRef[Int](id)
 
     def kill[T: ActorLike](mut self, actor: ActorHandle[T]) raises:
         """Destroys `actor` once its earlier calls have run, and frees its
@@ -509,7 +532,10 @@ struct Client(Movable):
                 _ = self._subs.pop(id, _Submission(0, 0, [], []))
                 self._drop_local(id)
                 continue
-            if id in self._subs and self._subs[id].kind == KIND_ACTOR_CALL:
+            if id in self._subs and (
+                self._subs[id].kind == KIND_ACTOR_CALL
+                or self._subs[id].kind == KIND_CHECKPOINT
+            ):
                 self._errors[id] = String(
                     "actor lost: the head restarted before this call finished"
                 )

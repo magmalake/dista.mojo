@@ -33,7 +33,8 @@ every input exists, and fails it if an input failed.
 
 `create` starts an actor on a worker of its own and returns its handle;
 `call` runs one of its methods there, in the order of the calls, and returns
-an `ObjectRef` like a task does; `kill` destroys it.
+an `ObjectRef` like a task does; `checkpoint` saves its state to
+`DISTA_CHECKPOINT_URI`; `kill` destroys it.
 """
 
 from std.os import getenv
@@ -267,6 +268,21 @@ struct Runtime[*Ts: TaskLike](Movable):
                 return
 
     @staticmethod
+    def _save(type_id: UInt64, state: StatePtr, mut out: List[UInt8]) raises:
+        comptime for i in range(Self.Ts.length):
+            if Self.Ts[i].is_actor() and Self.Ts[i].id() == type_id:
+                Self.Ts[i].save(state, out)
+                return
+        raise Error("unknown actor ID ", type_id)
+
+    @staticmethod
+    def _restore(type_id: UInt64, bytes: List[UInt8]) raises -> StatePtr:
+        comptime for i in range(Self.Ts.length):
+            if Self.Ts[i].is_actor() and Self.Ts[i].id() == type_id:
+                return Self.Ts[i].restore(bytes)
+        raise Error("unknown actor ID ", type_id)
+
+    @staticmethod
     def _dispatch_list(
         task_id: UInt64,
         args: List[UInt8],
@@ -287,7 +303,12 @@ struct Runtime[*Ts: TaskLike](Movable):
         is where its tasks' client connects.
         """
         var w = Worker[
-            Self._dispatch_list, Self._create, Self._call, Self._destroy
+            Self._dispatch_list,
+            Self._create,
+            Self._call,
+            Self._destroy,
+            Self._save,
+            Self._restore,
         ](head^, Self._registry_hash(), head_addr, rejoin_at)
         while True:
             w.run()
@@ -325,15 +346,28 @@ struct Runtime[*Ts: TaskLike](Movable):
         Self._check_registered[T]()
         return self._c.remote[T](args)
 
-    def create[T: ActorLike](mut self, arg: T.A) raises -> ActorHandle[T]:
+    def create[
+        T: ActorLike
+    ](mut self, arg: T.A, checkpoint_every: Int = 0) raises -> ActorHandle[T]:
         """Starts actor `T` on a worker of its own, built from `arg`.
 
         It returns at once; calls made before the actor is up wait for it.
         If the constructor raises, every call fails with its error. The
         handle is a value: a task given it can call the actor too.
+
+        With `checkpoint_every` set, the actor's state is written to
+        `DISTA_CHECKPOINT_URI` after every that many calls, and a restart
+        restores it from there instead of running every call again.
         """
         Self._check_registered[T]()
-        return self._c.create[T](arg)
+        return self._c.create[T](arg, checkpoint_every)
+
+    def checkpoint[
+        T: ActorLike
+    ](mut self, actor: ActorHandle[T]) raises -> ObjectRef[Int]:
+        """Checkpoints `actor` after the calls made to it so far. The result
+        is the number of calls the checkpoint covers, once it's written."""
+        return self._c.checkpoint(actor)
 
     def call[
         M: MethodLike

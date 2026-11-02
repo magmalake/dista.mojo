@@ -20,12 +20,16 @@ them have their arguments.
 
 A worker the head gives an actor builds its state and then runs only that
 actor's calls, in the order they come. A kill destroys the state, and the
-worker goes back to running tasks.
+worker goes back to running tasks. Between calls the head may ask for a
+checkpoint: the worker writes the state through the codec to
+`DISTA_CHECKPOINT_URI` (see `checkpoint.mojo`), and deletes the checkpoint
+before it. An actor restarted elsewhere is restored from the last one.
 
 If the head goes away, `run` returns and the results here stay. `rejoin`
 introduces the worker to a new head and reports what it holds; the tasks it
 had queued are dropped, since their drivers resubmit them. An actor it
-hosted is destroyed: actors don't survive a head restart yet.
+hosted is destroyed: actors don't survive a head restart yet, though their
+checkpoints stay.
 """
 
 from std.ffi import c_int, external_call
@@ -38,6 +42,9 @@ from dista.frame import (
     KIND_ACTOR_CALL,
     KIND_ACTOR_CREATE,
     KIND_ACTOR_KILL,
+    KIND_ACTOR_RESTORE,
+    KIND_CHECKPOINT,
+    KIND_CHECKPOINTED,
     KIND_ERROR,
     KIND_FETCH,
     KIND_FREE,
@@ -51,6 +58,13 @@ from dista.frame import (
     ROLE_WORKER,
     Frame,
     encode_addr,
+)
+from dista.checkpoint import (
+    checkpoint_location,
+    delete_checkpoint,
+    list_checkpoints,
+    read_checkpoint,
+    write_checkpoint,
 )
 from dista.client import TaskContext
 from dista.task import StatePtr
@@ -95,6 +109,12 @@ comptime CallFn = def(
 
 comptime DestroyFn = def(UInt64, StatePtr) thin
 """Destroys the state of an actor of type `type_id`."""
+
+comptime SaveFn = def(UInt64, StatePtr, mut List[UInt8]) thin raises
+"""Appends the encoded state of an actor of type `type_id`."""
+
+comptime RestoreFn = def(UInt64, List[UInt8]) thin raises -> StatePtr
+"""Builds actor type `type_id`'s state from a checkpoint."""
 
 
 @fieldwise_init
@@ -215,6 +235,8 @@ struct Worker[
     create: CreateFn,
     call: CallFn,
     destroy: DestroyFn,
+    save: SaveFn,
+    restore: RestoreFn,
 ](Movable):
     var _head: Conn
     var _listener: Listener
@@ -252,6 +274,9 @@ struct Worker[
     """Its state, unless its constructor failed."""
     var _actor_error: String
     """Why its constructor failed."""
+    var _written: List[Int]
+    """The actor's checkpoints written or restored here, by the calls each
+    covers, that may still be restored from."""
     var _ctx: TaskContext
     """The client a `CtxTask` calls actors through, opened on first use."""
 
@@ -295,6 +320,7 @@ struct Worker[
         self._actor_type = 0
         self._state = None
         self._actor_error = String()
+        self._written = List[Int]()
         self._ctx = TaskContext(head_addr, resume_at, registry_hash)
 
     @staticmethod
@@ -422,6 +448,8 @@ struct Worker[
             or f.kind == KIND_ACTOR_CREATE
             or f.kind == KIND_ACTOR_CALL
             or f.kind == KIND_ACTOR_KILL
+            or f.kind == KIND_CHECKPOINT
+            or f.kind == KIND_ACTOR_RESTORE
         ):
             var obj = f.object_id
             var task = f.task_id
@@ -585,16 +613,30 @@ struct Worker[
         self._actor = 0
         self._actor_type = 0
         self._actor_error = String()
+        self._written.clear()
 
     def _run_actor(mut self, var t: _Ready) raises:
         """Runs an actor frame: build the actor, call it, or destroy it."""
         var started = wall_ns()
-        if t.kind == KIND_ACTOR_CREATE:
+        if t.kind == KIND_ACTOR_CREATE or t.kind == KIND_ACTOR_RESTORE:
             self._end_actor()
             self._actor = t.object_id
             self._actor_type = t.task_id
             try:
-                self._state = Self.create(t.task_id, t.args)
+                if t.kind == KIND_ACTOR_CREATE:
+                    self._state = Self.create(t.task_id, t.args)
+                else:
+                    var pos = 0
+                    var calls = Int(get_scalar[DType.uint64](t.args, pos))
+                    var bytes = read_checkpoint(
+                        checkpoint_location(t.object_id, calls)
+                    )
+                    self._state = Self.restore(t.task_id, bytes)
+                    # Checkpoints the last worker wrote are this one's to
+                    # delete once they're behind the head's.
+                    self._written = list_checkpoints(t.object_id)
+                    if calls not in self._written:
+                        self._written.append(calls)
             except e:
                 self._actor_error = String(e)
                 self._span(t.object_id, t.arrived, started)
@@ -604,7 +646,20 @@ struct Worker[
             self._to_head(KIND_RESULT, t.object_id, List[UInt8]())
         elif t.kind == KIND_ACTOR_KILL:
             if t.object_id == self._actor:
+                for c in self._written:
+                    try:
+                        delete_checkpoint(checkpoint_location(self._actor, c))
+                    except:
+                        pass
                 self._end_actor()
+        elif t.kind == KIND_CHECKPOINT:
+            var pos = 0
+            var keep = -1
+            try:
+                keep = Int(get_scalar[DType.int64](t.args, pos))
+            except:
+                pass
+            self._checkpoint(t.object_id, Int(t.task_id), keep)
         else:
             var out = List[UInt8]()
             try:
@@ -627,6 +682,35 @@ struct Worker[
                 self._report_error(t.object_id, String(e))
                 return
             self._finish(t.object_id, t.arrived, started, out^)
+
+    def _checkpoint(mut self, a: UInt64, calls: Int, keep: Int):
+        """Writes actor `a`'s state after `calls` calls, and says so.
+
+        The head would restore from the checkpoint after `keep` calls (-1 for
+        none) until it hears of this one, so only those before it go."""
+        var why = String()
+        try:
+            if a != self._actor:
+                raise Error("actor ", a, " is not on this worker")
+            if not self._state:
+                raise Error("actor failed to start: ", self._actor_error)
+            var bytes = List[UInt8]()
+            Self.save(self._actor_type, self._state.value(), bytes)
+            write_checkpoint(checkpoint_location(a, calls), bytes)
+            var still = List[Int]()
+            for c in self._written:
+                if c < keep:
+                    delete_checkpoint(checkpoint_location(a, c))
+                elif c != calls:
+                    still.append(c)
+            still.append(calls)
+            self._written = still^
+        except e:
+            why = String(e)
+        try:
+            self._head.send(KIND_CHECKPOINTED, a, UInt64(calls), why.as_bytes())
+        except:
+            self._head.closed = True
 
     def _run_one(mut self) raises:
         var t = self._ready.pop(0)

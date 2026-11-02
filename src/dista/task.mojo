@@ -35,7 +35,9 @@ comptime Add = Method[CounterActor, Int, Int, add]
 
 Actors and methods go in the runtime's registry with the tasks. The worker
 hosting an actor keeps its state behind a `StatePtr`, which only the actor's
-own `create` and `destroy` and its methods' `call` cast back to its type.
+own `create`, `destroy`, `save` and `restore` and its methods' `call` cast
+back to its type. A checkpoint is the state through the codec, so a state
+type that implements `Codec` chooses what it saves.
 """
 
 from std.memory.alloc import unsafe_alloc
@@ -100,6 +102,16 @@ trait TaskLike:
     def destroy(state: StatePtr):
         """An actor: destroys the state `create` built."""
         pass
+
+    @staticmethod
+    def save(state: StatePtr, mut out: List[UInt8]) raises:
+        """An actor: appends its state's encoding, a checkpoint."""
+        raise Error(Self.name(), " is not an actor")
+
+    @staticmethod
+    def restore(bytes: Span[UInt8, _]) raises -> StatePtr:
+        """An actor: builds the state again from a checkpoint `save` wrote."""
+        raise Error(Self.name(), " is not an actor")
 
     @staticmethod
     def call(
@@ -194,6 +206,20 @@ struct Actor[
         var p = state.unsafe_bitcast[Self.S]()
         _ = p.unsafe_take_pointee()
         p.unsafe_free()
+
+    @staticmethod
+    def save(state: StatePtr, mut out: List[UInt8]) raises:
+        encode(state.unsafe_bitcast[Self.S]()[], out)
+
+    @staticmethod
+    def restore(bytes: Span[UInt8, _]) raises -> StatePtr:
+        var p = unsafe_alloc[Self.S](1)
+        try:
+            p.unsafe_write(_decode_all[Self.S](Self.name(), bytes))
+        except e:
+            p.unsafe_free()
+            raise e^
+        return p.unsafe_bitcast[NoneType]()
 
 
 struct Method[

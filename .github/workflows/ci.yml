@@ -22,7 +22,7 @@ jobs:
         with:
           path: dista.mojo
 
-      # The nightly compiles memory-region and arrow-mlake from source,
+      # The nightly compiles memory-region, arrow-mlake and objectstore from source,
       # because their packages are precompiled by 1.2.0 and a 1.3 compiler
       # refuses them. The refs match the pins in pixi.toml.
       - if: matrix.env == 'nightly'
@@ -37,6 +37,12 @@ jobs:
           repository: magmalake/arrow-mlake.mojo
           ref: d157bb3296b4f6d36feae2848ebf6e0c7e4f9f5e
           path: arrow-mlake.mojo
+      - if: matrix.env == 'nightly'
+        uses: actions/checkout@v4
+        with:
+          repository: magmalake/objectstore.mojo
+          ref: 748e2d31450a7793592e439d6c69d8c6598d2129
+          path: objectstore.mojo
 
       - uses: prefix-dev/setup-pixi@v0.10.2
         with:
