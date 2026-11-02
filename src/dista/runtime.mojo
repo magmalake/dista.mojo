@@ -334,6 +334,28 @@ struct Runtime[*Ts: TaskLike](Movable):
         Self._check_registered[T]()
         return self._c.remote_many[T](arg, n)
 
+    def remote_many[
+        T: ManyLike
+    ](mut self, arg: ObjectRef[T.A], n: Int) raises -> List[ObjectRef[T.Part]]:
+        """Submits task `T`, a `TaskMany`, to run on another task's result
+        once it exists, for `n` results."""
+        Self._check_registered[T]()
+        return self._c.remote_many[T](arg, n)
+
+    def remote_many[
+        X: AnyType, //, T: ManyLike
+    ](mut self, args: List[ObjectRef[X]], n: Int) raises -> List[
+        ObjectRef[T.Part]
+    ]:
+        """Submits task `T`, a `TaskMany` taking a `Seq[X]`, to run on these
+        results once they exist, for `n` results.
+
+        A shuffle's later stage takes this shape: it partitions again what
+        earlier tasks made, without the driver fetching it.
+        """
+        Self._check_registered[T]()
+        return self._c.remote_many[T](args, n)
+
     def create[
         T: ActorLike
     ](mut self, arg: T.A, checkpoint_every: Int = 0) raises -> ActorHandle[T]:

@@ -59,6 +59,7 @@ from dista.frame import (
     KIND_TASK_MANY,
     GATHER,
     WITH_VALUE,
+    MANY,
     ROLE_WORKER,
     Frame,
     encode_addr,
@@ -141,6 +142,8 @@ struct InputSpec(Copyable, Movable):
 
 @fieldwise_init
 struct TaskInputs(Movable):
+    var many: Int
+    """A `TaskMany`'s number of results; 0 for any other task."""
     var gather: Bool
     var inputs: List[InputSpec]
     var value: List[UInt8]
@@ -154,6 +157,11 @@ def parse_task_inputs(payload: Span[UInt8, _]) raises -> TaskInputs:
     var flags = payload[0]
     var gather = (flags & GATHER) != 0
     var pos = 1
+    var many = 0
+    if flags & MANY:
+        many = Int(get_scalar[DType.uint64](payload, pos))
+        if many < 1 or many > 1 << 20:
+            raise Error("bad task-inputs result count ", many)
     var n = Int(get_scalar[DType.uint64](payload, pos))
     if n < 0 or n > len(payload):
         raise Error("bad task-inputs count ", n)
@@ -190,7 +198,7 @@ def parse_task_inputs(payload: Span[UInt8, _]) raises -> TaskInputs:
         value = List[UInt8](payload[pos:])
     elif pos != len(payload):
         raise Error("task-inputs with ", len(payload) - pos, " bytes left over")
-    return TaskInputs(gather, inputs^, value^)
+    return TaskInputs(many, gather, inputs^, value^)
 
 
 struct _Input(Copyable, Movable):
@@ -215,6 +223,8 @@ struct _Parked(Copyable, Movable):
     var inputs: List[_Input]
     var value: List[UInt8]
     var arrived: UInt64
+    var many: Int
+    """A `TaskMany`'s number of results; 0 for any other task."""
 
     def __init__(
         out self,
@@ -223,9 +233,11 @@ struct _Parked(Copyable, Movable):
         gather: Bool,
         var inputs: List[_Input],
         var value: List[UInt8],
+        many: Int = 0,
     ):
         self.object_id = object_id
         self.task_id = task_id
+        self.many = many
         self.gather = gather
         self.inputs = inputs^
         self.value = value^
@@ -533,6 +545,7 @@ struct Worker[
         elif f.kind == KIND_TASK_INPUTS:
             var spec = parse_task_inputs(f.payload)
             var gather = spec.gather
+            var many = spec.many
             var inputs = List[_Input](capacity=len(spec.inputs))
             for ref inp in spec.inputs:
                 var obj = inp.object_id
@@ -551,7 +564,12 @@ struct Worker[
                     inputs.append(_Input(obj, False, List[UInt8]()))
             self._parked.append(
                 _Parked(
-                    f.object_id, f.task_id, gather, inputs^, spec.value.copy()
+                    f.object_id,
+                    f.task_id,
+                    gather,
+                    inputs^,
+                    spec.value.copy(),
+                    many,
                 )
             )
         elif f.kind == KIND_STOP:
@@ -634,11 +652,20 @@ struct Worker[
                 elif inp.object_id not in self._objects:
                     complete = False
             if failed:
-                self._report_error(p.object_id, String("input lost: ", failed))
+                var first = p.object_id
+                var parts = max(p.many, 1)
+                for k in range(parts):
+                    self._report_error(
+                        first + UInt64(k), String("input lost: ", failed)
+                    )
             elif not complete:
                 still.append(p.copy())
             else:
-                var args = p.value.copy()
+                # A `TaskMany` runs on its number of results, then the input.
+                var args = List[UInt8]()
+                if p.many > 0:
+                    put_scalar[DType.uint64](args, UInt64(p.many))
+                args.extend(p.value.copy())
                 if p.gather:
                     put_scalar[DType.int64](args, Int64(len(p.inputs)))
                 if self._debug:
@@ -662,8 +689,9 @@ struct Worker[
                         args.extend(
                             self._objects.get(inp.object_id, List[UInt8]())
                         )
+                var kind = KIND_TASK_MANY if p.many > 0 else KIND_TASK
                 self._ready.append(
-                    _Ready(p.object_id, p.task_id, args^, p.arrived)
+                    _Ready(p.object_id, p.task_id, args^, p.arrived, kind=kind)
                 )
         self._parked = still^
         # Fetched copies nothing parked still waits on have done their job.

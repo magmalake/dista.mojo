@@ -71,7 +71,9 @@ hosted: its state may hold calls no caller would resend.
 
 A task-after frame queues a task whose argument is built from other results:
 the single result as is, or with gather set, a `Seq` of all of them; with
-`WITH_VALUE` set, after an encoded value (a `TaskWith`).
+`WITH_VALUE` set, after an encoded value (a `TaskWith`). With `MANY` set it's
+a `TaskMany`, whose results, the object ID and the ones after it, number the
+u64 that follows the flags byte; the task-inputs frame carries it on.
 
 A task-many frame runs a `TaskMany`: its worker answers each of its results
 with its own result, stored or error frame, as if each were a task. When
@@ -121,6 +123,9 @@ comptime GATHER: UInt8 = 1
 """Task-after and task-inputs flag: the inputs gather into a `Seq`."""
 comptime WITH_VALUE: UInt8 = 2
 """Task-after and task-inputs flag: an encoded value goes before them."""
+comptime MANY: UInt8 = 4
+"""Task-after and task-inputs flag: the task is a `TaskMany`, and the number
+of its results, a u64, follows the flags byte."""
 comptime ADDR_SIZE = 12
 comptime ROLE_DRIVER: UInt8 = 1
 comptime ROLE_WORKER: UInt8 = 2

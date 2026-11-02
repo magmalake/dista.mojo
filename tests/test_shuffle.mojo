@@ -43,6 +43,24 @@ def square(x: Int) -> Int:
     return x * x
 
 
+def halves(s: String) -> Seq[Int]:
+    """Two results from one input: the lengths of its halves."""
+    var n = s.byte_length()
+    return Seq[Int]([n // 2, n - n // 2])
+
+
+def by_parity(xs: Seq[Int]) -> Seq[Int]:
+    """Two results from many inputs: the sums of the even and odd ones."""
+    var even = 0
+    var odd = 0
+    for i in range(len(xs)):
+        if xs[i] % 2 == 0:
+            even += xs[i]
+        else:
+            odd += xs[i]
+    return Seq[Int]([even, odd])
+
+
 @fieldwise_init
 struct Pair(Copyable, Movable):
     var key: Int
@@ -95,6 +113,8 @@ comptime Length = Task[String, Int, length]
 comptime ScaledSum = TaskWith[Int, Int, Int, scaled_sum]
 comptime Square = Task[Int, Int, square]
 comptime MapRows = TaskMany[Int, Seq[Pair], map_rows]
+comptime Halves = TaskMany[String, Int, halves]
+comptime ByParity = TaskMany[Seq[Int], Int, by_parity]
 comptime ReducePart = TaskWith[Int, Seq[Pair], Seq[Pair], reduce_part]
 comptime RT = Runtime[
     Split3,
@@ -106,6 +126,8 @@ comptime RT = Runtime[
     Square,
     MapRows,
     ReducePart,
+    Halves,
+    ByParity,
 ]
 
 
@@ -125,6 +147,40 @@ def test_the_wrong_number_of_results_fails_them_all() raises:
     var r = rt.remote_many[WrongCount](1, 2)
     for k in range(2):
         with assert_raises(contains="returned 1 results, not 2"):
+            _ = rt.get(r[k])
+
+
+def test_a_task_many_on_another_tasks_result() raises:
+    """A `TaskMany` can wait on one result: a small one through the head,
+    and a large one fetched from the worker holding it."""
+    var rt = RT(workers=2)
+    var small = rt.remote_many[Split3](rt.remote[Square](3), 3)
+    assert_equal(rt.get(small[0]), 9)
+    assert_equal(rt.get(small[2]), 11)
+    comptime N = 200_001
+    var big = rt.remote_many[Blocks](N, 2)
+    var h = rt.remote_many[Halves](big[0], 2)
+    assert_equal(rt.get(h[0]), N // 2)
+    assert_equal(rt.get(h[1]), N - N // 2)
+
+
+def test_a_task_many_on_a_list_of_results() raises:
+    """A `TaskMany` taking a `Seq` can wait on several results, in order."""
+    var rt = RT(workers=2)
+    var squares = List[ObjectRef[Int]]()
+    for i in range(1, 7):
+        squares.append(rt.remote[Square](i))
+    var p = rt.remote_many[ByParity](squares, 2)
+    assert_equal(rt.get(p[0]), 4 + 16 + 36)
+    assert_equal(rt.get(p[1]), 1 + 9 + 25)
+
+
+def test_a_failed_input_fails_every_result_of_a_task_many() raises:
+    var rt = RT(workers=2)
+    var bad = rt.remote_many[WrongCount](1, 2)
+    var r = rt.remote_many[Split3](bad[0], 3)
+    for k in range(3):
+        with assert_raises(contains="input failed"):
             _ = rt.get(r[k])
 
 

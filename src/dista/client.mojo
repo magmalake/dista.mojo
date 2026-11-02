@@ -41,6 +41,7 @@ from dista.frame import (
     KIND_TASK_MANY,
     GATHER,
     WITH_VALUE,
+    MANY,
     KIND_TIMELINE,
     KIND_WELCOME,
     ROLE_CLIENT,
@@ -572,6 +573,50 @@ struct Client(Movable):
         for k in range(1, n):
             self._live[refs[k].id] = True
         self._submit(refs[0].id, KIND_TASK_MANY, T.id(), body^, List[UInt64]())
+        return refs^
+
+    def remote_many[
+        T: ManyLike
+    ](mut self, arg: ObjectRef[T.A], n: Int) raises -> List[ObjectRef[T.Part]]:
+        """Submits task `T`, a `TaskMany`, to run on another task's result
+        once it exists, for `n` results."""
+        return self._submit_many_after[T.Part](T.id(), [arg.id], False, n)
+
+    def remote_many[
+        X: AnyType, //, T: ManyLike
+    ](mut self, args: List[ObjectRef[X]], n: Int) raises -> List[
+        ObjectRef[T.Part]
+    ]:
+        """Submits task `T`, a `TaskMany` taking a `Seq[X]`, to run on these
+        results once they all exist, for `n` results: a shuffle's second
+        stage, partitioning what the first made."""
+        comptime assert (
+            reflect[T.A].base_name() == "Seq"
+        ), "a task given a list of ObjectRefs must take a Seq"
+        var deps = List[UInt64](capacity=len(args))
+        for r in args:
+            deps.append(r.id)
+        return self._submit_many_after[T.Part](T.id(), deps, True, n)
+
+    def _submit_many_after[
+        X: AnyType
+    ](
+        mut self, task_id: UInt64, deps: List[UInt64], gather: Bool, n: Int
+    ) raises -> List[ObjectRef[X]]:
+        if n < 1:
+            raise Error("remote_many needs at least one result")
+        var flags = MANY | (GATHER if gather else UInt8(0))
+        var body: List[UInt8] = [flags]
+        put_scalar[DType.uint64](body, UInt64(n))
+        put_scalar[DType.uint64](body, UInt64(len(deps)))
+        for d in deps:
+            put_scalar[DType.uint64](body, d)
+        var refs = List[ObjectRef[X]](capacity=n)
+        for _ in range(n):
+            refs.append(ObjectRef[X](self._new_id()))
+        for k in range(1, n):
+            self._live[refs[k].id] = True
+        self._submit(refs[0].id, KIND_TASK_AFTER, task_id, body^, deps.copy())
         return refs^
 
     def create[
