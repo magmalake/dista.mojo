@@ -67,13 +67,7 @@ def _check(head: Head) raises:
 def _connect(mut head: Head, mut peers: List[Stream]) raises -> Int:
     var pair = stream_pair()
     peers.append(pair.pop())
-    head._conns.append(Conn(pair.pop()))
-    head._roles.append(0)
-    head._inflight.append(List[UInt64]())
-    head._worker_addr.append(List[UInt8]())
-    head._hosting.append(0)
-    head._hashes.append(0)
-    return len(head._conns) - 1
+    return head._add_conn(Conn(pair.pop()))
 
 
 def target(data: List[UInt8]) raises:

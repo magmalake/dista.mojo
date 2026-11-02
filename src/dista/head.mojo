@@ -652,14 +652,19 @@ struct Head(Movable):
         return out^
 
     def _accept(mut self) raises:
-        var s = self._listener.accept()
-        self._conns.append(Conn(s^))
+        self._add_conn(Conn(self._listener.accept()))
+
+    def _add_conn(mut self, var conn: Conn) -> Int:
+        """A new connection, with an entry in every per-connection list; its
+        index. The fuzzer adds its connections here too."""
+        self._conns.append(conn^)
         self._roles.append(_ROLE_NONE)
         self._inflight.append(List[UInt64]())
         self._worker_addr.append(List[UInt8]())
         self._node.append(String())
         self._hosting.append(0)
         self._hashes.append(0)
+        return len(self._conns) - 1
 
     def _handle(mut self, i: Int, var f: Frame) raises:
         var role = self._roles[i]

@@ -30,5 +30,9 @@ out=$(DISTA_HEAD=localhost:$port ./build/locality-driver)
 echo "driver: $out"
 n=$(echo "$out" | sed -n 's/^local \([0-9]*\) of 40$/\1/p')
 [ -n "$n" ] || { echo "FAIL: no answer"; exit 1; }
-[ "$n" -ge 36 ] || { echo "FAIL: only $n of 40 tasks ran beside their input"; exit 1; }
+# By chance about 20 of 40 would, give or take 3. A task still goes to the
+# other node when every worker on its own is busy, which on a small machine
+# happens more, so the bar is 28: chance alone gets there well under 1% of
+# the time. Locally it's 37 to 40.
+[ "$n" -ge 28 ] || { echo "FAIL: only $n of 40 tasks ran beside their input"; exit 1; }
 echo "PASS locality: $n of 40 tasks ran on the node holding their input"
