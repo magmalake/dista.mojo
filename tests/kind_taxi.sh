@@ -35,7 +35,10 @@ esac
 # compiles, side by side, without build output.
 stage=build/taxi-context
 rm -rf "$stage" && mkdir -p "$stage"
-for repo in dista memory-region arrow-mlake parquet iceberg threads thrift \
+# dista itself from this checkout, which needn't be ../dista.mojo (a
+# worktree isn't).
+rsync -a --exclude .pixi --exclude build --exclude .git ./ "$stage/dista.mojo/"
+for repo in memory-region arrow-mlake parquet iceberg threads thrift \
     hashes snappy deflate avro roaring objectstore zstd lz4 brotli sqlite \
     postgres; do
   rsync -a --exclude .pixi --exclude build --exclude .git \
