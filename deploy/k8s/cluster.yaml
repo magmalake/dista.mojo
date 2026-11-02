@@ -36,8 +36,11 @@ spec:
           env:
             - {name: DISTA_ROLE, value: head}
             - {name: DISTA_PORT, value: "6390"}
+            # Prometheus metrics at /metrics.
+            - {name: DISTA_METRICS_PORT, value: "9090"}
           ports:
             - {name: dista, containerPort: 6390}
+            - {name: metrics, containerPort: 9090}
           readinessProbe:
             tcpSocket: {port: 6390}
             periodSeconds: 2
@@ -66,9 +69,12 @@ spec:
         - name: worker
           image: dista:smoke
           imagePullPolicy: IfNotPresent
+          ports:
+            - {name: metrics, containerPort: 9090}
           env:
             - {name: DISTA_ROLE, value: worker}
             - {name: DISTA_HEAD, value: "dista-head:6390"}
+            - {name: DISTA_METRICS_PORT, value: "9090"}
             # Peers and drivers fetch large results from this address.
             - name: DISTA_ADVERTISE
               valueFrom: {fieldRef: {fieldPath: status.podIP}}
