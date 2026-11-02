@@ -19,8 +19,11 @@ Small results come through the head, which keeps them, because a task
 submitted later may take one as input. A large result stays on the worker
 that computed it: the head records where, tells the owning driver, and sends
 a task that needs it as task-inputs, so the worker running that task fetches
-it from its peer. A worker that goes away fails the tasks it had in flight
-and loses the results it held.
+it from its peer. A worker that goes away loses the results it held: dista
+doesn't rebuild them (that's Ray's lineage reconstruction), so a task that
+needs one fails, naming it, and an orchestrator runs the job again. The
+tasks it was running are sent to another worker, up to `DISTA_TASK_RETRIES`
+times (default 3), unless an input they read from that worker is gone too.
 
 Every object is reference counted: its driver holds it until it releases it
 (or disconnects), and each submitted task taking it as input holds it until
@@ -61,6 +64,7 @@ resend run on that: every call no checkpoint includes, answered or not.
 """
 
 from std.ffi import c_int
+from std.os import getenv
 
 from dista.codec import get_scalar, put_scalar
 from dista.conn import Conn
@@ -253,6 +257,18 @@ struct _Queue(Copyable, Movable, Sized):
         return len(self.tasks) - self.head
 
 
+def _lost_result(obj: UInt64) -> String:
+    """The error for a result whose worker went away with it."""
+    return String(
+        "result ",
+        obj,
+        (
+            " lost: its worker went away, and dista doesn't rebuild lost"
+            " results; run the job again"
+        ),
+    )
+
+
 comptime LOOKAHEAD = 64
 """How far into its queue a free worker looks for a task to take."""
 
@@ -262,6 +278,9 @@ struct Head(Movable):
     var _registry_hash: UInt64
     var _pipeline: Int
     var _exit_when_idle: Bool
+    var _workers_seen: Bool
+    """Whether a worker has said hello. In local mode, once every worker
+    seen is gone, nothing can replace them, and queued tasks fail."""
     var _conns: List[Conn]
     var _roles: List[UInt8]
     var _inflight: List[List[UInt64]]
@@ -309,6 +328,14 @@ struct Head(Movable):
     var _resuming: Dict[UInt64, Bool]
     """Drivers that came back with their old number and haven't finished
     resuming: the actors they create again are restored, not built."""
+    var _running: Dict[UInt64, _Task]
+    """Every task sent to a worker and not settled, kept to send again if
+    the worker goes away."""
+    var _tries: Dict[UInt64, Int]
+    """How many times each of those has been sent."""
+    var _max_retries: Int
+    """How many times a task whose worker went away runs again:
+    `DISTA_TASK_RETRIES`, default 3."""
     var _spans: Dict[UInt64, _Span]
     """Tasks in progress, by object."""
     var _finished: Dict[UInt64, List[_Span]]
@@ -333,6 +360,8 @@ struct Head(Movable):
     var _durations: Histogram
     """Tasks' and calls' run times on their workers."""
     var _restarts: Int
+    var _retried: Int
+    """Tasks sent again because their worker went away."""
     var _checkpoints: Int
     var _checkpoint_failures: Int
 
@@ -355,6 +384,7 @@ struct Head(Movable):
         self._registry_hash = registry_hash
         self._pipeline = pipeline
         self._exit_when_idle = exit_when_idle
+        self._workers_seen = False
         self._conns = List[Conn]()
         self._roles = List[UInt8]()
         self._inflight = List[List[UInt64]]()
@@ -366,6 +396,13 @@ struct Head(Movable):
         self._driver_hash = Dict[UInt64, UInt64]()
         self._stopped = False
         self._many = Dict[UInt64, Int]()
+        self._running = Dict[UInt64, _Task]()
+        self._tries = Dict[UInt64, Int]()
+        self._max_retries = 3
+        try:
+            self._max_retries = Int(getenv("DISTA_TASK_RETRIES", "3"))
+        except:
+            pass
         self._waiting = List[_Task]()
         self._results = Dict[UInt64, List[UInt8]]()
         self._errors = Dict[UInt64, String]()
@@ -395,6 +432,7 @@ struct Head(Movable):
         self._submitted = 0
         self._finished_ok = 0
         self._finished_err = 0
+        self._retried = 0
         self._durations = Histogram()
         self._restarts = 0
         self._checkpoints = 0
@@ -480,6 +518,13 @@ struct Head(Movable):
             "Tasks, actor calls and actors settled, by outcome.",
             self._finished_ok,
             self._finished_err,
+        )
+        write_metric(
+            out,
+            "counter",
+            "dista_tasks_retried_total",
+            "Tasks sent again because their worker went away.",
+            self._retried,
         )
         self._durations.write(
             out,
@@ -652,7 +697,7 @@ struct Head(Movable):
         return out^
 
     def _accept(mut self) raises:
-        self._add_conn(Conn(self._listener.accept()))
+        _ = self._add_conn(Conn(self._listener.accept()))
 
     def _add_conn(mut self, var conn: Conn) -> Int:
         """A new connection, with an entry in every per-connection list; its
@@ -1287,6 +1332,7 @@ struct Head(Movable):
                 raise Error("a worker's hello must carry its address")
             self._roles[i] = ROLE_WORKER
             self._worker_addr[i] = List[UInt8](f.payload[9:])
+            self._workers_seen = True
         else:
             raise Error("unknown role ", Int(f.payload[0]))
 
@@ -1336,6 +1382,8 @@ struct Head(Movable):
     def _settle(mut self, object_id: UInt64):
         """`object_id`'s task is done: it no longer holds its inputs."""
         _ = self._many.pop(object_id, 0)
+        _ = self._running.pop(object_id, _Task(0, 0, List[UInt8]()))
+        _ = self._tries.pop(object_id, 0)
         var deps = self._deps_of.pop(object_id, List[UInt64]())
         for d in deps:
             self._dec(d)
@@ -1510,21 +1558,9 @@ struct Head(Movable):
                             replays[t.object_id] = True
                 except:
                     pass
-            var lost = self._inflight[i].copy()
-            self._inflight[i].clear()
-            for obj in lost:
-                if obj in replays:
-                    continue
-                # A `TaskMany`'s worker answers its first result last, so
-                # it's in flight until every result is answered.
-                var parts = self._many.pop(obj, 1)
-                for k in range(parts):
-                    var part = obj + UInt64(k)
-                    if k > 0 and self._answered(part):
-                        continue
-                    self._fail(
-                        part, String("worker lost while running this task")
-                    )
+            # The results it held are gone. dista doesn't rebuild them by
+            # running their tasks again (Ray's lineage reconstruction): a job
+            # that needs one fails, and the orchestrator runs it again.
             var held = List[UInt64]()
             for entry in self._location.items():
                 if entry.value == i:
@@ -1534,7 +1570,88 @@ struct Head(Movable):
                 _ = self._where.pop(obj, List[UInt8]())
                 if self._orphans.pop(obj, False):
                     continue
-                self._fail(obj, String("result lost: its worker went away"))
+                self._fail(obj, _lost_result(obj))
+            # The tasks it was running run again elsewhere, up to
+            # `_max_retries` times, unless an input they read from a worker
+            # is gone too.
+            var lost = self._inflight[i].copy()
+            self._inflight[i].clear()
+            for obj in lost:
+                if obj in replays:
+                    continue
+                var why = self._why_not_retry(obj)
+                if why == "":
+                    try:
+                        var t = self._running.pop(obj)
+                        self._enqueue(t^)
+                        self._retried += 1
+                        continue
+                    except:
+                        why = String("worker lost while running this task")
+                # A `TaskMany`'s worker answers its first result last, so
+                # it's in flight until every result is answered.
+                var parts = self._many.pop(obj, 1)
+                for k in range(parts):
+                    var part = obj + UInt64(k)
+                    if k > 0 and self._answered(part):
+                        continue
+                    self._fail(part, why.copy())
+
+    def _any_worker(self) -> Bool:
+        for i in range(len(self._conns)):
+            if self._roles[i] == ROLE_WORKER:
+                return True
+        return False
+
+    def _fail_queued(mut self):
+        """Fails every queued task: in local mode, with every worker gone,
+        nothing will run them, and a driver waiting on one would wait for
+        ever."""
+        var queued = List[_Task]()
+        for entry in self._queues.items():
+            ref q = entry.value
+            for k in range(q.head, len(q.tasks)):
+                queued.append(q.tasks[k].copy())
+        self._queues = Dict[UInt64, _Queue]()
+        for ref t in queued:
+            var parts = self._many.get(t.object_id, 1)
+            for k in range(parts):
+                self._fail(
+                    t.object_id + UInt64(k),
+                    String("no workers left: every local worker went away"),
+                )
+
+    def _why_not_retry(self, obj: UInt64) -> String:
+        """Why the task making `obj`, whose worker went away, can't run
+        again: "" if it can."""
+        var tries = self._tries.get(obj, 0)
+        if obj not in self._running:
+            return String("worker lost while running this task")
+        if tries > self._max_retries:
+            return String(
+                "worker lost while running this task, ",
+                tries,
+                " times (DISTA_TASK_RETRIES is ",
+                self._max_retries,
+                ")",
+            )
+        for d in self._deps_of.get(obj, List[UInt64]()):
+            if d in self._errors:
+                return String(
+                    (
+                        "worker lost while running this task, and an input with"
+                        " it: "
+                    ),
+                    self._errors.get(d, String()),
+                )
+        var parts = self._many.get(obj, 1)
+        for k in range(1, parts):
+            if self._answered(obj + UInt64(k)):
+                return String(
+                    "worker lost while running this task, after some of its"
+                    " results were answered"
+                )
+        return String()
 
     def _shutdown(mut self):
         for i in range(len(self._conns)):
@@ -1698,6 +1815,13 @@ struct Head(Movable):
             self._place()
         except e:
             print("dista head: placing an actor:", e)
+        if (
+            self._exit_when_idle
+            and self._workers_seen
+            and not self._any_worker()
+        ):
+            self._fail_queued()
+            return
         for depth in range(self._pipeline):
             for i in range(len(self._conns)):
                 if self._roles[i] != ROLE_WORKER or self._hosting[i] != 0:
@@ -1732,8 +1856,13 @@ struct Head(Movable):
                         sp.dispatched = wall_ns()
                     except:
                         pass
+                self._tries[t.object_id] = self._tries.get(t.object_id, 0) + 1
+                var sent = t.copy()
+                self._running[t.object_id] = t^
                 try:
-                    self._conns[i].send(t.kind, t.object_id, t.task_id, t.args)
+                    self._conns[i].send(
+                        sent.kind, sent.object_id, sent.task_id, sent.args
+                    )
                 except e:
                     print("dista head: lost worker:", e)
                     self._drop(i)

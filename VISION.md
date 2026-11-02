@@ -44,6 +44,7 @@ Later, the same core serves stateful work: actors that hold a model, a cache or 
 - **Not a cluster manager.** Kubernetes places pods, restarts them and scales them. dista schedules tasks inside the pods it's given.
 - **Not a dataframe or SQL engine.** dista runs the tasks; libraries like iceberg-mojo and parquet do the data work inside them.
 - **Not multi-tenant at first.** One job per cluster, trusted code, no per-user isolation or quotas.
+- **No lineage reconstruction.** Ray rebuilds a result lost with its worker by re-running the tasks that made it, back through their inputs. dista doesn't: it re-runs the tasks a dead worker was running, but a job that needs a result that's gone fails, naming it, and the orchestrator ([orca](https://github.com/magmalake/orca.mojo)) runs that job again. For batch jobs of seconds to minutes, running one again costs little, and it keeps the head from holding every task's arguments for as long as its result lives.
 
 ## Where it goes
 
@@ -52,7 +53,7 @@ Each phase ends at a gate: a working demo, not a feature list.
 1. **One machine, many processes.** `remote[f](args) -> ObjectRef` and `get(ref)`, a head service, workers and the function registry, talking over flare. *Gate:* a fan-out and gather of 1,000 tasks runs correctly across 4 local worker processes.
 2. **A real cluster.** A shared-memory object store on each node, Arrow Flight between nodes, and deployment on Kubernetes from plain manifests (head StatefulSet, worker Deployment). *Gate:* a distributed Iceberg scan of the taxi data on a 3-node cluster returns the same answer as one machine.
 3. **Actors.** Stateful structs that take ordered method calls, placed and restarted by the head. *Gate:* a long-lived actor survives its worker restarting, with its state restored.
-4. **Hardening.** Lost objects rebuilt by re-running the tasks that made them, data-aware scheduling, and a Kubernetes operator with autoscaling. *Gate:* the taxi suite finishes with a worker killed mid-run.
+4. **Hardening.** Tasks whose worker dies run again elsewhere, data-aware scheduling, and a Kubernetes operator with autoscaling. Results lost with a worker are not rebuilt: a job that needs one fails, and orca runs it again (see Non-goals). *Gate:* the taxi suite finishes with a worker killed mid-run.
 
 ## What success looks like
 
@@ -64,7 +65,7 @@ dista works if a Mojo program goes from one machine to a cluster without changin
 | Task overhead | Under 1 ms per empty task, end to end on one node | Small tasks stay worth sending |
 | Data movement | No copy for Arrow results within a node | Keeps Mojo's speed through the data path |
 | Code change | A single-machine program becomes distributed by adding `remote` and `get` | The programming model is the product |
-| Recovery | A killed worker costs re-running its tasks, not the whole job | Batch jobs finish on real clusters |
+| Recovery | A killed worker costs re-running its tasks, not the whole job, unless the job needed a result the worker held | Batch jobs finish on real clusters |
 | Core size | Under 10k lines, outside the tins it builds on | Small and explainable |
 
 ## Decisions
