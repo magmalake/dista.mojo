@@ -1,3 +1,4 @@
 .pixi/
 build/
 *.conda
+__pycache__/
