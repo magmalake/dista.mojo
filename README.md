@@ -30,9 +30,10 @@ DISTA_HEAD=headhost:6390 ./app                         # the driver
 ```
 
 What works today:
+- **Up to three arguments:** `Task2` and `Task3` take two and three, as `rt.remote[T](a, b)` and `rt.remote[T](a, b, c)` ([tests/test_arity.mojo](tests/test_arity.mojo)); more travel as a struct.
 - **Arguments and results:** scalars, `String`, plain structs of those, `Seq[T]` lists, types that implement `Codec`, and arrow-mlake `RecordBatch`es, which travel as Arrow IPC streams.
 - **Results feeding tasks:** a task can take another task's `ObjectRef`, or gather a list of them into a `Seq`, as in [examples/mapreduce.mojo](examples/mapreduce.mojo).
-- **Errors:** a task that raises re-raises in `get`, and a worker that dies fails only its own tasks.
+- **Errors:** a task that raises re-raises in `get`. A worker that dies has its tasks run again elsewhere, up to `DISTA_TASK_RETRIES` times; the results it held are lost, and a task that needs one fails, naming it.
 - **Large results stay on the worker that made them.** On the same host other processes map them from shared memory; across hosts they fetch them directly from that worker. Small ones come back through the head.
 - **Speed:** small tasks cost about 6 µs each.
 - **Kubernetes:** one image for every role, and manifests for a head and workers, in [deploy/](deploy). CI runs a smoke test on a 3-node kind cluster.
