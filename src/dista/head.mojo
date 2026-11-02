@@ -47,8 +47,13 @@ keeps its first answer, and the replay's is dropped.
 A checkpoint is asked for every `checkpoint_every` calls, if the actor was
 created with one, and whenever a driver asks. The head sends it to the
 actor's worker between calls, numbered by the calls it covers, and once the
-worker says it's written, forgets the calls it covers. A head restart still
-loses actors, since the call log is the head's.
+worker says it's written, forgets the calls it covers, and tells each
+caller the newest of its calls the checkpoint includes.
+
+After a head restart, a resuming driver creates its actors again. The head
+restores each from its newest checkpoint in `DISTA_CHECKPOINT_URI`, which
+the head lists, or builds it if there's none, and the calls the callers
+resend run on that: every call no checkpoint includes, answered or not.
 """
 
 from std.ffi import c_int
@@ -65,6 +70,7 @@ from dista.frame import (
     KIND_CHECKPOINT,
     KIND_CHECKPOINTED,
     KIND_CLAIM,
+    KIND_COVERED,
     KIND_ERROR,
     KIND_FREE,
     KIND_HELLO,
@@ -95,6 +101,7 @@ from dista.socket import (
     poll,
     wall_ns,
 )
+from dista.checkpoint import newest_checkpoint
 from dista.store import Location
 
 comptime DRIVER_SHIFT = 40
@@ -246,6 +253,9 @@ struct Head(Movable):
     """Results a rejoining worker reported that no driver has claimed yet."""
     var _resumed: Dict[UInt64, Bool]
     """Drivers that have finished resuming with this head."""
+    var _resuming: Dict[UInt64, Bool]
+    """Drivers that came back with their old number and haven't finished
+    resuming: the actors they create again are restored, not built."""
     var _spans: Dict[UInt64, _Span]
     """Tasks in progress, by object."""
     var _finished: Dict[UInt64, List[_Span]]
@@ -299,6 +309,7 @@ struct Head(Movable):
         self._dead = Dict[UInt64, Bool]()
         self._orphans = Dict[UInt64, Bool]()
         self._resumed = Dict[UInt64, Bool]()
+        self._resuming = Dict[UInt64, Bool]()
         self._spans = Dict[UInt64, _Span]()
         self._finished = Dict[UInt64, List[_Span]]()
         self._actors = Dict[UInt64, _Actor]()
@@ -441,6 +452,7 @@ struct Head(Movable):
             elif f.kind == KIND_RESUMED:
                 var d = owner_of(f.object_id)
                 self._resumed[d] = True
+                _ = self._resuming.pop(d, False)
                 var unclaimed = List[UInt64]()
                 for entry in self._orphans.items():
                     if owner_of(entry.key) == d:
@@ -468,6 +480,8 @@ struct Head(Movable):
                 self._actors[a] = _Actor(
                     type_id, List[UInt8](f.payload[8:]), every
                 )
+                if owner_of(a) in self._resuming:
+                    self._resume_actor(a)
                 self._unplaced.append(a)
             elif f.kind == KIND_ACTOR_CALL:
                 self._call(f^)
@@ -576,10 +590,15 @@ struct Head(Movable):
         var pos = 0
         var a = get_scalar[DType.uint64](f.payload, pos)
         if self._known(obj):
-            return
-        self._hold(obj)
-        self._open_span(obj, f.task_id)
-        self._stamp_queued(obj)
+            if not self._answered(obj) or a not in self._actors:
+                return  # sent again while it runs
+            # Answered, but resent after a head restart: the actor's state
+            # restored from its checkpoint hasn't seen it. It runs again,
+            # and the answer it has stands.
+        else:
+            self._hold(obj)
+            self._open_span(obj, f.task_id)
+            self._stamp_queued(obj)
         if a not in self._actors:
             self._fail(obj, String("no such actor: killed, or never created"))
             return
@@ -632,6 +651,31 @@ struct Head(Movable):
             print("dista head: lost worker:", e)
             self._drop(worker)
 
+    def _resume_actor(mut self, a: UInt64):
+        """An actor created again by a driver resuming after a head restart:
+        it restores from its newest checkpoint, if it has one, and the calls
+        its callers resend run on that."""
+        var newest = -1
+        try:
+            newest = newest_checkpoint(a)
+        except e:
+            print("dista head: no checkpoints for actor", a, ":", e)
+        if newest >= 0:
+            print(
+                "dista head: restoring actor",
+                a,
+                "from its checkpoint after",
+                newest,
+                "calls",
+            )
+        try:
+            ref act = self._actors[a]
+            act.saved = newest
+            act.asked = newest
+            act.calls = max(newest, 0)
+        except:
+            pass
+
     def _ask_checkpoint(mut self, var f: Frame) raises:
         """A driver's `checkpoint`: answered with the calls covered once a
         checkpoint after every call it has made so far is written."""
@@ -675,10 +719,16 @@ struct Head(Movable):
         var done = List[_Waiter]()
         var ok = len(f.payload) == 0
         ref act = self._actors[a]
+        var newest = Dict[UInt64, UInt64]()
         if ok and calls > act.saved:
             var covered = calls - max(act.saved, 0)
             if covered > len(act.log):
                 raise Error("checkpoint covers calls the head never sent")
+            for k in range(covered):
+                var obj = act.log[k].object_id
+                var d = owner_of(obj)
+                if obj > newest.get(d, 0):
+                    newest[d] = obj
             var rest = List[_Task](capacity=len(act.log) - covered)
             for k in range(covered, len(act.log)):
                 rest.append(act.log[k].copy())
@@ -694,6 +744,19 @@ struct Head(Movable):
                 still.append(w.copy())
         act.waiters = still^
         var saved = act.saved
+        # Its callers can let go of the calls it now includes.
+        for entry in newest.items():
+            var d = entry.key
+            if d not in self._driver_conn:
+                continue
+            var j = self._driver_conn.get(d, -1)
+            var body = List[UInt8]()
+            put_scalar[DType.uint64](body, entry.value)
+            try:
+                self._conns[j].send(KIND_COVERED, a, 0, body)
+            except e:
+                print("dista head: lost driver", d, ":", e)
+                self._drop(j)
         for ref w in done:
             if ok:
                 self._answer_checkpoint(w.object_id, saved)
@@ -849,6 +912,7 @@ struct Head(Movable):
                     raise Error("driver ", n, " is already connected")
                 if n >= self._next_driver:
                     self._next_driver = n + 1
+                self._resuming[n] = True
             else:
                 self._next_driver += 1
             self._roles[i] = ROLE_DRIVER

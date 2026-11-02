@@ -67,6 +67,7 @@ from dista.checkpoint import (
     write_checkpoint,
 )
 from dista.client import TaskContext
+from dista.head import owner_of
 from dista.task import StatePtr
 from dista.store import (
     Location,
@@ -206,6 +207,16 @@ struct _Parked(Copyable, Movable):
         self.arrived = wall_ns()
 
 
+@fieldwise_init
+struct _Answer(Copyable, Movable):
+    """A call's answer, kept so a checkpoint can carry it."""
+
+    var calls: Int
+    """The calls the actor had run once it ran this one."""
+    var kind: UInt8
+    var bytes: List[UInt8]
+
+
 struct _Ready(Movable):
     var object_id: UInt64
     var task_id: UInt64
@@ -274,6 +285,18 @@ struct Worker[
     """Its state, unless its constructor failed."""
     var _actor_error: String
     """Why its constructor failed."""
+    var _marks: Dict[UInt64, UInt64]
+    """For each caller, the newest of its calls the actor's state includes:
+    saved with each checkpoint, so a call resent after a head restart that
+    the restored state has already seen doesn't run twice."""
+    var _answers: Dict[UInt64, _Answer]
+    """Answers to the actor's recent calls, by object, from its first
+    checkpoint on: a checkpoint carries those since the one before it, so
+    a call resent after a head restart that the restored state has seen is
+    answered rather than failed."""
+    var _calls: Int
+    """The calls the actor has run, its checkpoint's included."""
+    var _checkpointed: Bool
     var _written: List[Int]
     """The actor's checkpoints written or restored here, by the calls each
     covers, that may still be restored from."""
@@ -321,6 +344,10 @@ struct Worker[
         self._state = None
         self._actor_error = String()
         self._written = List[Int]()
+        self._marks = Dict[UInt64, UInt64]()
+        self._answers = Dict[UInt64, _Answer]()
+        self._calls = 0
+        self._checkpointed = False
         self._ctx = TaskContext(head_addr, resume_at, registry_hash)
 
     @staticmethod
@@ -614,6 +641,10 @@ struct Worker[
         self._actor_type = 0
         self._actor_error = String()
         self._written.clear()
+        self._marks = Dict[UInt64, UInt64]()
+        self._answers = Dict[UInt64, _Answer]()
+        self._calls = 0
+        self._checkpointed = False
 
     def _run_actor(mut self, var t: _Ready) raises:
         """Runs an actor frame: build the actor, call it, or destroy it."""
@@ -631,7 +662,12 @@ struct Worker[
                     var bytes = read_checkpoint(
                         checkpoint_location(t.object_id, calls)
                     )
-                    self._state = Self.restore(t.task_id, bytes)
+                    var at = self._read_header(bytes)
+                    self._state = Self.restore(
+                        t.task_id, List[UInt8](bytes[at:])
+                    )
+                    self._calls = calls
+                    self._checkpointed = True
                     # Checkpoints the last worker wrote are this one's to
                     # delete once they're behind the head's.
                     self._written = list_checkpoints(t.object_id)
@@ -661,7 +697,10 @@ struct Worker[
                 pass
             self._checkpoint(t.object_id, Int(t.task_id), keep)
         else:
+            self._calls += 1
+            var obj = t.object_id
             var out = List[UInt8]()
+            var ran = False
             try:
                 var pos = 0
                 var a = get_scalar[DType.uint64](t.args, pos)
@@ -669,6 +708,23 @@ struct Worker[
                     raise Error("actor ", a, " is not on this worker")
                 if not self._state:
                     raise Error("actor failed to start: ", self._actor_error)
+                var caller = owner_of(obj)
+                if obj <= self._marks.get(caller, 0):
+                    # Resent after a head restart, and already in the state
+                    # restored from the checkpoint: running it again would
+                    # apply it twice. Its answer came with the checkpoint,
+                    # unless it was too large to.
+                    self._span(obj, t.arrived, started)
+                    if obj in self._answers:
+                        var ans = self._answers[obj].copy()
+                        self._to_head(ans.kind, obj, ans.bytes)
+                        return
+                    raise Error(
+                        "this call ran, but its answer was lost when the head"
+                        " restarted"
+                    )
+                self._marks[caller] = obj
+                ran = True
                 Self.call(
                     t.task_id,
                     self._actor_type,
@@ -678,10 +734,75 @@ struct Worker[
                     self._ctx,
                 )
             except e:
-                self._span(t.object_id, t.arrived, started)
-                self._report_error(t.object_id, String(e))
+                var msg = String(e)
+                if ran and self._checkpointed:
+                    self._answers[obj] = _Answer(
+                        self._calls, KIND_ERROR, List[UInt8](msg.as_bytes())
+                    )
+                self._span(obj, t.arrived, started)
+                self._report_error(obj, msg)
                 return
-            self._finish(t.object_id, t.arrived, started, out^)
+            if self._checkpointed and len(out) <= INLINE_LIMIT:
+                self._answers[obj] = _Answer(
+                    self._calls, KIND_RESULT, out.copy()
+                )
+            self._finish(obj, t.arrived, started, out^)
+
+    def _read_header(mut self, bytes: Span[UInt8, _]) raises -> Int:
+        """Reads a checkpoint's callers and answers; returns where the state
+        starts."""
+        var at = 0
+        var n = Int(get_scalar[DType.uint64](bytes, at))
+        if n < 0 or n > (len(bytes) - at) // 16:
+            raise Error("a checkpoint with a bad caller count")
+        for _ in range(n):
+            var caller = get_scalar[DType.uint64](bytes, at)
+            self._marks[caller] = get_scalar[DType.uint64](bytes, at)
+        n = Int(get_scalar[DType.uint64](bytes, at))
+        if n < 0 or n > (len(bytes) - at) // 25:
+            raise Error("a checkpoint with a bad answer count")
+        for _ in range(n):
+            var obj = get_scalar[DType.uint64](bytes, at)
+            var calls = Int(get_scalar[DType.uint64](bytes, at))
+            if at >= len(bytes):
+                raise Error("a truncated checkpoint")
+            var kind = bytes[at]
+            at += 1
+            var size = Int(get_scalar[DType.uint64](bytes, at))
+            if size < 0 or size > len(bytes) - at:
+                raise Error("a truncated checkpoint")
+            self._answers[obj] = _Answer(
+                calls, kind, List[UInt8](bytes[at : at + size])
+            )
+            at += size
+        return at
+
+    def _header(mut self, after: Int) -> List[UInt8]:
+        """A checkpoint's callers, and the answers to the calls after the
+        `after`th; drops the answers before them, which it doesn't need."""
+        var out = List[UInt8]()
+        put_scalar[DType.uint64](out, UInt64(len(self._marks)))
+        for entry in self._marks.items():
+            put_scalar[DType.uint64](out, entry.key)
+            put_scalar[DType.uint64](out, entry.value)
+        var old = List[UInt64]()
+        var body = List[UInt8]()
+        var n = 0
+        for entry in self._answers.items():
+            if entry.value.calls <= after:
+                old.append(entry.key)
+                continue
+            n += 1
+            put_scalar[DType.uint64](body, entry.key)
+            put_scalar[DType.uint64](body, UInt64(entry.value.calls))
+            body.append(entry.value.kind)
+            put_scalar[DType.uint64](body, UInt64(len(entry.value.bytes)))
+            body.extend(entry.value.bytes.copy())
+        for obj in old:
+            _ = self._answers.pop(obj, _Answer(0, 0, List[UInt8]()))
+        put_scalar[DType.uint64](out, UInt64(n))
+        out.extend(body^)
+        return out^
 
     def _checkpoint(mut self, a: UInt64, calls: Int, keep: Int):
         """Writes actor `a`'s state after `calls` calls, and says so.
@@ -694,7 +815,21 @@ struct Worker[
                 raise Error("actor ", a, " is not on this worker")
             if not self._state:
                 raise Error("actor failed to start: ", self._actor_error)
-            var bytes = List[UInt8]()
+            if calls != self._calls:
+                raise Error(
+                    "the head counts ",
+                    calls,
+                    " calls, this worker ran ",
+                    self._calls,
+                )
+            # Answers since the checkpoint before this one go with it: a
+            # head that dies may not have passed them on.
+            var before = -1
+            for c in self._written:
+                if c < calls:
+                    before = max(before, c)
+            self._checkpointed = True
+            var bytes = self._header(before)
             Self.save(self._actor_type, self._state.value(), bytes)
             write_checkpoint(checkpoint_location(a, calls), bytes)
             var still = List[Int]()

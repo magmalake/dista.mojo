@@ -96,7 +96,7 @@ def target(data: List[UInt8]) raises:
     while pos + 5 <= len(data):
         var who = Int(data[pos] & 1)
         var hang_up = (data[pos] & 2) != 0
-        var kind = data[pos + 1] % 25
+        var kind = data[pos + 1] % 26
         var obj = (UInt64(1) << DRIVER_SHIFT) | UInt64(data[pos + 2] % 16)
         var task = UInt64(data[pos + 3] % 4)
         var n = min(Int(data[pos + 4]), len(data) - pos - 5)
