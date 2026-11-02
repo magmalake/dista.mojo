@@ -21,7 +21,7 @@ def main() raises:
     print(total)  # 332833500
 ```
 
-**Status: phase 4's gate passes.** The taxi queries on a 3-node kind cluster finish exact with a worker pod killed mid-run, its tasks run again elsewhere ([tests/kind_taxi.sh](tests/kind_taxi.sh)). Phase 4's Kubernetes operator with autoscaling is still to come. One binary runs as driver, head or worker, chosen by environment. Run it on its own and it forks a head and workers on one machine; point it at a head and it joins a cluster:
+**Status: phase 4's gate passes.** The taxi queries on a 3-node kind cluster finish exact with a worker pod killed mid-run, its tasks run again elsewhere ([tests/kind_taxi.sh](tests/kind_taxi.sh)). Still to come in phase 4: workers that drain when stopped, so a cluster can shrink. dista creates no pods: Kubernetes or [orca](https://github.com/magmalake/orca.mojo) does ([DESIGN.md](DESIGN.md#kubernetes-dista-and-orca)). One binary runs as driver, head or worker, chosen by environment. Run it on its own and it forks a head and workers on one machine; point it at a head and it joins a cluster:
 
 ```
 DISTA_ROLE=head DISTA_PORT=6390 ./app                  # the head
