@@ -1,8 +1,11 @@
 """The head: one event loop that schedules every driver's tasks onto workers.
 
 Drivers and workers connect to the head and say hello with their role and
-registry hash; a mismatched hash is refused, so every process in a cluster
-runs the same tasks. A driver gets a number, which becomes the top bits of
+registry hash. A head built into a program refuses a peer whose hash isn't
+its own, so every process runs the same tasks. A generic head (`dista head`,
+registry hash 0) takes any, and hands a driver's tasks and actors only to
+workers built from the same program, so one head serves several programs.
+Observers (`dista status`, `timeline` and `stop`) say hello without a hash. A driver gets a number, which becomes the top bits of
 every object ID it creates, so the head knows where each result goes.
 
 The loop `poll`s the listener and every connection. Drivers send tasks, ready
@@ -87,12 +90,17 @@ from dista.frame import (
     KIND_TASK_INPUTS,
     KIND_TIMELINE,
     KIND_WELCOME,
+    KIND_STATUS,
+    KIND_STOP,
     ROLE_CLIENT,
     ROLE_DRIVER,
+    ROLE_OBSERVER,
     ROLE_WORKER,
+    decode_addr,
     Frame,
 )
 from dista.socket import (
+    addr_key,
     POLLERR,
     POLLHUP,
     POLLIN,
@@ -223,6 +231,19 @@ struct _Waiter(Copyable, Movable):
     var calls: Int
 
 
+struct _Queue(Copyable, Movable, Sized):
+    var tasks: List[_Task]
+    var head: Int
+    """The next task to hand out."""
+
+    def __init__(out self):
+        self.tasks = List[_Task]()
+        self.head = 0
+
+    def __len__(self) -> Int:
+        return len(self.tasks) - self.head
+
+
 struct Head(Movable):
     var _listener: Listener
     var _registry_hash: UInt64
@@ -235,8 +256,14 @@ struct Head(Movable):
     var _driver_conn: Dict[UInt64, Int]
     var _next_driver: UInt64
     var _drivers_seen: Bool
-    var _queue: List[_Task]
-    var _queue_head: Int
+    var _queues: Dict[UInt64, _Queue]
+    """Tasks ready to run, by the registry hash of the program that
+    submitted them: only a worker built from the same program runs them."""
+    var _hashes: List[UInt64]
+    """For each connection, the registry hash its hello carried."""
+    var _driver_hash: Dict[UInt64, UInt64]
+    """Each driver's registry hash, by number."""
+    var _stopped: Bool
     var _waiting: List[_Task]
     var _results: Dict[UInt64, List[UInt8]]
     var _errors: Dict[UInt64, String]
@@ -267,6 +294,9 @@ struct Head(Movable):
     """Tasks in progress, by object."""
     var _finished: Dict[UInt64, List[_Span]]
     """Settled tasks' spans, by driver, until the driver asks for them."""
+    var _departed: List[UInt64]
+    """Drivers that left, oldest first, whose spans are kept for observers:
+    at most `MAX_SPANS` of them in all."""
     var _actors: Dict[UInt64, _Actor]
     """Live actors, by ID."""
     var _unplaced: List[UInt64]
@@ -312,8 +342,10 @@ struct Head(Movable):
         self._driver_conn = Dict[UInt64, Int]()
         self._next_driver = 1
         self._drivers_seen = False
-        self._queue = List[_Task]()
-        self._queue_head = 0
+        self._queues = Dict[UInt64, _Queue]()
+        self._hashes = List[UInt64]()
+        self._driver_hash = Dict[UInt64, UInt64]()
+        self._stopped = False
         self._waiting = List[_Task]()
         self._results = Dict[UInt64, List[UInt8]]()
         self._errors = Dict[UInt64, String]()
@@ -329,6 +361,7 @@ struct Head(Movable):
         self._resuming = Dict[UInt64, Bool]()
         self._spans = Dict[UInt64, _Span]()
         self._finished = Dict[UInt64, List[_Span]]()
+        self._departed = List[UInt64]()
         self._actors = Dict[UInt64, _Actor]()
         self._unplaced = List[UInt64]()
         self._hosting = List[UInt64]()
@@ -355,6 +388,9 @@ struct Head(Movable):
                 if len(self._driver_conn) == len(self._clients):
                     self._shutdown()
                     return
+            if self._stopped:
+                self._shutdown()
+                return
             var fds: List[c_int] = [self._listener.fd]
             var events: List[Int16] = [POLLIN]
             var which: List[Int] = [-1]
@@ -493,6 +529,107 @@ struct Head(Movable):
         )
         return out^
 
+    def _observe(mut self, i: Int, var f: Frame) raises:
+        """A frame from an observer: status, timeline, stats or stop."""
+        if f.kind == KIND_STATUS:
+            var text = self._status()
+            self._conns[i].send(KIND_STATUS, 0, 0, text.as_bytes())
+        elif f.kind == KIND_TIMELINE:
+            self._send_timeline(i)
+        elif f.kind == KIND_STOP:
+            print("dista head: stopping, as an observer asked")
+            for j in range(len(self._conns)):
+                if self._roles[j] == ROLE_WORKER:
+                    try:
+                        self._conns[j].send(KIND_STOP, 0, 0, List[UInt8]())
+                        self._conns[j].flush()
+                    except:
+                        pass
+            self._conns[i].send(KIND_STOP, 0, 0, List[UInt8]())
+            self._conns[i].flush()
+            self._stopped = True
+        else:
+            raise Error("observer sent frame kind ", Int(f.kind))
+
+    def _addr(self, i: Int) -> String:
+        """Worker `i`'s object server, as `ip:port`."""
+        try:
+            var pos = 0
+            var a = decode_addr(self._worker_addr[i], pos)
+            return addr_key(a[0], a[1])
+        except:
+            return String("?")
+
+    def _status(self) -> String:
+        """The head's state, for `dista status`."""
+        var out = String()
+        var workers = 0
+        for i in range(len(self._roles)):
+            if self._roles[i] == ROLE_WORKER:
+                workers += 1
+        out += String(
+            "head: ",
+            workers,
+            " workers, ",
+            len(self._driver_conn) - len(self._clients),
+            " drivers, ",
+            len(self._actors),
+            " actors; ",
+            self._queued() + len(self._waiting),
+            " tasks waiting, ",
+            len(self._refs),
+            " objects; ",
+            self._finished_ok,
+            " tasks done, ",
+            self._finished_err,
+            " failed\n",
+        )
+        if self._registry_hash != 0:
+            out += String("registry ", hex(self._registry_hash), "\n")
+        out += "workers:\n"
+        for i in range(len(self._roles)):
+            if self._roles[i] != ROLE_WORKER:
+                continue
+            out += String(
+                "  ",
+                self._addr(i),
+                "  registry ",
+                hex(self._hashes[i]),
+                "  running ",
+                len(self._inflight[i]),
+            )
+            if self._hosting[i] != 0:
+                out += String("  actor ", self._hosting[i])
+            out += "\n"
+        out += "drivers:\n"
+        for entry in self._driver_conn.items():
+            out += String(
+                "  ",
+                entry.key,
+                "  registry ",
+                hex(self._driver_hash.get(entry.key, 0)),
+            )
+            if entry.value in self._clients:
+                out += "  (a task's client)"
+            out += "\n"
+        out += "actors:\n"
+        for entry in self._actors.items():
+            ref act = entry.value
+            out += String("  ", entry.key, "  ")
+            if act.failed:
+                out += String("failed: ", act.failed)
+            elif act.worker >= 0:
+                out += String("on ", self._addr(act.worker))
+            else:
+                out += "waiting for a worker"
+            out += String("  calls ", act.calls)
+            if act.saved >= 0:
+                out += String("  checkpoint after ", act.saved)
+            if act.restarts > 0:
+                out += String("  restarts ", act.restarts)
+            out += "\n"
+        return out^
+
     def _accept(mut self) raises:
         var s = self._listener.accept()
         self._conns.append(Conn(s^))
@@ -500,11 +637,14 @@ struct Head(Movable):
         self._inflight.append(List[UInt64]())
         self._worker_addr.append(List[UInt8]())
         self._hosting.append(0)
+        self._hashes.append(0)
 
     def _handle(mut self, i: Int, var f: Frame) raises:
         var role = self._roles[i]
         if role == _ROLE_NONE:
             self._hello(i, f^)
+        elif role == ROLE_OBSERVER:
+            self._observe(i, f^)
         elif role == ROLE_DRIVER:
             if f.kind == KIND_TASK:
                 var obj = f.object_id
@@ -515,7 +655,7 @@ struct Head(Movable):
                 if self._adopt(obj):
                     return
                 self._open_span(obj, task)
-                self._queue.append(_Task(obj, task, f^.take_payload()))
+                self._enqueue(_Task(obj, task, f^.take_payload()))
                 self._stamp_queued(obj)
             elif f.kind == KIND_TASK_AFTER:
                 if len(f.payload) < 9:
@@ -913,21 +1053,28 @@ struct Head(Movable):
             self._drop(i)
 
     def _place(mut self) raises:
-        """Gives each waiting actor a worker of its own, while there are any."""
-        while len(self._unplaced) > 0:
+        """Gives each waiting actor a worker of its own, built from the same
+        program, while there are any."""
+        var waiting = self._unplaced^
+        self._unplaced = List[UInt64]()
+        var still = List[UInt64]()
+        for a in waiting:
+            if a not in self._actors:
+                continue  # killed before it was placed
+            var h = self._hash_of(a)
             var best = -1
             for i in range(len(self._conns)):
                 if self._roles[i] != ROLE_WORKER or self._hosting[i] != 0:
+                    continue
+                if self._hashes[i] != h:
                     continue
                 if best < 0 or len(self._inflight[i]) < len(
                     self._inflight[best]
                 ):
                     best = i
             if best < 0:
-                return
-            var a = self._unplaced.pop(0)
-            if a not in self._actors:
-                continue  # killed before it was placed
+                still.append(a)
+                continue
             self._hosting[best] = a
             ref act = self._actors[a]
             act.worker = best
@@ -955,6 +1102,9 @@ struct Head(Movable):
                 self._maybe_checkpoint(a)
             if killed:
                 self._kill(a)
+        # Restarts queued while placing go after the ones still waiting.
+        still.extend(self._unplaced^)
+        self._unplaced = still^
 
     def _kill(mut self, a: UInt64) raises:
         """Destroys actor `a` and frees its worker; its driver's done with it.
@@ -1027,7 +1177,14 @@ struct Head(Movable):
             raise Error("expected a hello frame")
         var pos = 1
         var hash = get_scalar[DType.uint64](f.payload, pos)
-        if hash != self._registry_hash:
+        if f.payload[0] == ROLE_OBSERVER:
+            self._roles[i] = ROLE_OBSERVER
+            var body = List[UInt8]()
+            put_scalar[DType.uint64](body, 0)
+            self._conns[i].send(KIND_WELCOME, 0, 0, body)
+            return
+        self._hashes[i] = hash
+        if self._registry_hash != 0 and hash != self._registry_hash:
             var msg = String(
                 "registry mismatch: this peer was built with different tasks"
             )
@@ -1050,6 +1207,7 @@ struct Head(Movable):
                 self._next_driver += 1
             self._roles[i] = ROLE_DRIVER
             self._driver_conn[n] = i
+            self._driver_hash[n] = hash
             if f.payload[0] == ROLE_CLIENT:
                 self._clients[i] = True
             else:
@@ -1152,13 +1310,31 @@ struct Head(Movable):
         except:
             pass
 
+    def _forget_spans(mut self, gone: UInt64):
+        """Keeps a departed driver's spans for `dista timeline`, dropping the
+        oldest departed drivers' once they hold more than `MAX_SPANS`."""
+        if gone in self._finished:
+            self._departed.append(gone)
+        var total = 0
+        for d in self._departed:
+            total += len(self._finished.get(d, List[_Span]()))
+        while total > MAX_SPANS and len(self._departed) > 0:
+            var d = self._departed.pop(0)
+            total -= len(self._finished.pop(d, List[_Span]()))
+
     def _send_timeline(mut self, i: Int) raises:
-        """Sends driver `i` its finished spans, and forgets them."""
-        var d = UInt64(0)
-        for entry in self._driver_conn.items():
-            if entry.value == i:
-                d = entry.key
-        var done = self._finished.pop(d, List[_Span]())
+        """Sends driver `i` its finished spans, and forgets them; or an
+        observer every driver's, and keeps them."""
+        var done = List[_Span]()
+        if self._roles[i] == ROLE_OBSERVER:
+            for entry in self._finished.items():
+                done.extend(entry.value.copy())
+        else:
+            var d = UInt64(0)
+            for entry in self._driver_conn.items():
+                if entry.value == i:
+                    d = entry.key
+            done = self._finished.pop(d, List[_Span]())
         var body = List[UInt8]()
         put_scalar[DType.uint64](body, UInt64(len(done)))
         for ref sp in done:
@@ -1225,6 +1401,7 @@ struct Head(Movable):
                     gone = entry.key
             if gone != 0:
                 _ = self._driver_conn.pop(gone, -1)
+                self._forget_spans(gone)
                 # A driver that's gone holds nothing.
                 var mine = List[UInt64]()
                 for entry in self._held.items():
@@ -1314,8 +1491,9 @@ struct Head(Movable):
                     put_scalar[DType.int64](args, Int64(len(t.deps)))
                 for d in t.deps:
                     args.extend(self._results.get(d, List[UInt8]()))
-                self._queue.append(_Task(t.object_id, t.task_id, args^))
-                self._stamp_queued(t.object_id)
+                var id = t.object_id
+                self._enqueue(_Task(id, t.task_id, args^))
+                self._stamp_queued(id)
             else:
                 # Some inputs live on workers: tell the worker that runs this
                 # task where to fetch them, and pass the rest inline.
@@ -1332,14 +1510,31 @@ struct Head(Movable):
                         put_scalar[DType.uint64](spec, d)
                         put_scalar[DType.uint64](spec, UInt64(len(r)))
                         spec.extend(r^)
-                self._queue.append(
-                    _Task(t.object_id, t.task_id, spec^, kind=KIND_TASK_INPUTS)
+                var id = t.object_id
+                self._enqueue(
+                    _Task(id, t.task_id, spec^, kind=KIND_TASK_INPUTS)
                 )
-                self._stamp_queued(t.object_id)
+                self._stamp_queued(id)
         self._waiting = still^
 
     def _queued(self) -> Int:
-        return len(self._queue) - self._queue_head
+        var n = 0
+        for entry in self._queues.items():
+            n += len(entry.value)
+        return n
+
+    def _hash_of(self, object_id: UInt64) -> UInt64:
+        """The registry hash of the program that made `object_id`."""
+        return self._driver_hash.get(owner_of(object_id), self._registry_hash)
+
+    def _enqueue(mut self, var t: _Task):
+        var h = self._hash_of(t.object_id)
+        if h not in self._queues:
+            self._queues[h] = _Queue()
+        try:
+            self._queues[h].tasks.append(t^)
+        except:
+            pass
 
     def _dispatch(mut self):
         """Places waiting actors, then hands queued tasks to the workers that
@@ -1350,14 +1545,25 @@ struct Head(Movable):
             print("dista head: placing an actor:", e)
         for depth in range(self._pipeline):
             for i in range(len(self._conns)):
-                if self._queued() == 0:
-                    break
                 if self._roles[i] != ROLE_WORKER or self._hosting[i] != 0:
                     continue
                 if len(self._inflight[i]) != depth:
                     continue
-                ref t = self._queue[self._queue_head]
-                self._queue_head += 1
+                var h = self._hashes[i]
+                if h not in self._queues:
+                    continue
+                var t: _Task
+                try:
+                    ref q = self._queues[h]
+                    if len(q) == 0:
+                        continue
+                    t = q.tasks[q.head].copy()
+                    q.head += 1
+                    if q.head == len(q.tasks):
+                        q.tasks.clear()
+                        q.head = 0
+                except:
+                    continue
                 self._inflight[i].append(t.object_id)
                 if t.object_id in self._spans:
                     try:
@@ -1371,6 +1577,3 @@ struct Head(Movable):
                 except e:
                     print("dista head: lost worker:", e)
                     self._drop(i)
-        if self._queue_head == len(self._queue):
-            self._queue.clear()
-            self._queue_head = 0

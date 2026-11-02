@@ -1,8 +1,10 @@
 # A dista cluster: one head and a set of workers, all running the same image.
 # Drivers reach the head at dista-head:6390 (see driver-job.yaml).
 #
-# Every pod runs the same binary; DISTA_ROLE picks its part. A head and its
-# workers must be built from the same program, or the head refuses them.
+# The head runs `dista head`, the generic head in the image beside the
+# program; the workers run the program, with DISTA_ROLE=worker. A generic
+# head serves any program, giving each driver's tasks to workers built from
+# the same one.
 apiVersion: v1
 kind: Service
 metadata:
@@ -33,9 +35,8 @@ spec:
         - name: head
           image: dista:smoke
           imagePullPolicy: IfNotPresent
+          command: ["/opt/dista/bin/dista", "head", "--port", "6390"]
           env:
-            - {name: DISTA_ROLE, value: head}
-            - {name: DISTA_PORT, value: "6390"}
             # Prometheus metrics at /metrics.
             - {name: DISTA_METRICS_PORT, value: "9090"}
           ports:

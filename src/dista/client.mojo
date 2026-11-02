@@ -34,12 +34,15 @@ from dista.frame import (
     KIND_RESULT,
     KIND_RESUMED,
     KIND_STATS,
+    KIND_STATUS,
+    KIND_STOP,
     KIND_TASK,
     KIND_TASK_AFTER,
     KIND_TIMELINE,
     KIND_WELCOME,
     ROLE_CLIENT,
     ROLE_DRIVER,
+    ROLE_OBSERVER,
     Frame,
     decode_addr,
     read_frame,
@@ -184,6 +187,160 @@ def _event(
         args,
         "},\n",
     )
+
+
+def parse_timeline(payload: Span[UInt8, _]) raises -> List[TaskSpan]:
+    """A timeline frame's spans, unnamed."""
+    var out = List[TaskSpan]()
+    var pos = 0
+    var n = Int(get_scalar[DType.uint64](payload, pos))
+    for _ in range(n):
+        var obj = get_scalar[DType.uint64](payload, pos)
+        var task = get_scalar[DType.uint64](payload, pos)
+        var t = List[UInt64]()
+        for _ in range(7):
+            t.append(get_scalar[DType.uint64](payload, pos))
+        var addr = decode_addr(payload, pos)
+        var worker = String()
+        if addr[1] != 0:
+            worker = addr_key(addr[0], addr[1])
+        out.append(
+            TaskSpan(
+                obj,
+                String(),
+                worker^,
+                t[0],
+                t[1],
+                t[2],
+                t[3],
+                t[4],
+                t[5],
+                t[6],
+                task,
+            )
+        )
+    return out^
+
+
+struct Observer(Movable):
+    """A connection to the head that only looks, and can stop it: what
+    `dista status`, `timeline` and `stop` use. It owns no objects and needs
+    no registry."""
+
+    var _head: Stream
+
+    def __init__(out self, addr: String) raises:
+        """Connects to the head at `addr`, `host:port`, once: an observer
+        reports a head that isn't there rather than wait for one."""
+        var hp = parse_host_port(addr)
+        self._head = Stream.connect(hp[0], hp[1])
+        _ = _hello(self._head, ROLE_OBSERVER, 0)
+
+    def _ask(mut self, kind: UInt8) raises -> Frame:
+        write_frame(self._head, kind, 0, 0, List[UInt8]())
+        var f = read_frame(self._head)
+        if not f:
+            raise Error("the head closed the connection")
+        if f.value().kind != kind:
+            raise Error(
+                "expected frame kind ", Int(kind), ", got ", Int(f.value().kind)
+            )
+        return f.take()
+
+    def status(mut self) raises -> String:
+        """The head's workers, drivers and actors, as text."""
+        return message(self._ask(KIND_STATUS).payload)
+
+    def spans(mut self) raises -> List[TaskSpan]:
+        """Every driver's finished tasks the head still holds."""
+        return parse_timeline(self._ask(KIND_TIMELINE).payload)
+
+    def stop(mut self) raises:
+        """Shuts the head down, and its workers with it."""
+        _ = self._ask(KIND_STOP)
+
+
+def write_trace(
+    path: String,
+    spans: List[TaskSpan],
+    mine: List[_DriverSpan] = List[_DriverSpan](),
+) raises -> Int:
+    """Writes finished tasks, and a driver's own spans, to `path` in Chrome's
+    trace format, for Perfetto (ui.perfetto.dev) or chrome://tracing, and
+    returns how many tasks it holds.
+
+    Each worker is a process with two tracks: its tasks running, and its
+    tasks waiting for their inputs. The driver's spans are a process above
+    them. Times are microseconds from the first submission or driver span;
+    each run's arguments carry the head's waits too. A task without a name
+    is named by its wire ID.
+    """
+    var t0 = UInt64(0)
+    for ref sp in spans:
+        if t0 == 0 or sp.submitted < t0:
+            t0 = sp.submitted
+    for ref d in mine:
+        if t0 == 0 or d.start < t0:
+            t0 = d.start
+    var pids = Dict[String, Int]()
+    var out = String("[\n")
+    if len(mine) > 0:
+        out += _meta(0, "process_name", "driver")
+        out += _meta(0, "thread_name", "driver", 1)
+    for ref d in mine:
+        out += _event(
+            d.name,
+            0,
+            1,
+            d.start - t0,
+            d.end - d.start if d.end > d.start else 0,
+            String("{}"),
+        )
+    for ref sp in spans:
+        if sp.worker == "" or sp.started == 0:
+            continue
+        if sp.worker not in pids:
+            var p = len(pids) + 1
+            pids[sp.worker] = p
+            out += _meta(p, "process_name", "worker " + sp.worker)
+            out += _meta(p, "thread_name", "running", 1)
+            out += _meta(p, "thread_name", "waiting for inputs", 2)
+        var pid = pids.get(sp.worker, 0)
+        if sp.started > sp.arrived:
+            out += _event(
+                "inputs",
+                pid,
+                2,
+                sp.arrived - t0,
+                sp.started - sp.arrived,
+                String('{"object":', sp.object_id, "}"),
+            )
+        var name = sp.task if sp.task != "" else String(
+            "task ", hex(sp.task_id)
+        )
+        out += _event(
+            name,
+            pid,
+            1,
+            sp.started - t0,
+            sp.ended - sp.started,
+            String(
+                '{"object":',
+                sp.object_id,
+                ',"queued_after_submit_us":',
+                _us(sp.queued - sp.submitted) if sp.queued else String(0),
+                ',"dispatch_wait_us":',
+                _us(sp.dispatched - sp.queued) if sp.queued else String(0),
+                ',"settle_after_end_us":',
+                _us(sp.settled - sp.ended) if sp.settled
+                > sp.ended else String(0),
+                "}",
+            ),
+        )
+    out += '{"name":"end","ph":"i","ts":0,"pid":0,"tid":0,"s":"g"}\n]\n'
+    with open(path, "w") as f:
+        f.write(out)
+    return len(spans)
 
 
 def parse_host_port(addr: String) raises -> Tuple[String, Int]:
@@ -630,33 +787,7 @@ struct Client(Movable):
                 self._located[id] = frame.payload.copy()
             self._settle(id)
         elif frame.kind == KIND_TIMELINE:
-            var pos = 0
-            var n = Int(get_scalar[DType.uint64](frame.payload, pos))
-            for _ in range(n):
-                var obj = get_scalar[DType.uint64](frame.payload, pos)
-                var task = get_scalar[DType.uint64](frame.payload, pos)
-                var t = List[UInt64]()
-                for _ in range(7):
-                    t.append(get_scalar[DType.uint64](frame.payload, pos))
-                var addr = decode_addr(frame.payload, pos)
-                var worker = String()
-                if addr[1] != 0:
-                    worker = addr_key(addr[0], addr[1])
-                self._spans.append(
-                    TaskSpan(
-                        obj,
-                        String(),
-                        worker^,
-                        t[0],
-                        t[1],
-                        t[2],
-                        t[3],
-                        t[4],
-                        t[5],
-                        t[6],
-                        task,
-                    )
-                )
+            self._spans.extend(parse_timeline(frame.payload))
             self._timeline_answered = True
         elif frame.kind == KIND_COVERED:
             var pos = 0
