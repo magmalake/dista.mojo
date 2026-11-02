@@ -137,7 +137,7 @@ An address is 12 bytes: the IPv4 address, then the port as a u64. A worker's hel
 
 ### Still to come in phase 2
 
-- **Freeing results.** Nothing is freed yet. Ray frees a result once its owner and every task that takes it are done with it.
+- **Freeing results** (done in phase 3): reference counts at the head; see the defaults table.
 - **Locality** (done, see the shuffle table below): a task goes to the node that holds most of its inputs' bytes, when one does.
 
 ## Concurrency
@@ -146,8 +146,9 @@ A `poll` event loop, plus threads where work must overlap inside one process, no
 
 ## Failure handling
 
-- **Now:** a worker that dies fails the tasks it had in flight; `get` raises `worker lost while running this task`. No retry.
-- **Phase 4:** lost objects are rebuilt by re-running the tasks that produced them (lineage), and actors restart from checkpoints or through restate.mojo.
+- **Tasks whose worker dies run again.** The head keeps every task it sent until it settles. When the worker goes away, each task it was running goes back in the queue for another worker, up to `DISTA_TASK_RETRIES` times (default 3, as Ray's). It fails instead, with `worker lost while running this task`, past that, if an input it read from that worker went with it, or if a `TaskMany` had answered some of its results. `dista_tasks_retried_total` counts the retries. A task may therefore run more than once, as across a head restart: tasks have to be safe to repeat.
+- **Results lost with a worker are not rebuilt.** Ray's lineage reconstruction is out of scope (VISION.md, Non-goals). A lost result fails, as `result <id> lost: its worker went away, and dista doesn't rebuild lost results; run the job again`, and so does every task waiting on it. Retrying the whole job is the orchestrator's: orca runs a failed run again.
+- **Actors** restart from their checkpoint and replay their calls (phase 3).
 
 ## Testing
 
@@ -220,7 +221,7 @@ Today the head is one process holding everything: the queue, where each result l
 
 That covers a head restart, not a head that's lost for good with the driver. Replicating the head is later work.
 
-**Throughput.** The head is a single-threaded `poll()` loop. `bench/fanout.mojo` grows a mode that measures tasks per second through the head with 16, 64 and 192 workers, empty tasks and 1 MB results. That shows whether the head limits the 12-node runs, before the actor work adds traffic to it.
+**Throughput** (done, #33). The head is a single-threaded `poll()` loop. `bench/fanout.mojo` measures tasks per second through it: about 160,000 empty tasks a second, flat from 4 to 192 workers, so the head doesn't limit the 12-node runs.
 
 ### How actors work
 

@@ -2,6 +2,7 @@
 value beside other tasks' results (`TaskWith`), then a group-by built from
 the two."""
 
+from std.os import setenv, unsetenv
 from std.testing import TestSuite, assert_equal, assert_raises, assert_true
 
 from dista import ObjectRef, Runtime, Seq, Task, TaskMany, TaskWith
@@ -128,7 +129,10 @@ def test_the_wrong_number_of_results_fails_them_all() raises:
 
 
 def test_a_lost_worker_fails_every_result() raises:
+    """With no retries, a `TaskMany` whose worker dies fails every result."""
+    _ = setenv("DISTA_TASK_RETRIES", "0")
     var rt = RT(workers=2)
+    _ = unsetenv("DISTA_TASK_RETRIES")
     var r = rt.remote_many[Die](0, 3)
     for k in range(3):
         with assert_raises(contains="worker lost"):

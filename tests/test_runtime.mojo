@@ -7,7 +7,7 @@ from std.testing import (
     assert_raises,
     assert_true,
 )
-from std.os import setenv, unsetenv
+from std.os import remove, setenv, unsetenv
 from std.os.path import exists
 from std.time import perf_counter_ns, sleep
 
@@ -76,6 +76,19 @@ def die(x: Int) -> Int:
     return x
 
 
+comptime DIE_ONCE_FLAG = "build/test-runtime-died-once"
+
+
+def die_once(x: Int) raises -> Int:
+    """Its worker dies the first time; the flag file says it already has, so
+    the retry on another worker answers."""
+    if not exists(DIE_ONCE_FLAG):
+        with open(DIE_ONCE_FLAG, "w") as f:
+            f.write("died")
+        exit_now(9)
+    return x * x
+
+
 def blob(n: Int) -> String:
     return String("x") * n
 
@@ -101,6 +114,7 @@ comptime TotalLength = Task[Seq[String], Int, total_length]
 comptime Grow = Task[String, String, grow]
 comptime Total = Task[Seq[Int], Int, total]
 comptime Die = Task[Int, Int, die]
+comptime DieOnce = Task[Int, Int, die_once]
 comptime Increment = Task[Int, Int, increment]
 comptime Describe = Task[Point, String, describe]
 comptime TextLength = Task[String, Int, text_length]
@@ -232,13 +246,38 @@ def test_seq_argument_directly() raises:
     assert_equal(rt.get(rt.remote[Total](Seq[Int]([1, 2, 3, 4]))), 10)
 
 
-def test_worker_death_fails_its_task() raises:
-    """A worker that dies fails its in-flight task; the others carry on."""
-    var rt = Runtime[Square, Die](workers=2, pipeline=1)
+def test_a_task_whose_worker_dies_runs_again() raises:
+    """A worker that dies has its in-flight task sent to another."""
+    if exists(DIE_ONCE_FLAG):
+        remove(DIE_ONCE_FLAG)
+    var rt = Runtime[Square, DieOnce](workers=2, pipeline=1)
+    assert_equal(rt.get(rt.remote[DieOnce](7)), 49)
+    assert_true(exists(DIE_ONCE_FLAG), "the worker never died")
+    assert_equal(rt.get(rt.remote[Square](12)), 144)
+    remove(DIE_ONCE_FLAG)
+
+
+def test_a_task_that_keeps_losing_its_worker_fails() raises:
+    """Past `DISTA_TASK_RETRIES`, a task whose worker dies fails, saying how
+    often; the workers left carry on."""
+    _ = setenv("DISTA_TASK_RETRIES", "1")
+    var rt = Runtime[Square, Die](workers=3, pipeline=1)
+    _ = unsetenv("DISTA_TASK_RETRIES")
     var doomed = rt.remote[Die](1)
-    with assert_raises(contains="worker lost"):
+    with assert_raises(contains="worker lost while running this task, 2 times"):
         _ = rt.get(doomed)
     assert_equal(rt.get(rt.remote[Square](12)), 144)
+
+
+def test_running_out_of_local_workers_fails_instead_of_hanging() raises:
+    """A task that kills every worker it runs on uses up a local runtime's
+    workers, which nothing replaces: then it fails, and so does the next
+    task, instead of waiting for ever."""
+    var rt = Runtime[Square, Die](workers=2, pipeline=1)
+    with assert_raises(contains="no workers left"):
+        _ = rt.get(rt.remote[Die](1))
+    with assert_raises(contains="no workers left"):
+        _ = rt.get(rt.remote[Square](3))
 
 
 def test_large_result_stays_on_its_worker() raises:
