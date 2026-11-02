@@ -9,6 +9,8 @@ worker. Reducer `j` (`ReduceZones`, a `TaskWith`) takes its partition from
 every map task, merges them, and returns its totals and its top 10. The
 driver adds those up. With `TAXI_MODE=both` the same per-trip code then runs
 over the whole table in this process, and the answers must agree.
+In this process, `TAXI_THREADS` threads (default one per core) each read
+whole files into a `Dense` of their own, added up at the end.
 
 Build with `-I deploy`: the table code is `taxi_table.mojo`'s.
 """
@@ -16,7 +18,14 @@ Build with `-I deploy`: the table code is `taxi_table.mojo`'s.
 from std.os import getenv
 from std.time import perf_counter_ns
 
-from arrow_mlake import RecordBatch
+from arrow_mlake import (
+    AT_FLOAT64,
+    AT_INT32,
+    AT_TIMESTAMP,
+    ArrayData,
+    RecordBatch,
+    bit_get,
+)
 from iceberg import FileScanTask, ScanOptions, TableMetadata, TableScan
 from iceberg.manifest import ManifestCache
 
@@ -24,6 +33,7 @@ from dista import Codec, ObjectRef, Runtime, Seq, TaskMany, TaskWith
 from dista.codec import get_scalar, put_scalar
 
 from taxi_table import PlannedFile, taxi_io, taxi_table
+from threads import AtomicCounter, num_cpus, parallel_for
 
 comptime ZONES = 266
 comptime HOURS = 24
@@ -114,7 +124,7 @@ struct Groups(Codec, Copyable, Movable, Sized):
         return g^
 
 
-struct Dense(Movable):
+struct Dense(Copyable, Movable):
     """Every key's group, indexed by key: what a map task, or the one
     process, adds trips into.
 
@@ -128,11 +138,17 @@ struct Dense(Movable):
     """Scratch for `add`: the batch's kept trips' keys..."""
     var weights: List[Float64]
     """...and their speed, tip and fare, three per kept trip."""
+    var valid: List[Bool]
+    """Scratch for `add`: whether each row has all seven values..."""
+    var all_valid: Bool
+    """...which is true of every row while this is."""
 
     def __init__(out self):
         self.slots = List[Float64](length=KEYS * SLOT, fill=0.0)
         self.keys = List[Int]()
         self.weights = List[Float64]()
+        self.valid = List[Bool]()
+        self.all_valid = False
 
     def n(self, key: Int) -> Int:
         return Int(self.slots[key * SLOT])
@@ -150,34 +166,56 @@ struct Dense(Movable):
         """Adds batch `b`'s trips that count (see the README), in two
         passes: first every row's key and features, without branches, keeping
         the trips that count; then those added into their keys' slots."""
-        var pu = b.column_i64(_column(b, "PULocationID"))
-        var do_ = b.column_i64(_column(b, "DOLocationID"))
-        var start = b.column_i64(_column(b, "tpep_pickup_datetime"))
-        var end = b.column_i64(_column(b, "tpep_dropoff_datetime"))
-        var dist = b.column_f64(_column(b, "trip_distance"))
-        var fare = b.column_f64(_column(b, "fare_amount"))
-        var tip = b.column_f64(_column(b, "tip_amount"))
+        # The columns are read where the batch holds them, without copying:
+        # 32-bit zones, 64-bit microsecond timestamps and 64-bit floats.
         var rows = b.num_rows
+        ref pu = _typed(b, "PULocationID", AT_INT32)
+        ref do_ = _typed(b, "DOLocationID", AT_INT32)
+        ref start = _typed(b, "tpep_pickup_datetime", AT_TIMESTAMP)
+        ref end = _typed(b, "tpep_dropoff_datetime", AT_TIMESTAMP)
+        ref dist = _typed(b, "trip_distance", AT_FLOAT64)
+        ref fare = _typed(b, "fare_amount", AT_FLOAT64)
+        ref tip = _typed(b, "tip_amount", AT_FLOAT64)
+        var pu_v = pu.values.unsafe_ptr().unsafe_bitcast[Int32]()
+        var do_v = do_.values.unsafe_ptr().unsafe_bitcast[Int32]()
+        var start_v = start.values.unsafe_ptr().unsafe_bitcast[Int64]()
+        var end_v = end.values.unsafe_ptr().unsafe_bitcast[Int64]()
+        var dist_v = dist.values.unsafe_ptr().unsafe_bitcast[Float64]()
+        var fare_v = fare.values.unsafe_ptr().unsafe_bitcast[Float64]()
+        var tip_v = tip.values.unsafe_ptr().unsafe_bitcast[Float64]()
+        # Whether each row has all seven values. Most batches have no nulls;
+        # then `valid` is left all true from the last time it was filled.
+        var nulls = (
+            pu.null_count
+            + do_.null_count
+            + start.null_count
+            + end.null_count
+            + dist.null_count
+            + fare.null_count
+            + tip.null_count
+        )
+        if nulls > 0 or not self.all_valid or len(self.valid) < rows:
+            if len(self.valid) < rows:
+                self.valid.resize(rows, True)
+            for i in range(rows):
+                self.valid[i] = True
+            self.all_valid = True
+        if nulls > 0:
+            _and_valid(pu, self.valid)
+            _and_valid(do_, self.valid)
+            _and_valid(start, self.valid)
+            _and_valid(end, self.valid)
+            _and_valid(dist, self.valid)
+            _and_valid(fare, self.valid)
+            _and_valid(tip, self.valid)
+            self.all_valid = False
+        var ok = self.valid.unsafe_ptr()
         self.keys.resize(rows, 0)
         self.weights.resize(rows * 3, 0.0)
         var keys = self.keys.unsafe_ptr()
         var weights = self.weights.unsafe_ptr()
         # Pass 1. Every row is written at `kept`, which only moves past the
         # trips that count, so the dropped ones are overwritten.
-        var pu_v = pu[0].unsafe_ptr()
-        var pu_ok = pu[1].unsafe_ptr()
-        var do_v = do_[0].unsafe_ptr()
-        var do_ok = do_[1].unsafe_ptr()
-        var start_v = start[0].unsafe_ptr()
-        var start_ok = start[1].unsafe_ptr()
-        var end_v = end[0].unsafe_ptr()
-        var end_ok = end[1].unsafe_ptr()
-        var dist_v = dist[0].unsafe_ptr()
-        var dist_ok = dist[1].unsafe_ptr()
-        var fare_v = fare[0].unsafe_ptr()
-        var fare_ok = fare[1].unsafe_ptr()
-        var tip_v = tip[0].unsafe_ptr()
-        var tip_ok = tip[1].unsafe_ptr()
         var kept = 0
         for i in range(rows):
             var p = pu_v[unsafe_offset=i]
@@ -187,13 +225,7 @@ struct Dense(Movable):
             var t = start_v[unsafe_offset=i]
             var us = end_v[unsafe_offset=i] - t
             var keep = (
-                pu_ok[unsafe_offset=i]
-                & do_ok[unsafe_offset=i]
-                & start_ok[unsafe_offset=i]
-                & end_ok[unsafe_offset=i]
-                & dist_ok[unsafe_offset=i]
-                & fare_ok[unsafe_offset=i]
-                & tip_ok[unsafe_offset=i]
+                ok[unsafe_offset=i]
                 & (p >= 1)
                 & (p <= 265)
                 & (d >= 1)
@@ -221,6 +253,13 @@ struct Dense(Movable):
             s[unsafe_offset=1] += weights[unsafe_offset=j * 3]
             s[unsafe_offset=2] += weights[unsafe_offset=j * 3 + 1]
             s[unsafe_offset=3] += weights[unsafe_offset=j * 3 + 2]
+
+    def merge(mut self, other: Dense):
+        """Adds every group of `other` into this one's."""
+        var a = self.slots.unsafe_ptr()
+        var b = other.slots.unsafe_ptr()
+        for i in range(KEYS * SLOT):
+            a[unsafe_offset=i] += b[unsafe_offset=i]
 
     def partitions(self, r: Int) -> Seq[Groups]:
         """The groups with trips, split into `r` partitions by key."""
@@ -326,6 +365,31 @@ def _column(b: RecordBatch, name: String) raises -> Int:
         if b.name(c) == name:
             return c
     raise Error("no column ", name)
+
+
+def _typed(
+    ref b: RecordBatch, name: String, type_id: Int
+) raises -> ref[b.arena.nodes[0]] ArrayData:
+    """Column `name` of `b`, which must be of type `type_id` and as long as
+    the batch, so `add` can read its values in place."""
+    ref a = b.column(_column(b, name))
+    if a.type.id != type_id:
+        raise Error(name, " is ", String(a.type), ", not the type expected")
+    if (
+        a.length != b.num_rows
+        or len(a.values) < a.length * a.type.fixed_width()
+    ):
+        raise Error(name, " is shorter than its batch")
+    return a
+
+
+def _and_valid(a: ArrayData, mut valid: List[Bool]):
+    """Marks the rows where `a` is null as not valid."""
+    if a.null_count == 0 or len(a.validity) == 0:
+        return
+    for i in range(a.length):
+        if not bit_get(Span(a.validity), i):
+            valid[i] = False
 
 
 def _scan(var table: TableMetadata) raises -> TableScan:
@@ -442,20 +506,85 @@ def _distributed(
     return got^
 
 
+struct _LocalScan(Movable):
+    """What the one process's threads share: the planned files, handed out
+    one at a time, and one table copy, one `Dense` and one error per thread.
+    A thread only writes its own slots."""
+
+    var files: List[FileScanTask]
+    var next: AtomicCounter
+    var tables: List[TableMetadata]
+    var dense: List[Dense]
+    var errors: List[String]
+
+    def __init__(
+        out self,
+        table: TableMetadata,
+        var files: List[FileScanTask],
+        threads: Int,
+    ):
+        self.files = files^
+        self.next = AtomicCounter.alloc(0)
+        self.tables = List[TableMetadata]()
+        self.dense = List[Dense]()
+        self.errors = List[String]()
+        for _ in range(threads):
+            self.tables.append(table.copy())
+            self.dense.append(Dense())
+            self.errors.append(String())
+
+    def __deinit__(deinit self):
+        self.next.unsafe_free()
+
+
+def _local_thread(w: Int, mut s: _LocalScan):
+    """Thread `w`: takes the next file until none are left, adding its trips
+    into its own `Dense`."""
+    try:
+        var scan = _scan(s.tables[w].copy())
+        while True:
+            var k = Int(s.next.fetch_add(1))
+            if k >= len(s.files):
+                break
+            var tasks: List[FileScanTask] = [s.files[k].copy()]
+            for b in scan.to_batches_for_tasks(tasks^):
+                s.dense[w].add(b)
+    except e:
+        s.errors[w] = String(e)
+
+
 def _local(table: TableMetadata) raises -> Tuple[Answer, Int]:
-    """The query in this process: every trip into one dense array."""
+    """The query in this process: every trip into one dense array.
+
+    On one thread, one reader scans the table, keeping several files' reads
+    in flight. On more, each thread reads whole files into its own `Dense`,
+    and they are added up at the end, so the per-row work runs on every
+    thread instead of on the one taking the reader's batches."""
     var t = Int(perf_counter_ns())
-    var dense = Dense()
-    var opts = ScanOptions()
-    opts.num_workers = Int(getenv("TAXI_THREADS", "0"))
-    var reader = _scan(table.copy()).to_batch_reader(opts)
-    while True:
-        var b = reader.next_batch()
-        if not b:
-            break
-        dense.add(b.value())
-    reader.raise_if_failed()
-    return (_answer_of(dense), _ms(t))
+    var threads = Int(getenv("TAXI_THREADS", "0"))
+    if threads <= 0:
+        threads = num_cpus()
+    if threads == 1:
+        var dense = Dense()
+        var opts = ScanOptions()
+        var reader = _scan(table.copy()).to_batch_reader(opts)
+        while True:
+            var b = reader.next_batch()
+            if not b:
+                break
+            dense.add(b.value())
+        reader.raise_if_failed()
+        return (_answer_of(dense), _ms(t))
+    var files = _scan(table.copy()).plan_files()
+    var state = _LocalScan(table, files^, threads)
+    parallel_for[_local_thread](threads, state, num_workers=threads)
+    for w in range(threads):
+        if state.errors[w] != "":
+            raise Error(state.errors[w])
+    while len(state.dense) > 1:
+        var other = state.dense.pop()
+        state.dense[0].merge(other)
+    return (_answer_of(state.dense[0]), _ms(t))
 
 
 def _close(a: Float64, b: Float64) -> Bool:

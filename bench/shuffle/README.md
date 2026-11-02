@@ -36,6 +36,7 @@ Groups, trips, and the top 10's keys and counts must match exactly between frame
 | `SHUFFLE_REDUCERS` | reduce tasks, `R` | 16 |
 | `TAXI_PASSES` | distributed runs; each prints `TIME zone_hours <pass> <ms>`, and later passes are checked against the first | 1 |
 | `TAXI_MODE` | `both`: pass 1 is checked against the same query in one process; `distributed`; `local`: one process only | `both` |
+| `TAXI_THREADS` | threads for the one-process run. dista: with more than one, each thread reads whole files into its own arrays, which are added up at the end; Ray: pyarrow's CPU threads | one per core |
 
 dista's also takes `TAXI_PREFIX` and `TAXI_ROOT`, as `deploy/taxi.mojo` does.
 
