@@ -4,7 +4,9 @@
 # against the same scans in one process (deploy/taxi.mojo). Then the shuffle
 # benchmark's job on the same cluster (deploy/shuffle.mojo, bench/shuffle):
 # trips by zone pair and hour as map and reduce tasks, checked against one
-# process too.
+# process too. Then phase 4's gate: the queries again, many passes, with a
+# worker pod killed partway; every answer must still be exact, and the head
+# must have run the dead worker's tasks again.
 #
 # Needs docker, kind, kubectl, the taxi warehouse (taxibench.example's
 # scripts/load.sh builds it), and the data environment's siblings checked out
@@ -58,11 +60,15 @@ done
 ctx=(--context "kind-$cluster")
 
 # Runs program $1 (in /opt/dista/bin) as the workers and the driver, and
-# checks the driver's log has a line starting with $2.
+# checks the driver's log has a line starting with $2. With $3 = kill, it
+# runs 20 passes and kills a worker pod once the first query is done.
 run_program() {
-  local program=$1 pass=$2
+  local program=$1 pass=$2 kill=${3:-}
+  local passes=1
+  [ "$kill" = kill ] && passes=20
   sed -e "s|@TAXI_METADATA@|$metadata|" -e "s|@TAXI_PREFIX@|$prefix|" \
-    -e "s|@PROGRAM@|/opt/dista/bin/$program|" deploy/k8s/taxi.yaml > build/taxi.yaml
+    -e "s|@PROGRAM@|/opt/dista/bin/$program|" -e "s|@PASSES@|$passes|" \
+    deploy/k8s/taxi.yaml > build/taxi.yaml
   # Start from nothing: a rolling update can't place new workers beside the
   # old ones while the spread allows only one per node.
   kubectl "${ctx[@]}" delete -f build/taxi.yaml --ignore-not-found --wait
@@ -70,6 +76,19 @@ run_program() {
   kubectl "${ctx[@]}" rollout status statefulset/dista-head --timeout=120s
   kubectl "${ctx[@]}" rollout status deployment/dista-worker --timeout=120s
   kubectl "${ctx[@]}" get pods -o wide
+
+  if [ "$kill" = kill ]; then
+    # Once the first query's first pass is done, kill a worker outright: no
+    # grace period, as a node failure would. Its replacement joins the head.
+    for _ in $(seq 300); do
+      kubectl "${ctx[@]}" logs job/dista-taxi 2>/dev/null | grep -q '^TIME ' && break
+      sleep 1
+    done
+    local victim
+    victim=$(kubectl "${ctx[@]}" get pods -l app=dista-taxi,role=worker -o name | head -1)
+    echo "killing $victim"
+    kubectl "${ctx[@]}" delete "$victim" --grace-period=0 --force --wait=false
+  fi
 
   # Wait for the job to succeed or fail, whichever comes first.
   local status=1 done_
@@ -86,8 +105,26 @@ run_program() {
     kubectl "${ctx[@]}" logs -l app=dista-taxi --prefix --tail=40 || true
     exit 1
   fi
+  if [ "$kill" = kill ]; then
+    # The head's metrics: the dead worker's tasks must have run again.
+    kubectl "${ctx[@]}" port-forward pod/dista-head-0 19090:9090 >/dev/null 2>&1 &
+    local fwd=$!
+    local retried=""
+    for _ in $(seq 30); do
+      retried=$(curl -s localhost:19090/metrics | sed -n 's/^dista_tasks_retried_total //p')
+      [ -n "$retried" ] && break
+      sleep 1
+    done
+    kill $fwd 2>/dev/null || true
+    echo "tasks retried: ${retried:-unknown}"
+    if [ -z "$retried" ] || [ "$retried" -lt 1 ]; then
+      echo "FAIL: the killed worker's tasks were never run again"
+      exit 1
+    fi
+  fi
 }
 
 run_program app "PASS taxi"
 run_program shuffle "PASS shuffle"
-echo "PASS kind taxi: the queries and the shuffle on 3 nodes, each equal to one process"
+run_program app "PASS taxi" kill
+echo "PASS kind taxi: the queries and the shuffle on 3 nodes, each equal to one process; the queries again with a worker killed, still exact"
