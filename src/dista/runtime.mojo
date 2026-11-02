@@ -55,7 +55,14 @@ from dista.client import (
 from dista.head import Head
 from dista.signals import exit_on_sigterm
 from dista.socket import Listener, Stream, exit_now, fork, wait_child, wall_ns
-from dista.task import ActorLike, MethodLike, StatePtr, TaskLike, fnv1a64
+from dista.task import (
+    ActorLike,
+    ManyLike,
+    MethodLike,
+    StatePtr,
+    TaskLike,
+    fnv1a64,
+)
 from dista.worker import Worker
 
 comptime DEFAULT_PORT = 6390
@@ -303,6 +310,29 @@ struct Runtime[*Ts: TaskLike](Movable):
         """
         Self._check_registered[T]()
         return self._c.remote[T](args)
+
+    def remote[
+        X: AnyType, //, T: TaskLike
+    ](mut self, arg: T.A, args: List[ObjectRef[X]]) raises -> ObjectRef[T.R]:
+        """Submits task `T`, a `TaskWith`, on `arg` and these results: it runs
+        once every result exists, and receives them in order as a `Seq`.
+
+        A shuffle's reducer takes this shape: its partition number, and the
+        map outputs holding that partition.
+        """
+        Self._check_registered[T]()
+        return self._c.remote[T](arg, args)
+
+    def remote_many[
+        T: ManyLike
+    ](mut self, arg: T.A, n: Int) raises -> List[ObjectRef[T.Part]]:
+        """Submits task `T`, a `TaskMany`, on `arg`, for `n` results: each is
+        an object of its own, stored, fetched and freed on its own.
+
+        A shuffle's map task takes this shape: one partition per reducer.
+        """
+        Self._check_registered[T]()
+        return self._c.remote_many[T](arg, n)
 
     def create[
         T: ActorLike

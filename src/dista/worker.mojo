@@ -56,6 +56,9 @@ from dista.frame import (
     KIND_STORED,
     KIND_TASK,
     KIND_TASK_INPUTS,
+    KIND_TASK_MANY,
+    GATHER,
+    WITH_VALUE,
     ROLE_WORKER,
     Frame,
     encode_addr,
@@ -76,7 +79,7 @@ from dista.metrics import (
     write_outcomes,
 )
 from dista.head import owner_of
-from dista.task import StatePtr
+from dista.task import StatePtr, split_parts
 from dista.store import (
     Location,
     node_name,
@@ -140,13 +143,16 @@ struct InputSpec(Copyable, Movable):
 struct TaskInputs(Movable):
     var gather: Bool
     var inputs: List[InputSpec]
+    var value: List[UInt8]
+    """A `TaskWith`'s value, which goes before the inputs; or empty."""
 
 
 def parse_task_inputs(payload: Span[UInt8, _]) raises -> TaskInputs:
     """A task-inputs payload, checked: a malformed one raises."""
     if len(payload) < 9:
         raise Error("truncated task-inputs")
-    var gather = payload[0] != 0
+    var flags = payload[0]
+    var gather = (flags & GATHER) != 0
     var pos = 1
     var n = Int(get_scalar[DType.uint64](payload, pos))
     if n < 0 or n > len(payload):
@@ -176,7 +182,15 @@ def parse_task_inputs(payload: Span[UInt8, _]) raises -> TaskInputs:
             )
         else:
             raise Error("bad task-inputs tag ", Int(tag))
-    return TaskInputs(gather, inputs^)
+    var value = List[UInt8]()
+    if flags & WITH_VALUE:
+        var size = Int(get_scalar[DType.uint64](payload, pos))
+        if size < 0 or size != len(payload) - pos:
+            raise Error("bad task-inputs value length ", size)
+        value = List[UInt8](payload[pos:])
+    elif pos != len(payload):
+        raise Error("task-inputs with ", len(payload) - pos, " bytes left over")
+    return TaskInputs(gather, inputs^, value^)
 
 
 struct _Input(Copyable, Movable):
@@ -199,6 +213,7 @@ struct _Parked(Copyable, Movable):
     var task_id: UInt64
     var gather: Bool
     var inputs: List[_Input]
+    var value: List[UInt8]
     var arrived: UInt64
 
     def __init__(
@@ -207,11 +222,13 @@ struct _Parked(Copyable, Movable):
         task_id: UInt64,
         gather: Bool,
         var inputs: List[_Input],
+        var value: List[UInt8],
     ):
         self.object_id = object_id
         self.task_id = task_id
         self.gather = gather
         self.inputs = inputs^
+        self.value = value^
         self.arrived = wall_ns()
 
 
@@ -507,6 +524,7 @@ struct Worker[
             or f.kind == KIND_ACTOR_KILL
             or f.kind == KIND_CHECKPOINT
             or f.kind == KIND_ACTOR_RESTORE
+            or f.kind == KIND_TASK_MANY
         ):
             var obj = f.object_id
             var task = f.task_id
@@ -532,7 +550,9 @@ struct Worker[
                         self._request(obj, loc.ip, loc.port)
                     inputs.append(_Input(obj, False, List[UInt8]()))
             self._parked.append(
-                _Parked(f.object_id, f.task_id, gather, inputs^)
+                _Parked(
+                    f.object_id, f.task_id, gather, inputs^, spec.value.copy()
+                )
             )
         elif f.kind == KIND_STOP:
             # `dista stop`: leave for good, instead of waiting to rejoin.
@@ -618,7 +638,7 @@ struct Worker[
             elif not complete:
                 still.append(p.copy())
             else:
-                var args = List[UInt8]()
+                var args = p.value.copy()
                 if p.gather:
                     put_scalar[DType.int64](args, Int64(len(p.inputs)))
                 if self._debug:
@@ -935,6 +955,9 @@ struct Worker[
 
     def _run_one(mut self) raises:
         var t = self._ready.pop(0)
+        if t.kind == KIND_TASK_MANY:
+            self._run_many(t^)
+            return
         if t.kind != KIND_TASK:
             self._run_actor(t^)
             return
@@ -955,6 +978,34 @@ struct Worker[
             self._report_error(t.object_id, String(e))
             return
         self._finish(t.object_id, t.arrived, started, out^)
+
+    def _run_many(mut self, var t: _Ready):
+        """Runs a `TaskMany` and answers each of its results on its own: the
+        last first, so the head sees the task in flight until all are."""
+        var first = t.object_id
+        var started = wall_ns()
+        var n = 0
+        var parts = List[List[UInt8]]()
+        var why = String()
+        try:
+            var pos = 0
+            n = Int(get_scalar[DType.uint64](t.args, pos))
+            var out = List[UInt8]()
+            Self.dispatch(t.task_id, List[UInt8](t.args[8:]), out, self._ctx)
+            parts = split_parts(out)
+            if len(parts) != n:
+                raise Error(
+                    "the task returned ", len(parts), " results, not ", n
+                )
+        except e:
+            why = String(e)
+        for k in range(n - 1, -1, -1):
+            var obj = first + UInt64(k)
+            if why:
+                self._span(obj, t.arrived, started)
+                self._report_error(obj, why)
+            else:
+                self._finish(obj, t.arrived, started, parts[k].copy())
 
     def _finish(
         mut self,

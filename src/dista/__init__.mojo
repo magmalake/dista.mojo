@@ -47,4 +47,14 @@ from dista.client import (
 )
 from dista.runtime import Runtime
 from dista.seq import Seq
-from dista.task import Actor, ActorLike, Method, MethodLike, Task, TaskLike
+from dista.task import (
+    Actor,
+    ActorLike,
+    ManyLike,
+    Method,
+    MethodLike,
+    Task,
+    TaskLike,
+    TaskMany,
+    TaskWith,
+)

@@ -16,11 +16,11 @@ Every frame is a 4-byte little-endian length, then that many bytes:
 | 3 error | worker to head, head to driver | a UTF-8 message |
 | 4 hello | driver, worker or observer to head | role byte (`ROLE_*`), the registry hash u64 (an observer's is ignored); a worker adds its object server's address |
 | 5 welcome | head to driver | the driver's number, u64 |
-| 6 task-after | driver to head | gather byte, count u64, then that many object IDs |
+| 6 task-after | driver to head | flags byte (`GATHER`, `WITH_VALUE`), count u64, then that many object IDs; with `WITH_VALUE`, a length u64 and the encoded value |
 | 7 stored | worker to head | the result's size, u64: it stayed on the worker |
 | 8 located | head to driver | the address of the worker holding the result |
 | 9 fetch | driver or worker to a worker | none: send that object back as a result frame |
-| 10 task-inputs | head to worker | gather byte, count u64, then per input a tag byte: 0, a length u64 and the bytes; or 1, an address |
+| 10 task-inputs | head to worker | flags byte, count u64, then per input a tag byte, its object ID, then for tag 0 a length u64 and the bytes, or for tag 1 its location; with `WITH_VALUE`, a length u64 and the value |
 | 11 release | driver to head | none: the driver is done with this object |
 | 12 free | head to worker | none: delete this object |
 | 13 stats | driver to head, head to driver | none; the reply is five u64 counts (see `HeadStats`) |
@@ -38,6 +38,7 @@ Every frame is a 4-byte little-endian length, then that many bytes:
 | 25 covered | head to driver | the newest of this driver's calls to the actor a checkpoint now includes, u64; the object ID names the actor |
 | 26 status | observer to head, head to observer | none; the reply is the head's state as UTF-8 text |
 | 27 stop | observer to head, head to worker | none: shut down; a worker exits instead of rejoining |
+| 28 task-many | driver to head, head to worker | the number of results u64, then the encoded argument; the results are this object ID and the ones after it |
 
 An observer (`dista status`, `timeline`, `stop`) says hello without a
 registry and owns no objects. Its timeline frame gets every driver's
@@ -69,7 +70,11 @@ already includes isn't run again. A rejoining worker destroys the actor it
 hosted: its state may hold calls no caller would resend.
 
 A task-after frame queues a task whose argument is built from other results:
-the single result as is, or with gather set, a `Seq` of all of them. When
+the single result as is, or with gather set, a `Seq` of all of them; with
+`WITH_VALUE` set, after an encoded value (a `TaskWith`).
+
+A task-many frame runs a `TaskMany`: its worker answers each of its results
+with its own result, stored or error frame, as if each were a task. When
 some of those results live on workers, the head sends the task as
 task-inputs, and the worker fetches them before it runs the task. An address
 is 12 bytes: the IPv4 address, then the port as a u64.
@@ -111,6 +116,11 @@ comptime KIND_ACTOR_RESTORE: UInt8 = 24
 comptime KIND_COVERED: UInt8 = 25
 comptime KIND_STATUS: UInt8 = 26
 comptime KIND_STOP: UInt8 = 27
+comptime KIND_TASK_MANY: UInt8 = 28
+comptime GATHER: UInt8 = 1
+"""Task-after and task-inputs flag: the inputs gather into a `Seq`."""
+comptime WITH_VALUE: UInt8 = 2
+"""Task-after and task-inputs flag: an encoded value goes before them."""
 comptime ADDR_SIZE = 12
 comptime ROLE_DRIVER: UInt8 = 1
 comptime ROLE_WORKER: UInt8 = 2
