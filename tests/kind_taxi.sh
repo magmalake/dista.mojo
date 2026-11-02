@@ -111,7 +111,9 @@ run_program() {
     local fwd=$!
     local retried=""
     for _ in $(seq 30); do
-      retried=$(curl -s localhost:19090/metrics | sed -n 's/^dista_tasks_retried_total //p')
+      # Until the forward is up, curl fails: keep trying.
+      retried=$(curl -s localhost:19090/metrics 2>/dev/null \
+        | sed -n 's/^dista_tasks_retried_total //p' || true)
       [ -n "$retried" ] && break
       sleep 1
     done
