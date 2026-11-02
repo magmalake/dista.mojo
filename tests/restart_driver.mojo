@@ -2,11 +2,18 @@
 
 Large results that stay on workers, a reduce over them after the driver has
 released them, small results through the head, and an actor checkpointed
-every 50 calls, all slow enough that the restart lands in the middle. The
-actor's count must come out exact: the new head restores it from its newest
-checkpoint, and the driver resends the calls no checkpoint includes.
+every 50 calls. The actor's count must come out exact: the new head
+restores it from its newest checkpoint, and the driver resends the calls no
+checkpoint includes.
+
+The driver sends everything, then waits until the file named by
+`RESTART_GATE` exists, which the script creates once it has killed and
+restarted the head. So the restart always lands while the driver still has
+every answer to collect, however fast or slow the machine is.
 """
 
+from std.os import getenv
+from std.os.path import exists
 from std.time import sleep
 
 from dista import Actor, Method, ObjectRef, Runtime, Seq, Task
@@ -53,6 +60,18 @@ comptime SlowAdd = Method[CounterActor, Int, Int, slow_add]
 comptime CALLS = 300
 
 
+def wait_for_gate() raises:
+    """Waits, up to a minute, for the script's sign that the head restarted."""
+    var gate = getenv("RESTART_GATE")
+    if not gate:
+        return
+    for _ in range(600):
+        if exists(gate):
+            return
+        sleep(0.1)
+    raise Error("the head was never restarted: no ", gate)
+
+
 def main() raises:
     var rt = Runtime[Blob, TotalLength, Square, CounterActor, SlowAdd](
         workers=4
@@ -69,6 +88,7 @@ def main() raises:
     var squares = List[ObjectRef[Int]]()
     for i in range(400):
         squares.append(rt.remote[Square](i))
+    wait_for_gate()
     var sum = 0
     for r in squares:
         sum += rt.get(r)

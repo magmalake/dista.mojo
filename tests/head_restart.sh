@@ -9,6 +9,10 @@ set -euo pipefail
 mkdir -p build
 export DISTA_CHECKPOINT_URI=$PWD/build/restart-checkpoints
 rm -rf "$DISTA_CHECKPOINT_URI"
+# The driver waits for this file before collecting any answer (see
+# tests/restart_driver.mojo), so the head always dies mid-run.
+export RESTART_GATE=$PWD/build/restart-gate
+rm -f "$RESTART_GATE"
 mojo build -I src ${DEP_INC:--I src} tests/restart_driver.mojo -o build/restart-driver
 
 pids=()
@@ -43,9 +47,11 @@ for _ in $(seq 300); do
   ls "$DISTA_CHECKPOINT_URI"/*/* >/dev/null 2>&1 && break
   sleep 0.1
 done
+ls "$DISTA_CHECKPOINT_URI"/*/* >/dev/null 2>&1 || { echo "FAIL: the actor never wrote a checkpoint"; exit 1; }
 kill -9 "$head"
 sleep 0.5
 start_head "$port"
+touch "$RESTART_GATE"
 
 status=0
 wait "$driver" || status=$?
