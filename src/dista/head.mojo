@@ -1589,8 +1589,9 @@ struct Head(Movable):
                 except:
                     pass
             # The results it held are gone. dista doesn't rebuild them by
-            # running their tasks again (Ray's lineage reconstruction): a job
-            # that needs one fails, and the orchestrator runs it again.
+            # running their tasks again (Ray's lineage reconstruction, out of
+            # scope: https://github.com/magmalake/dista.mojo/issues/69): a job that needs one fails,
+            # and the orchestrator runs it again.
             var held = List[UInt64]()
             for entry in self._location.items():
                 if entry.value == i:
