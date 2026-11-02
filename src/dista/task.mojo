@@ -86,6 +86,11 @@ trait TaskLike:
         raise Error(Self.name(), " is not a task")
 
     @staticmethod
+    def arity() -> Int:
+        """How many arguments it takes: 2 for a `Task2`, 3 for a `Task3`."""
+        return 1
+
+    @staticmethod
     def is_actor() -> Bool:
         return False
 
@@ -125,6 +130,16 @@ trait TaskLike:
     ) raises:
         """A method: runs on the actor's state, appends the encoded result."""
         raise Error(Self.name(), " is not a method")
+
+
+trait Task2Like(TaskLike):
+    comptime B: Movable
+    """The second argument's type; `A` is the first's."""
+
+
+trait Task3Like(Task2Like):
+    comptime C: Movable
+    """The third argument's type."""
 
 
 trait ManyLike(TaskLike):
@@ -176,6 +191,86 @@ struct Task[
         var a = _decode_all[Self.A](Self.name(), args)
         var r = Self.f(a)
         encode(r, out)
+
+
+struct Task2[
+    A_: Movable & Deinitable,
+    B_: Movable & Deinitable,
+    R_: Movable & Deinitable,
+    f: def(A_, B_) thin raises -> R_,
+](Task2Like):
+    """A remote function taking two arguments: `rt.remote[T](a, b)`.
+
+    One type per argument count, as Mojo's own library does it until its
+    variadic type parameters settle, when `Task` can take any number
+    (https://github.com/magmalake/dista.mojo/issues/71). On the wire the arguments are encoded one after the other.
+    """
+
+    comptime A = Self.A_
+    comptime B = Self.B_
+    comptime R = Self.R_
+
+    @staticmethod
+    def name() -> StaticString:
+        return reflect_fn[Self.f].linkage_name()
+
+    @staticmethod
+    def id() -> UInt64:
+        return fnv1a64(Self.name())
+
+    @staticmethod
+    def arity() -> Int:
+        return 2
+
+    @staticmethod
+    def run(args: Span[UInt8, _], mut out: List[UInt8]) raises:
+        var pos = 0
+        var a = decode[Self.A](args, pos)
+        var b = decode[Self.B](args, pos)
+        _all_read(Self.name(), args, pos)
+        encode(Self.f(a, b), out)
+
+
+struct Task3[
+    A_: Movable & Deinitable,
+    B_: Movable & Deinitable,
+    C_: Movable & Deinitable,
+    R_: Movable & Deinitable,
+    f: def(A_, B_, C_) thin raises -> R_,
+](Task3Like):
+    """A remote function taking three arguments: `rt.remote[T](a, b, c)`.
+    See `Task2`."""
+
+    comptime A = Self.A_
+    comptime B = Self.B_
+    comptime C = Self.C_
+    comptime R = Self.R_
+
+    @staticmethod
+    def name() -> StaticString:
+        return reflect_fn[Self.f].linkage_name()
+
+    @staticmethod
+    def id() -> UInt64:
+        return fnv1a64(Self.name())
+
+    @staticmethod
+    def arity() -> Int:
+        return 3
+
+    @staticmethod
+    def run(args: Span[UInt8, _], mut out: List[UInt8]) raises:
+        var pos = 0
+        var a = decode[Self.A](args, pos)
+        var b = decode[Self.B](args, pos)
+        var c = decode[Self.C](args, pos)
+        _all_read(Self.name(), args, pos)
+        encode(Self.f(a, b, c), out)
+
+
+def _all_read(name: StaticString, args: Span[UInt8, _], pos: Int) raises:
+    if pos != len(args):
+        raise Error(name, ": ", len(args) - pos, " argument bytes left over")
 
 
 struct TaskWith[

@@ -59,6 +59,8 @@ from dista.task import (
     ActorLike,
     ManyLike,
     MethodLike,
+    Task2Like,
+    Task3Like,
     StatePtr,
     TaskLike,
     fnv1a64,
@@ -297,6 +299,18 @@ struct Runtime[*Ts: TaskLike](Movable):
         """Submits task `T` on `arg` and returns a handle to its result."""
         Self._check_registered[T]()
         return self._c.remote[T](arg)
+
+    def remote[T: Task2Like](mut self, a: T.A, b: T.B) raises -> ObjectRef[T.R]:
+        """Submits task `T`, a `Task2`, on `a` and `b`."""
+        Self._check_registered[T]()
+        return self._c.remote[T](a, b)
+
+    def remote[
+        T: Task3Like
+    ](mut self, a: T.A, b: T.B, c: T.C) raises -> ObjectRef[T.R]:
+        """Submits task `T`, a `Task3`, on `a`, `b` and `c`."""
+        Self._check_registered[T]()
+        return self._c.remote[T](a, b, c)
 
     def remote[
         T: TaskLike

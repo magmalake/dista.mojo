@@ -58,6 +58,8 @@ from dista.task import (
     ActorLike,
     ManyLike,
     MethodLike,
+    Task2Like,
+    Task3Like,
     StatePtr,
     TaskLike,
     fnv1a64,
@@ -515,8 +517,32 @@ struct Client(Movable):
         """Submits task `T` on `arg` and returns a handle to its result."""
         if T.is_many():
             raise Error(T.name(), " has several results: use remote_many")
+        _one_argument[T]()
         var args = List[UInt8]()
         encode(arg, args)
+        var id = self._new_id()
+        self._submit(id, KIND_TASK, T.id(), args^, List[UInt64]())
+        return ObjectRef[T.R](id)
+
+    def remote[T: Task2Like](mut self, a: T.A, b: T.B) raises -> ObjectRef[T.R]:
+        """Submits task `T`, a `Task2`, on `a` and `b`."""
+        if T.arity() != 2:
+            raise Error(T.name(), " takes ", T.arity(), " arguments, not 2")
+        var args = List[UInt8]()
+        encode(a, args)
+        encode(b, args)
+        var id = self._new_id()
+        self._submit(id, KIND_TASK, T.id(), args^, List[UInt64]())
+        return ObjectRef[T.R](id)
+
+    def remote[
+        T: Task3Like
+    ](mut self, a: T.A, b: T.B, c: T.C) raises -> ObjectRef[T.R]:
+        """Submits task `T`, a `Task3`, on `a`, `b` and `c`."""
+        var args = List[UInt8]()
+        encode(a, args)
+        encode(b, args)
+        encode(c, args)
         var id = self._new_id()
         self._submit(id, KIND_TASK, T.id(), args^, List[UInt64]())
         return ObjectRef[T.R](id)
@@ -525,6 +551,7 @@ struct Client(Movable):
         T: TaskLike
     ](mut self, arg: ObjectRef[T.A]) raises -> ObjectRef[T.R]:
         """Submits task `T` to run on another task's result, once it exists."""
+        _one_argument[T]()
         return self._submit_after[T.R](T.id(), [arg.id], False)
 
     def remote[
@@ -1037,6 +1064,18 @@ struct Client(Movable):
             self._results[id] = frame.payload.copy()
         else:
             raise Error(message(frame.payload))
+
+
+def _one_argument[T: TaskLike]() raises:
+    """A `Task2` or `Task3` given one argument would decode garbage on its
+    worker: refuse it here, by name."""
+    if T.arity() != 1:
+        raise Error(
+            T.name(),
+            " takes ",
+            T.arity(),
+            " arguments: pass them all to rt.remote",
+        )
 
 
 struct TaskContext(Movable):
