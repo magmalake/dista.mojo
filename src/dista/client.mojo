@@ -946,15 +946,44 @@ struct Client(Movable):
             raise Error(self._errors[r.id])
         var pos = 0
         if r.id not in self._results:
-            var loc = self._where(r.id)
-            if loc.is_local():
-                # The file is visible here: decode straight from the mapping.
-                var m = SharedMapping(loc.path)
-                if loc.size > m.size():
-                    raise Error("shared object ", loc.path, " is truncated")
-                return decode[R](m.bytes()[: loc.size], pos)
-            self._fetch(r.id, loc)
+            var before = self._located[r.id].copy()
+            try:
+                return self._stored[R](r.id)
+            except e:
+                # Its worker may have drained and left, and the head have
+                # said where the result moved: read what it sent, and try
+                # there.
+                self._forget_fetcher(r.id, before)
+                while poll_readable([self._head.fd], 0)[0]:
+                    self._read_one()
+                if r.id not in self._located or self._located[r.id] == before:
+                    raise e^
+                return self._stored[R](r.id)
         return decode[R](self._results[r.id], pos)
+
+    def _stored[R: Movable](mut self, id: UInt64) raises -> R:
+        """Decodes a result that lives on a worker, from where it was last
+        said to be."""
+        var pos = 0
+        var loc = self._where(id)
+        if loc.is_local():
+            # The file is visible here: decode straight from the mapping.
+            var m = SharedMapping(loc.path)
+            if loc.size > m.size():
+                raise Error("shared object ", loc.path, " is truncated")
+            return decode[R](m.bytes()[: loc.size], pos)
+        self._fetch(id, loc)
+        return decode[R](self._results[id], pos)
+
+    def _forget_fetcher(mut self, id: UInt64, location: List[UInt8]):
+        """Stops reusing the connection to the worker at `location`, which
+        failed: the next fetch from there connects again."""
+        try:
+            var pos = 0
+            var loc = Location.decode(location, pos)
+            _ = self._fetcher_index.pop(addr_key(loc.ip, loc.port), -1)
+        except:
+            pass
 
     def release[R: AnyType](mut self, r: ObjectRef[R]) raises:
         """Says this driver is done with `r`.
