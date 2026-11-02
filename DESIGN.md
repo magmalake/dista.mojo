@@ -328,3 +328,18 @@ A worker writes a large result into the node store with `write(2)`, not through 
 ### Phase 4's gate: a worker killed mid-run (passed 2026-11-02)
 
 VISION.md's gate for phase 4 is the taxi suite finishing with a worker killed mid-run. `tests/kind_taxi.sh` runs it on kind after the phase-2 gate and the shuffle: the eight queries again, 20 passes each, with one of the three worker pods deleted with no grace period once the first query is done, as a node failure would. Kubernetes starts a replacement, which joins the head. Every pass must equal one process, and the head's `dista_tasks_retried_total` must be at least 1. First run: the dead worker's 2 tasks in flight ran again elsewhere, and all 160 query passes were exact. The taxi results are small, so they live at the head and nothing the dead worker held was needed; a job whose stored results die with their worker fails instead (see "Failure handling"). Not in CI, like the rest of `kind_taxi.sh`: the table is 1.3 GB.
+
+### Kubernetes: dista and orca
+
+dista runs in the pods it's given and creates none. orca's scheduler creates them for a pipeline's runs ([orca's K8S.md](https://github.com/magmalake/orca.mojo/blob/main/K8S.md)), so there is no dista operator: it would be a second thing creating pods, beside the one that already holds the permissions, the budgets and the cleanup.
+
+| | dista | orca |
+|---|---|---|
+| Pods | The image, one for every role, and what each role needs from its environment: `DISTA_ROLE`, `DISTA_HEAD`, `DISTA_ADVERTISE`, `DISTA_NODE`, `DISTA_STORE_BYTES`, `DISTA_METRICS_PORT` | Creates a head Pod and Service, the workers and a driver Job per run, labelled `orca.run=<id>`, and deletes them when the run ends |
+| Size | Uses every worker that joins, whenever it joins | Sets it from the pipeline's `workers=`, within `ORCA_VCPU_BUDGET` |
+| A worker lost | Runs its tasks again elsewhere; fails a task that needed a result it held | Runs the failed step, then the run, again |
+| Scaling down | Drains a stopped worker (to do, below) | Decides when; today only at a run's end |
+| Signals | `dista_queue_depth` and `dista_workers` on the head's `/metrics` | Reads them if it ever sizes a running cluster ([#76](https://github.com/magmalake/dista.mojo/issues/76)) |
+| Plain manifests | `deploy/k8s/` for a long-lived cluster without orca, which a HorizontalPodAutoscaler on `dista_queue_depth` can scale | - |
+
+**To do: drain on SIGTERM.** Today SIGTERM ends a worker at once, so a pod Kubernetes stops is a worker lost: its running tasks go elsewhere, but results it holds are gone, and a task that needs one fails. A worker told to stop should instead tell the head it's draining, so it gets no new tasks; finish what it's running, within the pod's `terminationGracePeriodSeconds`; and move what it holds before it exits, to another worker or to object storage. Then a cluster can shrink mid-job, by an autoscaler or by hand, and lose nothing. Gate: the taxi suite on kind with a worker pod deleted *with* its grace period, and no retries counted.

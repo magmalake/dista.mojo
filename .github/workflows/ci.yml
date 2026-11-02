@@ -29,19 +29,19 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: magmalake/memory-region.mojo
-          ref: 91ff4418b44a89f9354e7d32633e9b11ad365dfd
+          ref: 40068c4f95ea659e9b78aa91ced45420b07e3e6e
           path: memory-region.mojo
       - if: matrix.env == 'nightly'
         uses: actions/checkout@v4
         with:
           repository: magmalake/arrow-mlake.mojo
-          ref: d157bb3296b4f6d36feae2848ebf6e0c7e4f9f5e
+          ref: 178aae6e0da0dbe105f9cb02632a51cfd35b9dda
           path: arrow-mlake.mojo
       - if: matrix.env == 'nightly'
         uses: actions/checkout@v4
         with:
           repository: magmalake/objectstore.mojo
-          ref: 748e2d31450a7793592e439d6c69d8c6598d2129
+          ref: 58488efa729351f5894b45a0a92e898171c2e96d
           path: objectstore.mojo
 
       - uses: prefix-dev/setup-pixi@v0.10.2
@@ -74,9 +74,9 @@ jobs:
         with:
           path: dista.mojo
       - uses: actions/checkout@v4
-        with: {repository: magmalake/memory-region.mojo, ref: 9e299b82e3a866073a30ff9450c27f823513046f, path: memory-region.mojo}
+        with: {repository: magmalake/memory-region.mojo, ref: 40068c4f95ea659e9b78aa91ced45420b07e3e6e, path: memory-region.mojo}
       - uses: actions/checkout@v4
-        with: {repository: magmalake/arrow-mlake.mojo, ref: d157bb3296b4f6d36feae2848ebf6e0c7e4f9f5e, path: arrow-mlake.mojo}
+        with: {repository: magmalake/arrow-mlake.mojo, ref: 178aae6e0da0dbe105f9cb02632a51cfd35b9dda, path: arrow-mlake.mojo}
       - uses: actions/checkout@v4
         with: {repository: magmalake/parquet.mojo, ref: 9a596283d3612d1ebeca199f9e48f1c1a7eaab51, path: parquet.mojo}
       - uses: actions/checkout@v4
@@ -96,7 +96,7 @@ jobs:
       - uses: actions/checkout@v4
         with: {repository: magmalake/roaring.mojo, ref: a90a7bd30cf1c21403a29059282072e93fbeeee2, path: roaring.mojo}
       - uses: actions/checkout@v4
-        with: {repository: magmalake/objectstore.mojo, ref: 748e2d31450a7793592e439d6c69d8c6598d2129, path: objectstore.mojo}
+        with: {repository: magmalake/objectstore.mojo, ref: 58488efa729351f5894b45a0a92e898171c2e96d, path: objectstore.mojo}
       - uses: actions/checkout@v4
         with: {repository: magmalake/zstd.mojo, ref: 53655623ca8585fd5b36b1239842913ec308ae69, path: zstd.mojo}
       - uses: actions/checkout@v4

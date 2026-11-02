@@ -41,7 +41,7 @@ Later, the same core serves stateful work: actors that hold a model, a cache or 
 
 - **Not a Ray clone or Ray-compatible.** dista borrows Ray's model (tasks, actors, object refs, ownership), not its API or wire protocol. It doesn't run Python tasks.
 - **No shipping code at run time.** No pickled closures, no loading new functions into a running cluster. New code arrives as a new image.
-- **Not a cluster manager.** Kubernetes places pods, restarts them and scales them. dista schedules tasks inside the pods it's given.
+- **Not a cluster manager.** Kubernetes places pods, restarts them and scales them. dista schedules tasks inside the pods it's given, and creates none. Who decides how many there are is the deployer's: plain manifests, a HorizontalPodAutoscaler, or [orca](https://github.com/magmalake/orca.mojo)'s scheduler, which makes a cluster per run. A running job asking for more workers is deferred in [#76](https://github.com/magmalake/dista.mojo/issues/76).
 - **Not a dataframe or SQL engine.** dista runs the tasks; libraries like iceberg-mojo and parquet do the data work inside them.
 - **Not multi-tenant at first.** One job per cluster, trusted code, no per-user isolation or quotas.
 - **No lineage reconstruction.** Ray rebuilds a result lost with its worker by re-running the tasks that made it, back through their inputs. dista doesn't: it re-runs the tasks a dead worker was running, but a job that needs a result that's gone fails, naming it, and the orchestrator ([orca](https://github.com/magmalake/orca.mojo)) runs that job again. For batch jobs of seconds to minutes, running one again costs little, and it keeps the head from holding every task's arguments for as long as its result lives. Deferred in [#69](https://github.com/magmalake/dista.mojo/issues/69): vote there if you need it.
@@ -54,7 +54,7 @@ Each phase ends at a gate: a working demo, not a feature list.
 1. **One machine, many processes.** `remote[f](args) -> ObjectRef` and `get(ref)`, a head service, workers and the function registry, talking over flare. *Gate:* a fan-out and gather of 1,000 tasks runs correctly across 4 local worker processes.
 2. **A real cluster.** A shared-memory object store on each node, Arrow Flight between nodes, and deployment on Kubernetes from plain manifests (head StatefulSet, worker Deployment). *Gate:* a distributed Iceberg scan of the taxi data on a 3-node cluster returns the same answer as one machine.
 3. **Actors.** Stateful structs that take ordered method calls, placed and restarted by the head. *Gate:* a long-lived actor survives its worker restarting, with its state restored.
-4. **Hardening.** Tasks whose worker dies run again elsewhere, data-aware scheduling, and a Kubernetes operator with autoscaling. Results lost with a worker are not rebuilt: a job that needs one fails, and orca runs it again (see Non-goals). *Gate:* the taxi suite finishes with a worker killed mid-run.
+4. **Hardening.** Tasks whose worker dies run again elsewhere, data-aware scheduling, spilling, and workers that drain when Kubernetes stops them, so a cluster can shrink without failing jobs. There's no dista operator: orca creates and sizes clusters (see DESIGN.md, "Kubernetes: dista and orca"). Results lost with a worker are not rebuilt: a job that needs one fails, and orca runs it again (see Non-goals). *Gate:* the taxi suite finishes with a worker killed mid-run.
 
 ## What success looks like
 

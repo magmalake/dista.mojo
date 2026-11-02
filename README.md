@@ -21,7 +21,7 @@ def main() raises:
     print(total)  # 332833500
 ```
 
-**Status: phase 3 done** (actors, restarts, checkpoints, metrics). Phase 2's gate, a distributed Iceberg scan of the NYC taxi table on a 3-node cluster matching one machine, passes ([tests/kind_taxi.sh](tests/kind_taxi.sh)). One binary runs as driver, head or worker, chosen by environment. Run it on its own and it forks a head and workers on one machine; point it at a head and it joins a cluster:
+**Status: phase 4's gate passes.** The taxi queries on a 3-node kind cluster finish exact with a worker pod killed mid-run, its tasks run again elsewhere ([tests/kind_taxi.sh](tests/kind_taxi.sh)). Still to come in phase 4: workers that drain when stopped, so a cluster can shrink. dista creates no pods: Kubernetes or [orca](https://github.com/magmalake/orca.mojo) does ([DESIGN.md](DESIGN.md#kubernetes-dista-and-orca)). One binary runs as driver, head or worker, chosen by environment. Run it on its own and it forks a head and workers on one machine; point it at a head and it joins a cluster:
 
 ```
 DISTA_ROLE=head DISTA_PORT=6390 ./app                  # the head
@@ -35,9 +35,10 @@ What works today:
 - **Results feeding tasks:** a task can take another task's `ObjectRef`, or gather a list of them into a `Seq`, as in [examples/mapreduce.mojo](examples/mapreduce.mojo).
 - **Errors:** a task that raises re-raises in `get`. A worker that dies has its tasks run again elsewhere, up to `DISTA_TASK_RETRIES` times; the results it held are lost, and a task that needs one fails, naming it.
 - **Large results stay on the worker that made them.** On the same host other processes map them from shared memory; across hosts they fetch them directly from that worker. Small ones come back through the head.
+- **Spilling:** past `DISTA_STORE_BYTES` of results, or when the store is full, a worker writes the rest to `DISTA_SPILL_DIR` on disk, and readers map or fetch them as before ([tests/test_spill.mojo](tests/test_spill.mojo)).
+- **Data-aware scheduling:** a task goes to the node holding most of its inputs' bytes, unless that node has no worker free ([tests/locality.sh](tests/locality.sh)).
 - **Speed:** small tasks cost about 6 µs each.
 - **Kubernetes:** one image for every role, and manifests for a head and workers, in [deploy/](deploy). CI runs a smoke test on a 3-node kind cluster.
-
 - **Parquet:** tasks can read row groups with parquet.mojo and hand them to other tasks as batches ([tests/test_parquet_tasks.mojo](tests/test_parquet_tasks.mojo)).
 - **Iceberg:** a scan planned by iceberg.mojo runs as one task per data file, deletes and filters included, and returns what a local scan returns ([tests/test_iceberg_scan.mojo](tests/test_iceberg_scan.mojo)).
 - **Actors:** state on a worker of its own, with methods called in order, from the driver, from tasks or from other actors ([tests/test_actors.mojo](tests/test_actors.mojo)). An actor whose worker dies comes back on another one, from its last checkpoint if it has one (`checkpoint_every`, `rt.checkpoint`, written to `DISTA_CHECKPOINT_URI`, a directory or `s3://`), with the calls since run again. On kind, deleting the actor's pod mid-run leaves the count exact. Actors survive a head restart too: the new head restores them from their newest checkpoint, and their callers resend the calls since.
