@@ -283,9 +283,13 @@ struct Head(Movable):
     var _registry_hash: UInt64
     var _pipeline: Int
     var _exit_when_idle: Bool
-    var _workers_seen: Bool
-    """Whether a worker has said hello. In local mode, once every worker
-    seen is gone, nothing can replace them, and queued tasks fail."""
+    var _local_workers: Int
+    """In local mode, how many workers the runtime forked; 0 otherwise."""
+    var _workers_lost: Int
+    """Workers that said hello and then went away. In local mode, once all
+    `_local_workers` have, nothing can replace them, and queued tasks fail.
+    Counting them, rather than looking for a live one, keeps a worker that's
+    slow to say hello from being taken for a lost one."""
     var _conns: List[Conn]
     var _roles: List[UInt8]
     var _inflight: List[List[UInt64]]
@@ -376,6 +380,7 @@ struct Head(Movable):
         registry_hash: UInt64,
         pipeline: Int,
         exit_when_idle: Bool,
+        local_workers: Int = 0,
     ):
         """A head serving `listener`.
 
@@ -384,12 +389,14 @@ struct Head(Movable):
             registry_hash: What every peer's hello must carry.
             pipeline: Tasks in flight per worker.
             exit_when_idle: Return once the last driver leaves (local mode).
+            local_workers: In local mode, how many workers were forked.
         """
         self._listener = listener^
         self._registry_hash = registry_hash
         self._pipeline = pipeline
         self._exit_when_idle = exit_when_idle
-        self._workers_seen = False
+        self._local_workers = local_workers
+        self._workers_lost = 0
         self._conns = List[Conn]()
         self._roles = List[UInt8]()
         self._inflight = List[List[UInt64]]()
@@ -1355,7 +1362,6 @@ struct Head(Movable):
                 raise Error("a worker's hello must carry its address")
             self._roles[i] = ROLE_WORKER
             self._worker_addr[i] = List[UInt8](f.payload[9:])
-            self._workers_seen = True
         else:
             raise Error("unknown role ", Int(f.payload[0]))
 
@@ -1566,6 +1572,7 @@ struct Head(Movable):
                     if self._held.pop(obj, False):
                         self._dec(obj)
         elif role == ROLE_WORKER:
+            self._workers_lost += 1
             var a = self._hosting[i]
             self._hosting[i] = 0
             var replays = Dict[UInt64, Bool]()
@@ -1626,12 +1633,6 @@ struct Head(Movable):
                     if k > 0 and self._answered(part):
                         continue
                     self._fail(part, why.copy())
-
-    def _any_worker(self) -> Bool:
-        for i in range(len(self._conns)):
-            if self._roles[i] == ROLE_WORKER:
-                return True
-        return False
 
     def _fail_queued(mut self):
         """Fails every queued task: in local mode, with every worker gone,
@@ -1855,9 +1856,8 @@ struct Head(Movable):
         except e:
             print("dista head: placing an actor:", e)
         if (
-            self._exit_when_idle
-            and self._workers_seen
-            and not self._any_worker()
+            self._local_workers > 0
+            and self._workers_lost >= self._local_workers
         ):
             self._fail_queued()
             return

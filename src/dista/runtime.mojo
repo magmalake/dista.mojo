@@ -118,7 +118,11 @@ struct Runtime[*Ts: TaskLike](Movable):
                 var code = 0
                 try:
                     var head = Head(
-                        listener^, Self._registry_hash(), pipeline, True
+                        listener^,
+                        Self._registry_hash(),
+                        pipeline,
+                        True,
+                        local_workers=workers,
                     )
                     head.run()
                 except e:
