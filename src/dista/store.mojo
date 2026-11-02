@@ -36,7 +36,12 @@ comptime _F_OK: c_int = 0
 
 
 def node_name() -> String:
-    """This host's name, which identifies a shared `/dev/shm`."""
+    """This host's name, which identifies a shared `/dev/shm`, or
+    `DISTA_NODE` if it's set: tests use it to run one host as several
+    nodes."""
+    var named = getenv("DISTA_NODE")
+    if named:
+        return named
     var buf = stack_allocation[256, UInt8]()
     for i in range(256):
         buf.unsafe_offset(i).unsafe_write(0)
