@@ -25,6 +25,7 @@ from dista.frame import (
     KIND_ACTOR_KILL,
     KIND_CHECKPOINT,
     KIND_CLAIM,
+    KIND_COVERED,
     KIND_ERROR,
     KIND_FETCH,
     KIND_HELLO,
@@ -278,8 +279,12 @@ struct Client(Movable):
     """Actors this client created and hasn't killed."""
     var _killed: Dict[UInt64, Bool]
     """Actors this client killed: calls on them fail here."""
-    var _lost_actors: Dict[UInt64, Bool]
-    """Actors a head restart took with it."""
+    var _creates: Dict[UInt64, _Submission]
+    """How each actor this client created and hasn't killed was created: a
+    restarted head is told again."""
+    var _kept_calls: Dict[UInt64, _Submission]
+    """Calls to actors that no checkpoint includes yet: a restarted head
+    restores the actor from its checkpoint and these run again."""
     var _driver_spans: List[_DriverSpan]
 
     def __init__(
@@ -320,7 +325,8 @@ struct Client(Movable):
         self._timeline_answered = False
         self._actors = Dict[UInt64, Bool]()
         self._killed = Dict[UInt64, Bool]()
-        self._lost_actors = Dict[UInt64, Bool]()
+        self._creates = Dict[UInt64, _Submission]()
+        self._kept_calls = Dict[UInt64, _Submission]()
         self._driver_spans = List[_DriverSpan]()
 
     def close(mut self):
@@ -383,6 +389,9 @@ struct Client(Movable):
         encode(arg, args)
         var id = self._new_id()
         self._actors[id] = True
+        self._creates[id] = _Submission(
+            KIND_ACTOR_CREATE, T.id(), args.copy(), List[UInt64]()
+        )
         self._submit(id, KIND_ACTOR_CREATE, T.id(), args^, List[UInt64]())
         return ActorHandle[T](id)
 
@@ -390,14 +399,15 @@ struct Client(Movable):
         M: MethodLike
     ](mut self, actor: ActorHandle[M.Act], arg: M.A) raises -> ObjectRef[M.R]:
         """Calls method `M` on `actor` with `arg`, after every earlier call."""
-        if actor.id in self._lost_actors:
-            raise Error(actor, " was lost when the head restarted")
         if actor.id in self._killed:
             raise Error(actor, " was killed")
         var body = List[UInt8]()
         put_scalar[DType.uint64](body, actor.id)
         encode(arg, body)
         var id = self._new_id()
+        self._kept_calls[id] = _Submission(
+            KIND_ACTOR_CALL, M.id(), body.copy(), List[UInt64]()
+        )
         self._submit(id, KIND_ACTOR_CALL, M.id(), body^, List[UInt64]())
         return ObjectRef[M.R](id)
 
@@ -406,8 +416,6 @@ struct Client(Movable):
     ](mut self, actor: ActorHandle[T]) raises -> ObjectRef[Int]:
         """Checkpoints `actor` after the calls made to it so far. The result
         is the number of calls the checkpoint covers, once it's written."""
-        if actor.id in self._lost_actors:
-            raise Error(actor, " was lost when the head restarted")
         if actor.id in self._killed:
             raise Error(actor, " was killed")
         var body = List[UInt8]()
@@ -423,7 +431,8 @@ struct Client(Movable):
             return
         self._killed[actor.id] = True
         _ = self._actors.pop(actor.id, False)
-        _ = self._lost_actors.pop(actor.id, False)
+        _ = self._creates.pop(actor.id, _Submission(0, 0, [], []))
+        self._forget_calls(actor.id, UInt64.MAX)
         self._released[actor.id] = True
         self._drop_local(actor.id)
         self._send(KIND_ACTOR_KILL, actor.id, List[UInt8]())
@@ -483,6 +492,22 @@ struct Client(Movable):
             if d in self._released:
                 self._drop_local(d)
 
+    def _forget_calls(mut self, actor: UInt64, upto: UInt64):
+        """Stops keeping the calls to `actor` up to object `upto`: a
+        checkpoint has them."""
+        var done = List[UInt64]()
+        for entry in self._kept_calls.items():
+            if entry.key > upto:
+                continue
+            var pos = 0
+            try:
+                if get_scalar[DType.uint64](entry.value.payload, pos) == actor:
+                    done.append(entry.key)
+            except:
+                pass
+        for id in done:
+            _ = self._kept_calls.pop(id, _Submission(0, 0, [], []))
+
     def _drop_local(mut self, id: UInt64):
         _ = self._results.pop(id, List[UInt8]())
         _ = self._errors.pop(id, String())
@@ -519,27 +544,23 @@ struct Client(Movable):
         var f = read_frame(self._head)
         if not f or f.value().kind != KIND_WELCOME:
             raise Error("the restarted head didn't welcome this driver back")
-        # Actors don't survive a head restart yet: this driver's are lost,
-        # with their unfinished calls.
-        for entry in self._actors.items():
-            self._lost_actors[entry.key] = True
-        # Oldest first, so every task's inputs are back before it is.
+        # Oldest first, so every task's inputs are back before it is, and
+        # every actor before its calls.
         for n in range(1, Int(self._counter) + 1):
             var id = (self._driver << DRIVER_SHIFT) | UInt64(n)
+            if id in self._creates:
+                # Its checkpoint, if it has one, is in object storage: the
+                # new head restores it from there.
+                ref c = self._creates[id]
+                write_frame(self._head, c.kind, id, c.task_id, c.payload)
+                continue
             if id not in self._live:
-                continue
-            if id in self._lost_actors:
-                _ = self._subs.pop(id, _Submission(0, 0, [], []))
-                self._drop_local(id)
-                continue
-            if id in self._subs and (
-                self._subs[id].kind == KIND_ACTOR_CALL
-                or self._subs[id].kind == KIND_CHECKPOINT
-            ):
-                self._errors[id] = String(
-                    "actor lost: the head restarted before this call finished"
-                )
-                self._settle(id)
+                if id in self._kept_calls:
+                    # Released, but the actor's state needs it: run it
+                    # again, and let go of its answer.
+                    ref c = self._kept_calls[id]
+                    write_frame(self._head, c.kind, id, c.task_id, c.payload)
+                    write_frame(self._head, KIND_RELEASE, id, 0, List[UInt8]())
                 continue
             if id in self._results:
                 write_frame(self._head, KIND_RESULT, id, 0, self._results[id])
@@ -558,6 +579,12 @@ struct Client(Movable):
             elif id in self._subs:
                 ref sub = self._subs[id]
                 write_frame(self._head, sub.kind, id, sub.task_id, sub.payload)
+                continue
+            if id in self._kept_calls:
+                # Answered, but no checkpoint includes it: the restored actor
+                # runs it again, and the head keeps the answer it has.
+                ref c = self._kept_calls[id]
+                write_frame(self._head, c.kind, id, c.task_id, c.payload)
         write_frame(
             self._head,
             KIND_RESUMED,
@@ -631,6 +658,9 @@ struct Client(Movable):
                     )
                 )
             self._timeline_answered = True
+        elif frame.kind == KIND_COVERED:
+            var pos = 0
+            self._forget_calls(id, get_scalar[DType.uint64](frame.payload, pos))
         elif frame.kind == KIND_STATS:
             var pos = 0
             var n = List[Int]()

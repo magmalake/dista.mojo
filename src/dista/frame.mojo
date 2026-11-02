@@ -35,6 +35,7 @@ Every frame is a 4-byte little-endian length, then that many bytes:
 | 22 checkpoint | driver to head, head to worker | from the driver, the actor's ID u64, and the object ID is the checkpoint's own; from the head, the calls covered by the checkpoint it would restore from, i64 (-1 for none), the object ID names the actor and the task ID is the number of calls the new one covers |
 | 23 checkpointed | worker to head | none if the checkpoint is written, else why not; the object and task IDs are the checkpoint frame's |
 | 24 actor-restore | head to worker | the number of calls the checkpoint covers, u64; the object ID names the actor, the task ID its type |
+| 25 covered | head to driver | the newest of this driver's calls to the actor a checkpoint now includes, u64; the object ID names the actor |
 
 After a head restart, a driver's hello carries its old number as a u64 after
 the registry hash, so its object IDs stay valid. It then sends, in order of
@@ -50,9 +51,16 @@ call's object ID. Calls run in the order the driver sent them. A checkpoint
 runs between calls too: the worker writes the actor's state to
 `DISTA_CHECKPOINT_URI` and answers checkpointed. Actor-restore builds an
 actor from its checkpoint instead of its constructor, and is answered like
-actor-create. Actors don't survive a head restart yet: a resuming driver
-fails its actors' unfinished calls, and a rejoining worker destroys the
-actor it hosted.
+actor-create.
+
+Actors survive a head restart through their checkpoints. Every caller keeps
+its calls to an actor until covered says a checkpoint includes them. A
+resuming driver sends each live actor's actor-create again, in order with
+everything else, then every call it still keeps: those answered too, after
+their answers, since the actor's state hasn't seen them. The new head
+restores the actor from its newest checkpoint; a call that checkpoint
+already includes isn't run again. A rejoining worker destroys the actor it
+hosted: its state may hold calls no caller would resend.
 
 A task-after frame queues a task whose argument is built from other results:
 the single result as is, or with gather set, a `Seq` of all of them. When
@@ -94,6 +102,7 @@ comptime KIND_ACTOR_KILL: UInt8 = 21
 comptime KIND_CHECKPOINT: UInt8 = 22
 comptime KIND_CHECKPOINTED: UInt8 = 23
 comptime KIND_ACTOR_RESTORE: UInt8 = 24
+comptime KIND_COVERED: UInt8 = 25
 comptime ADDR_SIZE = 12
 comptime ROLE_DRIVER: UInt8 = 1
 comptime ROLE_WORKER: UInt8 = 2
