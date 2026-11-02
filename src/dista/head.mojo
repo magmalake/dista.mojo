@@ -100,6 +100,7 @@ from dista.frame import (
     KIND_TASK_MANY,
     GATHER,
     WITH_VALUE,
+    MANY,
     ROLE_CLIENT,
     ROLE_DRIVER,
     ROLE_OBSERVER,
@@ -169,6 +170,8 @@ struct _Task(Copyable, Movable):
     var node: String
     """The node holding more than half of this task's input bytes, which a
     worker there takes first; "" for none."""
+    var many: Int
+    """A waiting `TaskMany`'s number of results; 0 for any other task."""
 
     def __init__(
         out self,
@@ -179,6 +182,7 @@ struct _Task(Copyable, Movable):
         gather: Bool = False,
         kind: UInt8 = KIND_TASK,
         var node: String = String(),
+        many: Int = 0,
     ):
         self.object_id = object_id
         self.task_id = task_id
@@ -187,6 +191,7 @@ struct _Task(Copyable, Movable):
         self.gather = gather
         self.kind = kind
         self.node = node^
+        self.many = many
 
 
 struct _Actor(Copyable, Movable):
@@ -735,6 +740,16 @@ struct Head(Movable):
                 var flags = f.payload[0]
                 var gather = (flags & GATHER) != 0
                 var pos = 1
+                var many = 0
+                if flags & MANY:
+                    if len(f.payload) < 17:
+                        raise Error("truncated task-after")
+                    many = Int(get_scalar[DType.uint64](f.payload, pos))
+                    if many < 1 or many > 1 << 20:
+                        raise Error("task-after with a bad result count ", many)
+                    var last = f.object_id + UInt64(many - 1)
+                    if owner_of(last) != owner_of(f.object_id):
+                        raise Error("task-many results run past their IDs")
                 var n = Int(get_scalar[DType.uint64](f.payload, pos))
                 if n < 0 or n > (len(f.payload) - pos) // 8:
                     raise Error("task-after with a bad input count ", n)
@@ -753,12 +768,19 @@ struct Head(Movable):
                 self._hold(f.object_id)
                 if self._adopt(f.object_id):
                     return
+                if many > 0:
+                    # A `TaskMany`'s other results, held like its first.
+                    for k in range(1, many):
+                        var part = f.object_id + UInt64(k)
+                        if not self._known(part):
+                            self._hold(part)
+                    self._many[f.object_id] = many
                 var missing = False
                 for d in deps:
                     if d not in self._refs:
                         missing = True
                 if missing:
-                    self._fail(
+                    self._fail_all(
                         f.object_id,
                         String("an input was released before this task ran"),
                     )
@@ -774,6 +796,7 @@ struct Head(Movable):
                         value^,
                         deps=deps^,
                         gather=gather,
+                        many=many,
                     )
                 )
             elif f.kind == KIND_TASK_MANY:
@@ -1351,6 +1374,13 @@ struct Head(Movable):
             print("dista head: lost driver", d, ":", e)
             self._drop(i)
 
+    def _fail_all(mut self, first: UInt64, var msg: String):
+        """Fails a task's result, and if it's a `TaskMany`, every one."""
+        var parts = self._many.get(first, 1)
+        for k in range(1, parts):
+            self._fail(first + UInt64(k), msg.copy())
+        self._fail(first, msg^)
+
     def _fail(mut self, object_id: UInt64, var msg: String):
         if not self._dead.pop(object_id, False):
             self._errors[object_id] = msg.copy()
@@ -1676,17 +1706,22 @@ struct Head(Movable):
                 elif d not in self._results:
                     settled = False
             if failed:
-                self._fail(t.object_id, String("input failed: ", failed))
+                self._fail_all(t.object_id, String("input failed: ", failed))
             elif not settled:
                 still.append(t.copy())
             elif not remote:
-                var args = t.args.copy()
+                # A `TaskMany` runs on its number of results, then the input.
+                var args = List[UInt8]()
+                if t.many > 0:
+                    put_scalar[DType.uint64](args, UInt64(t.many))
+                args.extend(t.args.copy())
                 if t.gather:
                     put_scalar[DType.int64](args, Int64(len(t.deps)))
                 for d in t.deps:
                     args.extend(self._results.get(d, List[UInt8]()))
                 var id = t.object_id
-                self._enqueue(_Task(id, t.task_id, args^))
+                var kind = KIND_TASK_MANY if t.many > 0 else KIND_TASK
+                self._enqueue(_Task(id, t.task_id, args^, kind=kind))
                 self._stamp_queued(id)
             else:
                 # Some inputs live on workers: tell the worker that runs this
@@ -1694,7 +1729,11 @@ struct Head(Movable):
                 var flags = GATHER if t.gather else UInt8(0)
                 if len(t.args) > 0:
                     flags |= WITH_VALUE
+                if t.many > 0:
+                    flags |= MANY
                 var spec: List[UInt8] = [flags]
+                if t.many > 0:
+                    put_scalar[DType.uint64](spec, UInt64(t.many))
                 put_scalar[DType.uint64](spec, UInt64(len(t.deps)))
                 for d in t.deps:
                     if d in self._location:
