@@ -68,7 +68,7 @@ def new_counter(start: Int) -> Counter:
 
 def slow_add(mut c: Counter, n: Int) -> Int:
     """Slow enough that the run outlasts deleting a pod."""
-    sleep(0.005)
+    sleep(0.01)
     c.total += n
     c.runs += 1
     return c.total

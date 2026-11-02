@@ -52,10 +52,19 @@ if [ -z "$pod" ]; then
   exit 1
 fi
 sleep 2
+# Without grace: the worker is its container's PID 1, which ignores SIGTERM,
+# so a plain delete would leave it serving for the 30 s grace period.
 echo "deleting the counter's pod $pod"
-kubectl "${ctx[@]}" delete pod "$pod" --wait=false
-status=0
-kubectl "${ctx[@]}" wait --for=condition=complete job/dista-actor-driver --timeout=300s || status=1
+kubectl "${ctx[@]}" delete pod "$pod" --grace-period=0 --force --wait=false
+status=1
+for _ in $(seq 300); do
+  done_=$(kubectl "${ctx[@]}" get job dista-actor-driver -o jsonpath='{.status.succeeded}/{.status.failed}')
+  case "$done_" in
+    1/*) status=0; break ;;
+    */1) break ;;
+  esac
+  sleep 1
+done
 kubectl "${ctx[@]}" logs job/dista-actor-driver || true
 if [ $status != 0 ] || ! kubectl "${ctx[@]}" logs job/dista-actor-driver | grep -q '^PASS actor restored'; then
   echo "FAIL: the actor driver did not pass"
