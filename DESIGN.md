@@ -138,7 +138,7 @@ An address is 12 bytes: the IPv4 address, then the port as a u64. A worker's hel
 ### Still to come in phase 2
 
 - **Freeing results.** Nothing is freed yet. Ray frees a result once its owner and every task that takes it are done with it.
-- **Locality:** a task goes to the node that holds the most bytes of its arguments, falling back to the least-loaded node.
+- **Locality** (done, see the shuffle table below): a task goes to the node that holds most of its inputs' bytes, when one does.
 
 ## Concurrency
 
@@ -296,9 +296,9 @@ The taxi benchmark is mostly reading Parquet from S3. A second benchmark should 
 | | What's missing | Why a shuffle needs it |
 |---|---|---|
 | 1 | **Several results from one task** (done: `TaskMany`, `rt.remote_many[T](arg, n)`). A task that returns a `Seq` of N values; `remote_many` returns N `ObjectRef`s, each stored, fetched and freed on its own (Ray's `num_returns`). | A map task makes one partition per reducer. With one result per task, each reducer fetches every map task's whole output, or each partition is a separate task that re-reads its input. |
-| 2 | **Fetching part of an object.** A reducer fetches element *j* of a stored `Seq` without the rest. | The alternative to 1 when a task's partitions are one value. |
+| 2 | **Fetching part of an object** (dropped). A reducer fetches element *j* of a stored `Seq` without the rest. | Only an alternative to 1, which is done; nothing needs it now. |
 | 3 | **A value beside refs** (done: `TaskWith`, `rt.remote[T](value, refs)`). A task takes a value and a list of `ObjectRef`s, which resolve, in order, into a `Seq` before it runs. Refs nested anywhere in an argument are still to do. | "Reduce partition *j* over these map outputs" is a number and a list of refs. |
-| 4 | **Placement by data location.** A task goes to the node holding most of its inputs' bytes, rather than round-robin. | Reducers read megabytes from every node; sending them where the bytes are halves the traffic or better. |
+| 4 | **Placement by data location** (done). A task whose inputs live on workers prefers the node holding more than half of their bytes, and a free worker takes the first queued task that prefers its node. | For tasks whose input sits on one node, such as a step after a map, it saves the whole fetch. An all-to-all shuffle gains little: each reducer's inputs are spread evenly, so no node holds most of them, and those tasks are placed as before. |
 | 5 | **Spilling.** Results that don't fit in memory or `/dev/shm` go to local disk or object storage. | A shuffle's intermediate data can be larger than memory. |
 
 1 and 3 come first, before the second benchmark; 4 and 5 once it shows they matter. The second benchmark is [bench/shuffle](bench/shuffle/README.md), on dista (`deploy/shuffle.mojo`) and Ray (`bench/ray/shuffle_ray.py`) only: the Rust reference's workers can't fetch from each other. `JOB=shuffle bench/cloud/bench matrix` runs it on AWS. `tests/test_shuffle.mojo` runs a group-by as 8 map tasks partitioning their rows by key for 4 reducers, each reducer taking its partition from every map task, and checks the sums against one process's. A `TaskMany` takes values only, not refs, for now.
@@ -315,3 +315,7 @@ The head and the command line are a generic `dista` binary (`cli/main.mojo`) tha
 | `dista stop` | Shuts the head down, and its workers: they exit instead of rejoining. |
 
 `status`, `timeline` and `stop` connect as observers (`ROLE_OBSERVER`): a peer that says hello without a registry hash, owns no objects, and isn't counted as a driver. Gate: `tests/cli.sh` runs the smoke test and the head-restart driver, each with two workers of its own, against one `dista head` at once; both pass, `status` shows the two registries, `timeline` writes their tasks, and `stop` ends every process. On kind, `dista status` in the head pod lists the three workers. The benchmark's own command, `bench/cloud/bench`, is separate: it runs the AWS clusters and the frameworks on them.
+
+### Placement by data location (done)
+
+The head learns each worker's node from the locations of the results it stores: a node is a host name, or `DISTA_NODE` where it's set. When a task's inputs include results that live on workers, the head adds up their sizes by node, and if one node holds more than half the bytes, the task prefers it. A worker with a free slot looks at the next 64 queued tasks and takes the first that prefers its node; failing that, the first that prefers no node, or a node with no free worker this round. So a task waits only while a worker on its own node is free to take it, and a busy node's tasks still go elsewhere. Gate: `tests/locality.sh` runs four workers as two nodes; of 40 tasks taking one stored result each, 35 to 40 run on the node holding it on a laptop, where without placement about half did. The gate's bar is 28, since on a small CI runner the nodes' workers are busy more often and more tasks go to the other node.

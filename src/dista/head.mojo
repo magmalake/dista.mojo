@@ -11,7 +11,8 @@ every object ID it creates, so the head knows where each result goes.
 The loop `poll`s the listener and every connection. Drivers send tasks, ready
 to run or waiting on other results; the head queues them, hands them to
 workers round-robin up to `pipeline` in flight each, and forwards each result
-or error to the driver that owns it. Every socket is non-blocking with its
+or error to the driver that owns it. A task whose inputs live mostly on one
+node goes to a worker there when one is free (see `_pick`). Every socket is non-blocking with its
 own output queue (`Conn`), so a slow peer can't stall anyone else.
 
 Small results come through the head, which keeps them, because a task
@@ -161,6 +162,9 @@ struct _Task(Copyable, Movable):
     var gather: Bool
     var kind: UInt8
     """`KIND_TASK` with the argument, or `KIND_TASK_INPUTS` with input specs."""
+    var node: String
+    """The node holding more than half of this task's input bytes, which a
+    worker there takes first; "" for none."""
 
     def __init__(
         out self,
@@ -170,6 +174,7 @@ struct _Task(Copyable, Movable):
         var deps: List[UInt64] = List[UInt64](),
         gather: Bool = False,
         kind: UInt8 = KIND_TASK,
+        var node: String = String(),
     ):
         self.object_id = object_id
         self.task_id = task_id
@@ -177,6 +182,7 @@ struct _Task(Copyable, Movable):
         self.deps = deps^
         self.gather = gather
         self.kind = kind
+        self.node = node^
 
 
 struct _Actor(Copyable, Movable):
@@ -247,6 +253,10 @@ struct _Queue(Copyable, Movable, Sized):
         return len(self.tasks) - self.head
 
 
+comptime LOOKAHEAD = 64
+"""How far into its queue a free worker looks for a task to take."""
+
+
 struct Head(Movable):
     var _listener: Listener
     var _registry_hash: UInt64
@@ -275,6 +285,9 @@ struct Head(Movable):
     var _errors: Dict[UInt64, String]
     var _worker_addr: List[List[UInt8]]
     """For a worker, its object server's address, as frames carry it."""
+    var _node: List[String]
+    """For a worker, its node, learned from the results it stores; "" until
+    it stores one."""
     var _location: Dict[UInt64, Int]
     """Results that stayed on a worker: object ID to that worker's connection.
     """
@@ -357,6 +370,7 @@ struct Head(Movable):
         self._results = Dict[UInt64, List[UInt8]]()
         self._errors = Dict[UInt64, String]()
         self._worker_addr = List[List[UInt8]]()
+        self._node = List[String]()
         self._location = Dict[UInt64, Int]()
         self._where = Dict[UInt64, List[UInt8]]()
         self._refs = Dict[UInt64, Int]()
@@ -638,13 +652,19 @@ struct Head(Movable):
         return out^
 
     def _accept(mut self) raises:
-        var s = self._listener.accept()
-        self._conns.append(Conn(s^))
+        self._add_conn(Conn(self._listener.accept()))
+
+    def _add_conn(mut self, var conn: Conn) -> Int:
+        """A new connection, with an entry in every per-connection list; its
+        index. The fuzzer adds its connections here too."""
+        self._conns.append(conn^)
         self._roles.append(_ROLE_NONE)
         self._inflight.append(List[UInt64]())
         self._worker_addr.append(List[UInt8]())
+        self._node.append(String())
         self._hosting.append(0)
         self._hashes.append(0)
+        return len(self._conns) - 1
 
     def _handle(mut self, i: Int, var f: Frame) raises:
         var role = self._roles[i]
@@ -849,6 +869,7 @@ struct Head(Movable):
                 else:
                     self._location[obj] = i
                     self._where[obj] = f.payload.copy()
+                    self._learn_node(i, f.payload)
                     self._deliver(obj, KIND_LOCATED, f.payload)
             else:
                 self._errors[obj] = message(f.payload)
@@ -1209,6 +1230,7 @@ struct Head(Movable):
                 continue
             self._location[obj] = i
             self._where[obj] = loc.copy()
+            self._learn_node(i, loc)
             if obj in self._refs:
                 # Claimed already: tell the driver where it is again.
                 self._deliver(obj, KIND_LOCATED, loc)
@@ -1573,7 +1595,13 @@ struct Head(Movable):
                     spec.extend(t.args.copy())
                 var id = t.object_id
                 self._enqueue(
-                    _Task(id, t.task_id, spec^, kind=KIND_TASK_INPUTS)
+                    _Task(
+                        id,
+                        t.task_id,
+                        spec^,
+                        kind=KIND_TASK_INPUTS,
+                        node=self._preferred_node(t.deps),
+                    )
                 )
                 self._stamp_queued(id)
         self._waiting = still^
@@ -1587,6 +1615,72 @@ struct Head(Movable):
     def _hash_of(self, object_id: UInt64) -> UInt64:
         """The registry hash of the program that made `object_id`."""
         return self._driver_hash.get(owner_of(object_id), self._registry_hash)
+
+    def _learn_node(mut self, i: Int, location: Span[UInt8, _]):
+        """Worker `i`'s node, from a location it reported."""
+        try:
+            var pos = 0
+            self._node[i] = Location.decode(location, pos).node
+        except:
+            pass
+
+    def _preferred_node(self, deps: List[UInt64]) -> String:
+        """The node holding more than half the bytes of the inputs that live
+        on workers, or "" if none does. In an all-to-all shuffle no node does,
+        and the task goes to whichever worker is free, as before."""
+        var bytes = Dict[String, Int]()
+        var total = 0
+        for d in deps:
+            if d not in self._location:
+                continue
+            try:
+                var pos = 0
+                var loc = Location.decode(
+                    self._where.get(d, List[UInt8]()), pos
+                )
+                bytes[loc.node] = bytes.get(loc.node, 0) + loc.size
+                total += loc.size
+            except:
+                pass
+        for entry in bytes.items():
+            if entry.value * 2 > total:
+                return entry.key
+        return String()
+
+    def _pick(self, q: _Queue, i: Int, depth: Int) -> Int:
+        """Which of the next `LOOKAHEAD` queued tasks worker `i` takes: the
+        first that prefers its node, else the first that prefers no node or
+        a node with no free worker; -1 if every one is waiting for a free
+        worker on its own node, which then takes it."""
+        var fallback = -1
+        var end = min(q.head + LOOKAHEAD, len(q.tasks))
+        for k in range(q.head, end):
+            ref want = q.tasks[k].node
+            if want == "":
+                if fallback < 0:
+                    fallback = k
+                if self._node[i] == "":
+                    return k
+            elif want == self._node[i]:
+                return k
+            elif fallback < 0 and not self._free_on(want, i, depth):
+                fallback = k
+        return fallback
+
+    def _free_on(self, node: String, i: Int, depth: Int) -> Bool:
+        """Whether a worker on `node`, running worker `i`'s program, has no
+        more than `depth` tasks in flight, so it can take a task this round."""
+        for j in range(len(self._conns)):
+            if (
+                j != i
+                and self._roles[j] == ROLE_WORKER
+                and self._hosting[j] == 0
+                and self._hashes[j] == self._hashes[i]
+                and self._node[j] == node
+                and len(self._inflight[j]) <= depth
+            ):
+                return True
+        return False
 
     def _enqueue(mut self, var t: _Task):
         var h = self._hash_of(t.object_id)
@@ -1618,6 +1712,11 @@ struct Head(Movable):
                     ref q = self._queues[h]
                     if len(q) == 0:
                         continue
+                    var k = self._pick(q, i, depth)
+                    if k < 0:
+                        continue
+                    if k != q.head:
+                        q.tasks.swap_elements(q.head, k)
                     t = q.tasks[q.head].copy()
                     q.head += 1
                     if q.head == len(q.tasks):
