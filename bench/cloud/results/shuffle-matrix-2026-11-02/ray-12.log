@@ -1,0 +1,30 @@
+# ray job=shuffle nodes=12 slots=16 passes=5 reducers=192
+# metadata=s3://dista-bench-617847241090-us-east-2/warehouse/taxi/trips/metadata/00168-6ca1a160-53d8-4ae9-a692-b3f88d78a536.metadata.json
+[2026-11-02 13:15:35,214 W 7 7] network_util.cc:74: Failed to resolve hostname 'ray-head': IPv4 error: Host not found (authoritative), IPv6 error: Host not found (authoritative)
+[2026-11-02 13:15:35,215 W 7 7] network_util.cc:330: Failed to determine local IP via external connectivity to: ray-head:6379, falling back to hostname resolution
+[2026-11-02 13:15:40,219 W 7 7] rpc_client.h:153: Failed to connect to GCS at address ray-head:6379 within 5 seconds.
+2026-11-02 13:15:44,278	WARNING services.py:2248 -- WARNING: The object store is using /tmp/ray instead of /dev/shm because /dev/shm has only 4294967296 bytes available. This will harm performance! You may be able to free up space by deleting files in /dev/shm. If you are inside a Docker container, you can increase /dev/shm size by passing '--shm-size=10.13gb' to 'docker run' (or add it to the run_options list in a Ray cluster config). Make sure to set this to more than 30% of available RAM.
+2026-11-02 13:15:35,215	INFO scripts.py:1234 -- Local node IP: 10.42.2.13
+2026-11-02 13:15:46,397	SUCC scripts.py:1250 -- --------------------
+2026-11-02 13:15:46,397	SUCC scripts.py:1251 -- Ray runtime started.
+2026-11-02 13:15:46,397	SUCC scripts.py:1252 -- --------------------
+2026-11-02 13:15:46,397	INFO scripts.py:1254 -- To terminate the Ray runtime, run
+2026-11-02 13:15:46,398	INFO scripts.py:1255 --   ray stop
+TIME zone_hours 1 18399
+ANSWER zone_hours 1044000 1422958681 60931887829.752144 193441593.47473502 18065949359.899994
+TOP 1 1691731 264 264 19 1242596 59.782603418986746 0.12756007935260463
+TOP 2 1691730 264 264 18 1214169 57.208643858882475 0.12595356739605962
+TOP 3 1691732 264 264 20 1165859 60.660792438366045 0.12835065361939574
+TOP 4 1691733 264 264 21 1154013 127.49064140118129 0.1370276780746741
+TOP 5 1691734 264 264 22 1104820 66.12542072505317 0.12707116575696661
+TOP 6 1691729 264 264 17 1019847 54.18802357324156 0.12563381525293904
+TOP 7 1691726 264 264 14 1004357 42.0219334839114 0.11024799527015851
+TOP 8 1691727 264 264 15 982192 57.90572981205844 0.11646314901390371
+TOP 9 1691735 264 264 23 962926 87.0459023858932 0.133100670104408
+TOP 10 1691725 264 264 13 954446 46.64152870917211 0.1168493036627392
+TIME zone_hours 2 11439
+TIME zone_hours 3 13408
+TIME zone_hours 4 9920
+TIME zone_hours 5 11372
+zone_hours : 1044000 groups, 1422958681 trips | distributed 18399 ms, one process - ms
+PASS ray shuffle: zone_hours, 192 reducers; passes agree; distributed 18399 ms, one process - ms

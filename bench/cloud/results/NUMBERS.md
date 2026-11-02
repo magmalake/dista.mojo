@@ -240,3 +240,62 @@ dista's image is distroless with no libpq or sqlite (#27).
   22 ms.
 - Cost of the AWS gate: a head and 3 workers for about 13 minutes, about
   $1.50.
+
+## 7. The shuffle: trips by zone pair and hour
+
+The second benchmark (`bench/shuffle/README.md`, dista#57): every trip is
+grouped by pickup zone, dropoff zone and hour of day, which is 1,044,000
+groups in this table, and each group sums its trips, speeds, tip ratios and
+fares. Map tasks read one data file each and split their groups into one
+partition per reducer; reducer `j` takes partition `j` from every map task.
+dista and Ray only. These runs are from dista `fb21eb1`, before the faster
+per-row loop of dista#58.
+
+Every run's answer agrees with both one-process references: 1,044,000
+groups and 1,422,958,681 trips exactly, the same top 10, and sums equal to
+about 1e-13. (The matrix folder's own `summary.md` says "no reference"
+because the references are in another folder; summarizing the two
+together reports every answer matching.)
+
+### 7a. Distributed, 3, 6 and 12 nodes
+
+`shuffle-matrix-2026-11-02/`, 5 passes, one reducer per task slot (16 a
+node). Median pass, ms, with the slowest pass below it:
+
+| | dista ×3 | ray ×3 | dista ×6 | ray ×6 | dista ×12 | ray ×12 |
+|---|---:|---:|---:|---:|---:|---:|
+| median pass | **8,462** | **14,169** | **5,139** | **10,955** | **7,282** | **11,439** |
+| slowest pass | 9,321 | 18,228 | 6,299 | 14,535 | 8,754 | 18,399 |
+| reducers | 48 | 48 | 96 | 96 | 192 | 192 |
+
+dista is 1.7× (3 nodes), 2.1× (6) and 1.6× (12) faster than Ray. Both get
+slower from 6 nodes to 12; with one reducer per slot, 12 nodes means 192
+reducers each taking a partition from each of 416 map tasks, about 80,000
+partitions in all. Fewer reducers on 12 nodes is the next thing to try.
+
+### 7b. One process, on the head node
+
+`shuffle-local-2026-11-02/`, ms:
+
+| threads | dista | ray |
+|---|---:|---:|
+| 16 | 126,383 | failed |
+| 1 | 202,154 | 115,680 |
+
+dista on 16 threads is only 1.6× its one-thread time, because one thread
+did every batch's per-row work while sixteen decoded. On a laptop that work
+was 82% of the run on 8 threads; dista#58 makes it 2.7× faster, and the AWS
+numbers above predate it.
+
+Ray's 16-thread run failed twice, here and in `shuffle-local-2026-11-02-2/`:
+both times `kubectl` lost the API server on the head node ("TLS handshake
+timeout") for about four minutes, so the job's pod was never seen to
+finish. The head node also runs the k3s server, and Ray on all 16 cores
+likely starved it. Not yet retried with fewer threads.
+
+### 7c. Building the images
+
+`shuffle-matrix-2026-11-02/build.tsv`: dista's whole build is now 191 s, of
+which compiling is 124 s, against 116–122 s and 51–54 s in section 5. The
+image now compiles three programs: the taxi queries, the shuffle and the
+`dista` command. Ray 47 s, Rust 169 s, as before.

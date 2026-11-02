@@ -1,0 +1,70 @@
+results: bench/cloud/results/shuffle-matrix-2026-11-02
+== up 12 13:00:04
+launching the head (c7g.4xlarge)
+launching 12 workers (c7g.4xlarge)
+waiting for the head's API
+waiting for 12 workers to join
+NAME               STATUS   ROLES                  AGE   VERSION         ROLE     RANK
+ip-172-31-0-169    Ready    <none>                 11s   v1.33.13+k3s2   worker   0
+ip-172-31-1-132    Ready    <none>                 12s   v1.33.13+k3s2   worker   1
+ip-172-31-10-255   Ready    <none>                 10s   v1.33.13+k3s2   worker   2
+ip-172-31-12-197   Ready    <none>                 10s   v1.33.13+k3s2   worker   3
+ip-172-31-12-237   Ready    <none>                 10s   v1.33.13+k3s2   worker   4
+ip-172-31-13-13    Ready    <none>                 10s   v1.33.13+k3s2   worker   5
+ip-172-31-15-18    Ready    <none>                 10s   v1.33.13+k3s2   worker   6
+ip-172-31-15-40    Ready    control-plane,master   16s   v1.33.13+k3s2   head     
+ip-172-31-3-176    Ready    <none>                 8s    v1.33.13+k3s2   worker   7
+ip-172-31-7-207    Ready    <none>                 10s   v1.33.13+k3s2   worker   8
+ip-172-31-9-248    Ready    <none>                 10s   v1.33.13+k3s2   worker   9
+ip-172-31-9-34     Ready    <none>                 8s    v1.33.13+k3s2   worker   10
+ip-172-31-9-87     Ready    <none>                 9s    v1.33.13+k3s2   worker   11
+KUBECONFIG=build/cloud/kubeconfig
+== build 13:01:26
+== building dista:taxi on c7g.4xlarge
+dista	191	35.6	123.7	95	33	c7g.4xlarge
+== loading dista:taxi into every node
+== building dista-ray:taxi on c7g.4xlarge
+ray	47	19.0	-	652	217	c7g.4xlarge
+== loading dista-ray:taxi into every node
+== building dista-rust:taxi on c7g.4xlarge
+rust	169	92.8	58.6	132	41	c7g.4xlarge
+== loading dista-rust:taxi into every node
+image  total_s  deps_s  compile_s  disk_mb  gzip_mb  instance
+dista  191      35.6    123.7      95       33       c7g.4xlarge
+ray    47       19.0    -          652      217      c7g.4xlarge
+rust   169      92.8    58.6       132      41       c7g.4xlarge
+== run 13:09:41
+== shuffle: dista on 3 nodes, 16 slots each
+PASS shuffle: zone_hours, 48 reducers; passes agree; distributed 9321 ms, one process - ms
+== shuffle: ray on 3 nodes, 16 slots each
+PASS ray shuffle: zone_hours, 48 reducers; passes agree; distributed 18115 ms, one process - ms
+== shuffle: dista on 6 nodes, 16 slots each
+PASS shuffle: zone_hours, 96 reducers; passes agree; distributed 6299 ms, one process - ms
+== shuffle: ray on 6 nodes, 16 slots each
+PASS ray shuffle: zone_hours, 96 reducers; passes agree; distributed 14535 ms, one process - ms
+== shuffle: dista on 12 nodes, 16 slots each
+PASS shuffle: zone_hours, 192 reducers; passes agree; distributed 8754 ms, one process - ms
+== shuffle: ray on 12 nodes, 16 slots each
+PASS ray shuffle: zone_hours, 192 reducers; passes agree; distributed 18399 ms, one process - ms
+## Distributed, median of passes (ms)
+
+| query | dista ×3 | ray ×3 | dista ×6 | ray ×6 | dista ×12 | ray ×12 |
+|---|---:|---:|---:|---:|---:|---:|
+| zone_hours | 8,462 | 14,169 | 5,139 | 10,955 | 7,282 | 11,439 |
+| total, median pass | **8,462** | **14,169** | **5,139** | **10,955** | **7,282** | **11,439** |
+| total, slowest pass | 9,321 | 18,228 | 6,299 | 14,535 | 8,754 | 18,399 |
+| answers match the reference | no reference | no reference | no reference | no reference | no reference | no reference |
+
+Slots per node: 16. Passes: 5.
+
+## Building the images
+
+| image | whole build (s) | dependencies (s) | compile (s) | unpacked (MB) | gzip (MB) | built on |
+|---|---:|---:|---:|---:|---:|---|
+| dista | 191 | 35.6 | 123.7 | 95 | 33 | c7g.4xlarge |
+| ray | 47 | 19.0 | - | 652 | 217 | c7g.4xlarge |
+| rust | 169 | 92.8 | 58.6 | 132 | 41 | c7g.4xlarge |
+
+== done 13:17:04
+== teardown 13:17:04
+terminated; the bucket stays (bench/cloud/data.sh drop removes it)
