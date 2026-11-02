@@ -1,7 +1,10 @@
 #!/bin/bash
 # The phase-2 gate on a kind cluster of three worker nodes: taxibench's
 # queries over the NYC taxi Iceberg table, one task per data file, checked
-# against the same scans in one process (deploy/taxi.mojo).
+# against the same scans in one process (deploy/taxi.mojo). Then the shuffle
+# benchmark's job on the same cluster (deploy/shuffle.mojo, bench/shuffle):
+# trips by zone pair and hour as map and reduce tasks, checked against one
+# process too.
 #
 # Needs docker, kind, kubectl, the taxi warehouse (taxibench.example's
 # scripts/load.sh builds it), and the data environment's siblings checked out
@@ -53,28 +56,38 @@ for node in $(kind get nodes --name "$cluster" | grep -v control-plane); do
 done
 
 ctx=(--context "kind-$cluster")
-sed -e "s|@TAXI_METADATA@|$metadata|" -e "s|@TAXI_PREFIX@|$prefix|" \
-  deploy/k8s/taxi.yaml > build/taxi.yaml
-# Start from nothing: a rolling update can't place new workers beside the old
-# ones while the spread allows only one per node.
-kubectl "${ctx[@]}" delete -f build/taxi.yaml --ignore-not-found --wait
-kubectl "${ctx[@]}" apply -f build/taxi.yaml
-kubectl "${ctx[@]}" rollout status statefulset/dista-head --timeout=120s
-kubectl "${ctx[@]}" rollout status deployment/dista-worker --timeout=120s
-kubectl "${ctx[@]}" get pods -o wide
 
-# Wait for the job to succeed or fail, whichever comes first.
-status=1
-for _ in $(seq 600); do
-  done_=$(kubectl "${ctx[@]}" get job dista-taxi -o jsonpath='{.status.succeeded}{.status.failed}')
-  [ -n "$done_" ] && break
-  sleep 2
-done
-[ "$(kubectl "${ctx[@]}" get job dista-taxi -o jsonpath='{.status.succeeded}')" = 1 ] && status=0
-kubectl "${ctx[@]}" logs job/dista-taxi || true
-if [ $status != 0 ] || ! kubectl "${ctx[@]}" logs job/dista-taxi | grep -q '^PASS taxi'; then
-  echo "FAIL: the taxi job did not pass"
+# Runs program $1 (in /opt/dista/bin) as the workers and the driver, and
+# checks the driver's log has a line starting with $2.
+run_program() {
+  local program=$1 pass=$2
+  sed -e "s|@TAXI_METADATA@|$metadata|" -e "s|@TAXI_PREFIX@|$prefix|" \
+    -e "s|@PROGRAM@|/opt/dista/bin/$program|" deploy/k8s/taxi.yaml > build/taxi.yaml
+  # Start from nothing: a rolling update can't place new workers beside the
+  # old ones while the spread allows only one per node.
+  kubectl "${ctx[@]}" delete -f build/taxi.yaml --ignore-not-found --wait
+  kubectl "${ctx[@]}" apply -f build/taxi.yaml
+  kubectl "${ctx[@]}" rollout status statefulset/dista-head --timeout=120s
+  kubectl "${ctx[@]}" rollout status deployment/dista-worker --timeout=120s
   kubectl "${ctx[@]}" get pods -o wide
-  kubectl "${ctx[@]}" logs -l app=dista-taxi --prefix --tail=40 || true
-  exit 1
-fi
+
+  # Wait for the job to succeed or fail, whichever comes first.
+  local status=1 done_
+  for _ in $(seq 600); do
+    done_=$(kubectl "${ctx[@]}" get job dista-taxi -o jsonpath='{.status.succeeded}{.status.failed}')
+    [ -n "$done_" ] && break
+    sleep 2
+  done
+  [ "$(kubectl "${ctx[@]}" get job dista-taxi -o jsonpath='{.status.succeeded}')" = 1 ] && status=0
+  kubectl "${ctx[@]}" logs job/dista-taxi || true
+  if [ $status != 0 ] || ! kubectl "${ctx[@]}" logs job/dista-taxi | grep -q "^$pass"; then
+    echo "FAIL: the $program job did not pass"
+    kubectl "${ctx[@]}" get pods -o wide
+    kubectl "${ctx[@]}" logs -l app=dista-taxi --prefix --tail=40 || true
+    exit 1
+  fi
+}
+
+run_program app "PASS taxi"
+run_program shuffle "PASS shuffle"
+echo "PASS kind taxi: the queries and the shuffle on 3 nodes, each equal to one process"

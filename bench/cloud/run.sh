@@ -8,6 +8,9 @@
 #   bench/cloud/run.sh          the matrix: each framework on each node count,
 #                               every query TAXI_PASSES times
 #   NODES="3 6 12" FRAMEWORKS="dista rust ray" PASSES=5 SLOTS=16 bench/cloud/run.sh
+#   JOB=shuffle bench/cloud/run.sh   the shuffle benchmark (bench/shuffle),
+#                               on dista and Ray; REDUCERS reduce tasks
+#                               (default: every worker slot)
 #
 # The one-process scan takes from minutes (dista) to most of an hour (Rust,
 # Ray) on 1.4 billion rows, so it runs once, before the workers exist, and
@@ -29,6 +32,12 @@ cd "$(dirname "$0")/../.."
 
 metadata=$(cat "$state/metadata.txt")
 passes=${PASSES:-5}
+job=${JOB:-taxi}
+case $job in
+  taxi) dista_program=/opt/dista/bin/app; ray_script=taxi_ray.py; frameworks="dista rust ray" ;;
+  shuffle) dista_program=/opt/dista/bin/shuffle; ray_script=shuffle_ray.py; frameworks="dista ray" ;;
+  *) echo "JOB must be taxi or shuffle, got $job"; exit 2 ;;
+esac
 results=${RESULTS:-bench/cloud/results/$(date -u +%F)}
 mkdir -p "$results"
 
@@ -58,11 +67,11 @@ run_job() {
 
 if [ "${1:-}" = local ]; then
   aws_secret
-  for fw in ${FRAMEWORKS:-dista rust ray}; do
+  for fw in ${FRAMEWORKS:-$frameworks}; do
     case $fw in
-      dista) image=dista:taxi; command='["/opt/dista/bin/app"]' ;;
+      dista) image=dista:taxi; command="[\"$dista_program\"]" ;;
       rust)  image=dista-rust:taxi; command='["/usr/local/bin/taxi-rs"]' ;;
-      ray)   image=dista-ray:taxi; command='["python", "/app/taxi_ray.py"]' ;;
+      ray)   image=dista-ray:taxi; command="[\"python\", \"/app/$ray_script\"]" ;;
     esac
     echo "== $fw, one process on the head node"
     sed -e "s|@APP@|$fw-taxi|g" -e "s|@IMAGE@|$image|g" -e "s|@COMMAND@|$command|g" \
@@ -89,14 +98,16 @@ slots=${SLOTS:-$(kubectl get nodes -l dista-bench/role=worker -o jsonpath='{.ite
 } > "$results/meta.txt"
 
 for nodes in ${NODES:-3 6 12}; do
-  for fw in ${FRAMEWORKS:-dista rust ray}; do
-    echo "== $fw on $nodes nodes, $slots slots each"
+  for fw in ${FRAMEWORKS:-$frameworks}; do
+    echo "== $job: $fw on $nodes nodes, $slots slots each"
     aws_secret
     sed -e "s|@NODES@|$nodes|g" -e "s|@SLOTS@|$slots|g" \
       -e "s|@REPLICAS@|$((nodes * slots))|g" -e "s|@PASSES@|$passes|g" \
+      -e "s|@DISTA_PROGRAM@|$dista_program|g" -e "s|@RAY_SCRIPT@|$ray_script|g" \
+      -e "s|@REDUCERS@|${REDUCERS:-$((nodes * slots))}|g" \
       -e "s|@TAXI_METADATA@|$metadata|g" "bench/cloud/k8s/$fw.yaml" > "$state/$fw.yaml"
     log=$results/$fw-$nodes.log
-    { echo "# $fw nodes=$nodes slots=$slots passes=$passes"
+    { echo "# $fw job=$job nodes=$nodes slots=$slots passes=$passes reducers=${REDUCERS:-$((nodes * slots))}"
       echo "# metadata=$metadata"; } > "$log"
     run_job "$state/$fw.yaml" "$log" "$fw-taxi"
     if [ "$fw" = dista ]; then

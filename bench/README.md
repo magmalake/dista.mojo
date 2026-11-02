@@ -1,5 +1,10 @@
 # dista vs Ray vs Rust on the taxi gate
 
+A second benchmark, [shuffle/](shuffle/README.md), spends its time in user
+code and in a shuffle instead of in reading Parquet: trips by zone pair and
+hour, as map tasks partitioning by key and reduce tasks taking their
+partition from every map task, on dista and Ray. Below is the first one.
+
 The same program three times: taxibench's eight queries over the NYC taxi
 Iceberg table (79.5M trips, 24 monthly files, 1.3 GB). Each query runs as one
 task per data file, folded where it's read, and is then checked against the

@@ -39,7 +39,10 @@ usage() { sed -n '2,/^set -uo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; exit "$
 
 # A results folder nobody has used: <kind>-<date>, then -2, -3, ...
 fresh_results() {
-  local base=$here/results/$1-$(date -u +%F) dir n=2
+  # JOB=shuffle runs bench/shuffle's job instead of the taxi queries.
+  local job=${JOB:-taxi}
+  [ "$job" = taxi ] && job= || job=$job-
+  local base=$here/results/$job$1-$(date -u +%F) dir n=2
   dir=$base
   while [ -e "$dir" ]; do dir=$base-$n; n=$((n + 1)); done
   echo "$dir"

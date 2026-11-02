@@ -7,8 +7,10 @@ first pass included; Ray starts its worker processes in it), the median of
 the per-pass totals, and the slowest pass. The one-process times come from
 `run.sh local`, the reference runs.
 
-Every run's answers (its ANSWER lines) are checked against the references:
-row counts exactly, sums to 1e-6 relative. The references are checked
+Every run's answers (its ANSWER and TOP lines) are checked against the
+references: whole numbers exactly, the rest to 1e-6 relative. The taxi job's
+ANSWER is rows and three sums; the shuffle job's (bench/shuffle) is groups,
+trips and three sums, with its top 10 as TOP lines. The references are checked
 against each other the same way, so three implementations have to agree.
 
 Usage: summarize.py bench/cloud/results/<date>
@@ -37,15 +39,22 @@ def parse(path):
             _, q, _, ms = line.split()
             times[q].append(int(ms))
         elif line.startswith("ANSWER "):
-            _, q, rows, a, b, z = line.split()
-            answers[q] = (int(rows), float(a), float(b), float(z))
+            _, q, *vals = line.split()
+            answers[q] = tuple(number(v) for v in vals)
+        elif line.startswith("TOP "):
+            _, rank, *vals = line.split()
+            answers[f"top{rank}"] = tuple(number(v) for v in vals)
         elif line.startswith("PASS"):
             passed = True
         else:
-            m = re.match(r"(q\d\w*) : .* one process (\d+) ms", line)
+            m = re.match(r"(\w+) : .* one process (\d+) ms", line)
             if m:
                 local[m.group(1)] = int(m.group(2))
     return {"head": head, "times": times, "local": local, "answers": answers, "passed": passed}
+
+
+def number(v):
+    return float(v) if any(c in v for c in ".eEn") else int(v)
 
 
 def close(x, y):
@@ -58,11 +67,12 @@ def disagreement(got, want):
         g = got.get(q)
         if g is None:
             return f"{q} missing"
-        if g[0] != w[0]:
-            return f"{q} rows {g[0]} vs {w[0]}"
-        for i, name in ((1, "sum_a"), (2, "sum_b"), (3, "zones")):
-            if not close(g[i], w[i]):
-                return f"{q} {name} {g[i]!r} vs {w[i]!r}"
+        if len(g) != len(w):
+            return f"{q} has {len(g)} values, not {len(w)}"
+        for i, (x, y) in enumerate(zip(g, w)):
+            exact = isinstance(x, int) and isinstance(y, int)
+            if (x != y) if exact else not close(x, y):
+                return f"{q} value {i + 1}: {x!r} vs {y!r}"
     return None
 
 
