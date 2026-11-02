@@ -77,6 +77,10 @@ spec:
           env:
             - {name: DISTA_ROLE, value: worker}
             - {name: DISTA_HEAD, value: "dista-head:6390"}
+            # A worker keeps up to 1 GiB of results in /dev/shm, whose size
+            # limit evicts the pod rather than failing a write; past that it
+            # spills them to /tmp, on the node's disk.
+            - {name: DISTA_STORE_BYTES, value: "1073741824"}
             - {name: TAXI_METADATA, value: "@TAXI_METADATA@"}
             - name: DISTA_ADVERTISE
               valueFrom: {fieldRef: {fieldPath: status.podIP}}

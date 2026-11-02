@@ -86,7 +86,9 @@ from dista.store import (
     worker_token,
     read_shared,
     remove_file,
+    spill_dir,
     store_dir,
+    store_limit,
     write_shared,
 )
 from dista.socket import (
@@ -295,7 +297,15 @@ struct Worker[
     var _dir: String
     """The node store's directory, or "" when results stay in memory."""
     var _files: Dict[UInt64, Location]
-    """Results this worker wrote into the node store."""
+    """Results this worker wrote into the node store, or spilled to disk."""
+    var _spill: String
+    """Where results go that don't fit the store (`DISTA_SPILL_DIR`)."""
+    var _store_limit: Int
+    """`DISTA_STORE_BYTES`: the store bytes this worker may hold; 0, any."""
+    var _store_used: Int
+    """Bytes of this worker's results in the store, spilled ones aside."""
+    var _spilled: Int
+    """Results spilled to disk, for the metrics."""
     var _token: UInt64
     """Names this worker's node-store files: `dista-<token>-<object>`."""
     var _fetched: Dict[UInt64, Bool]
@@ -369,6 +379,10 @@ struct Worker[
         self._node = node_name()
         self._dir = store_dir()
         self._files = Dict[UInt64, Location]()
+        self._spill = spill_dir()
+        self._store_limit = store_limit()
+        self._store_used = 0
+        self._spilled = 0
         self._token = worker_token()
         self._fetched = Dict[UInt64, Bool]()
         self._debug = getenv("DISTA_DEBUG") == "1"
@@ -561,7 +575,7 @@ struct Worker[
         elif f.kind == KIND_FREE:
             _ = self._objects.pop(f.object_id, List[UInt8]())
             if f.object_id in self._files:
-                remove_file(self._files.pop(f.object_id).path)
+                self._remove(self._files.pop(f.object_id))
         elif f.kind == KIND_ERROR:
             raise Error(
                 "the head refused this worker: ",
@@ -714,6 +728,23 @@ struct Worker[
             "dista_worker_result_bytes",
             "Bytes of the large results this worker holds.",
             held,
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_worker_store_bytes",
+            "Bytes of this worker's results in the node store.",
+            self._store_used,
+        )
+        write_metric(
+            out,
+            "counter",
+            "dista_worker_results_spilled_total",
+            (
+                "Large results written to DISTA_SPILL_DIR because the store was"
+                " full."
+            ),
+            self._spilled,
         )
         write_metric(
             out,
@@ -1019,14 +1050,7 @@ struct Worker[
             self._span(obj, arrived, started)
             self._to_head(KIND_RESULT, obj, out)
         else:
-            var path = String()
-            if self._dir != "":
-                path = String(self._dir, "/dista-", hex(self._token), "-", obj)
-                try:
-                    write_shared(path, out)
-                except e:
-                    print("dista worker: node store write failed:", e)
-                    path = String()
+            var path = self._write(obj, out)
             var loc = Location(self._ip, self._port, self._node, path, len(out))
             if path != "":
                 self._files[obj] = loc.copy()
@@ -1034,6 +1058,38 @@ struct Worker[
                 self._objects[obj] = out^
             self._span(obj, arrived, started)  # storing included
             self._to_head(KIND_STORED, obj, loc.encode())
+
+    def _write(mut self, obj: UInt64, data: Span[UInt8, _]) -> String:
+        """Writes a large result into the node store, or past
+        `DISTA_STORE_BYTES` or a failed write, spills it to disk; its path,
+        or "" to keep it in memory, where the store is off or both fail."""
+        if self._dir == "":
+            return String()
+        var name = String("/dista-", hex(self._token), "-", obj)
+        var n = len(data)
+        if self._store_limit == 0 or self._store_used + n <= self._store_limit:
+            var path = String(self._dir, name)
+            try:
+                write_shared(path, data)
+                self._store_used += n
+                return path
+            except e:
+                print("dista worker: node store write failed, spilling:", e)
+        if self._spill != "" and self._spill != self._dir:
+            var path = String(self._spill, name)
+            try:
+                write_shared(path, data)
+                self._spilled += 1
+                return path
+            except e:
+                print("dista worker: spilling failed, keeping it in memory:", e)
+        return String()
+
+    def _remove(mut self, loc: Location):
+        """Deletes a result's file, and counts it out of the store."""
+        if loc.path.startswith(String(self._dir, "/")):
+            self._store_used -= loc.size
+        remove_file(loc.path)
 
     def _span(mut self, obj: UInt64, arrived: UInt64, started: UInt64):
         """Tells the head when `obj`'s task arrived, started and ended here."""

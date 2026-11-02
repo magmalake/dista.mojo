@@ -1,8 +1,8 @@
 """The node-local object store: large results in shared mappings.
 
 A worker writes each large result into a file in a node-local directory
-(`/dev/shm` on Linux, `$TMPDIR` on macOS, or `DISTA_STORE_DIR`) through
-memory-region's `MappedRegion`. A reader that can see that file maps it
+(`/dev/shm` on Linux, `$TMPDIR` on macOS, or `DISTA_STORE_DIR`). A reader
+that can see that file maps it, through memory-region's `SharedMapping`,
 read-only and reads the bytes where they lie: no socket, no copy through
 the kernel's network stack. A reader that can't fetches the result over a
 socket from the worker, as before.
@@ -16,6 +16,13 @@ one machine reported different ones.)
 `DISTA_SHM=0` turns the store off; large results then stay in the worker's
 memory and are always fetched over sockets.
 
+Spilling: a worker keeps at most `DISTA_STORE_BYTES` of results in the store
+(no limit when unset), and a result past that, or one the store can't take,
+goes to `DISTA_SPILL_DIR` on disk instead (default `$TMPDIR`, or `/tmp`).
+A spilled result is read the same way, mapped or fetched, only from disk.
+On Kubernetes `/dev/shm` is an in-memory volume whose size limit evicts the
+pod rather than failing a write, so the limit is what keeps it in bounds.
+
 A location says where a result is: the worker's object server address, its
 host name, the file's path ("" when it's only in memory) and the exact size,
 since mapped files are padded.
@@ -27,7 +34,8 @@ from std.os import getenv
 from std.sys.info import CompilationTarget
 from std.time import perf_counter_ns
 
-from memory_region import MappedRegion, SharedMapping
+from memory_region import SharedMapping
+from memory_region.ffi import close_fd, o_creat, o_trunc, open_file
 
 from dista.codec import get_scalar, put_scalar
 from dista.frame import decode_addr, encode_addr
@@ -102,21 +110,29 @@ def remove_file(path: String):
 
 
 def write_shared(path: String, data: Span[UInt8, _]) raises:
-    """Writes `data` into a new shared mapping at `path`.
+    """Writes `data` into a new file at `path`, for readers to map.
 
     It's written under a temporary name and renamed into place, so a reader
     that maps `path` sees a whole result, old or new, never one mid-write.
+    It's written with `write(2)`, not through a mapping: a full file system
+    then fails the write with an error, where a mapped store would kill the
+    process with SIGBUS on a page it couldn't back.
     """
     var tmp = String(path, ".tmp")
-    var region = MappedRegion(tmp, len(data))
-    var dst = Pointer[UInt8, MutUntrackedOrigin](
-        unsafe_from_address=region.base()
-    )
-    if len(data) > 0:
-        unsafe_memcpy(dest=dst, src=data.unsafe_ptr(), count=len(data))
-    # Mojo destroys a value after its last use, which would otherwise be
-    # `base()` above: the region would be unmapped before the writes.
-    region^.close()
+    var fd = open_file(tmp, 1 | o_creat() | o_trunc())  # O_WRONLY
+    var done = 0
+    while done < len(data):
+        var n = external_call["write", Int](
+            Int32(fd),
+            data.unsafe_ptr().unsafe_offset(done),
+            c_size_t(len(data) - done),
+        )
+        if n <= 0:
+            close_fd(fd)
+            remove_file(tmp)
+            raise Error("could not write ", tmp, ": the disk may be full")
+        done += n
+    close_fd(fd)
     var final = path
     if (
         external_call["rename", c_int](
@@ -126,6 +142,27 @@ def write_shared(path: String, data: Span[UInt8, _]) raises:
     ):
         remove_file(tmp)
         raise Error("could not move ", tmp, " into place")
+
+
+def spill_dir() -> String:
+    """Where results that don't fit the store go: `DISTA_SPILL_DIR`, or the
+    temporary directory, which in a container is on disk."""
+    var configured = getenv("DISTA_SPILL_DIR")
+    if configured != "":
+        return configured
+    var tmp = getenv("TMPDIR", "/tmp")
+    if tmp.endswith("/"):
+        return String(tmp.removesuffix("/"))
+    return tmp
+
+
+def store_limit() -> Int:
+    """`DISTA_STORE_BYTES`: how many bytes of results a worker keeps in the
+    store before it spills; 0, no limit, when unset."""
+    try:
+        return Int(getenv("DISTA_STORE_BYTES", "0"))
+    except:
+        return 0
 
 
 def read_shared(path: String, size: Int) raises -> List[UInt8]:
