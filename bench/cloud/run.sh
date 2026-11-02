@@ -60,7 +60,7 @@ if [ "${1:-}" = local ]; then
   aws_secret
   for fw in ${FRAMEWORKS:-dista rust ray}; do
     case $fw in
-      dista) image=dista:taxi; command='["/opt/dista/bin/dista"]' ;;
+      dista) image=dista:taxi; command='["/opt/dista/bin/app"]' ;;
       rust)  image=dista-rust:taxi; command='["/usr/local/bin/taxi-rs"]' ;;
       ray)   image=dista-ray:taxi; command='["python", "/app/taxi_ray.py"]' ;;
     esac

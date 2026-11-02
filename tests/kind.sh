@@ -39,6 +39,12 @@ if [ $status != 0 ] || ! kubectl "${ctx[@]}" logs job/dista-driver | grep -q '^P
 fi
 echo "PASS kind: head, 3 workers on 3 nodes and a driver job"
 
+# The head is `dista head`; its status lists the three workers.
+status_log=$(mktemp)
+kubectl "${ctx[@]}" exec dista-head-0 -- /opt/dista/bin/dista status --head localhost:6390 \
+  | tee "$status_log"
+grep -q '^head: 3 workers' "$status_log" || { echo "FAIL: dista status"; exit 1; }
+
 # A pod's metric, read through the API server's proxy to its port 9090.
 metric() {
   kubectl "${ctx[@]}" get --raw "/api/v1/namespaces/default/pods/$1:9090/proxy/metrics" \

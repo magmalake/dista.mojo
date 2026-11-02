@@ -14,7 +14,7 @@ Every frame is a 4-byte little-endian length, then that many bytes:
 | 1 task | driver to head, head to worker | the encoded argument |
 | 2 result | worker to head, head to driver | the encoded result |
 | 3 error | worker to head, head to driver | a UTF-8 message |
-| 4 hello | driver or worker to head | role byte (`ROLE_*`), the registry hash u64; a worker adds its object server's address |
+| 4 hello | driver, worker or observer to head | role byte (`ROLE_*`), the registry hash u64 (an observer's is ignored); a worker adds its object server's address |
 | 5 welcome | head to driver | the driver's number, u64 |
 | 6 task-after | driver to head | gather byte, count u64, then that many object IDs |
 | 7 stored | worker to head | the result's size, u64: it stayed on the worker |
@@ -36,6 +36,12 @@ Every frame is a 4-byte little-endian length, then that many bytes:
 | 23 checkpointed | worker to head | none if the checkpoint is written, else why not; the object and task IDs are the checkpoint frame's |
 | 24 actor-restore | head to worker | the number of calls the checkpoint covers, u64; the object ID names the actor, the task ID its type |
 | 25 covered | head to driver | the newest of this driver's calls to the actor a checkpoint now includes, u64; the object ID names the actor |
+| 26 status | observer to head, head to observer | none; the reply is the head's state as UTF-8 text |
+| 27 stop | observer to head, head to worker | none: shut down; a worker exits instead of rejoining |
+
+An observer (`dista status`, `timeline`, `stop`) says hello without a
+registry and owns no objects. Its timeline frame gets every driver's
+finished tasks, and leaves them for the drivers too.
 
 After a head restart, a driver's hello carries its old number as a u64 after
 the registry hash, so its object IDs stay valid. It then sends, in order of
@@ -103,10 +109,13 @@ comptime KIND_CHECKPOINT: UInt8 = 22
 comptime KIND_CHECKPOINTED: UInt8 = 23
 comptime KIND_ACTOR_RESTORE: UInt8 = 24
 comptime KIND_COVERED: UInt8 = 25
+comptime KIND_STATUS: UInt8 = 26
+comptime KIND_STOP: UInt8 = 27
 comptime ADDR_SIZE = 12
 comptime ROLE_DRIVER: UInt8 = 1
 comptime ROLE_WORKER: UInt8 = 2
 comptime ROLE_CLIENT: UInt8 = 3
+comptime ROLE_OBSERVER: UInt8 = 4
 """A driver inside a worker, for a task that calls actors: the head treats
 it as a driver, except that it doesn't keep a local-mode head alive."""
 comptime HEADER = 17

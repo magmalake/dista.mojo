@@ -4,6 +4,8 @@
 #     docker build -f deploy/Dockerfile -t dista-smoke .
 #
 # PROGRAM is the Mojo file to build; its tasks are the cluster's registry.
+# It's /opt/dista/bin/app, the entrypoint. The image carries the `dista`
+# command too, /opt/dista/bin/dista, whose generic head the manifests run.
 FROM ghcr.io/prefix-dev/pixi:0.78.0 AS build
 ARG PROGRAM=deploy/smoke.mojo
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev git ca-certificates \
@@ -14,14 +16,16 @@ RUN pixi install --locked -e default
 COPY src src
 COPY deploy deploy
 COPY examples examples
-RUN mkdir -p /out && pixi run -e default mojo build -I src ${PROGRAM} -o /out/dista
+COPY cli cli
+RUN mkdir -p /out && pixi run -e default mojo build -I src ${PROGRAM} -o /out/app \
+    && pixi run -e default mojo build -I src cli/main.mojo -o /out/dista
 # The binary loads the Mojo runtime from the pixi environment; take along the
 # libraries it links, and nothing else.
-RUN mkdir -p /out/lib && ldd /out/dista | awk '/=> \/dista\/.pixi/ {print $3}' \
-    | xargs -r cp -L -t /out/lib
+RUN mkdir -p /out/lib && ldd /out/app /out/dista | awk '/=> \/dista\/.pixi/ {print $3}' \
+    | sort -u | xargs -r cp -L -t /out/lib
 
 FROM debian:bookworm-slim
 COPY --from=build /out/lib /opt/dista/lib
-COPY --from=build /out/dista /opt/dista/bin/dista
+COPY --from=build /out/app /out/dista /opt/dista/bin/
 ENV LD_LIBRARY_PATH=/opt/dista/lib
-ENTRYPOINT ["/opt/dista/bin/dista"]
+ENTRYPOINT ["/opt/dista/bin/app"]
