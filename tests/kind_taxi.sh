@@ -85,9 +85,9 @@ run_program() {
   kubectl "${ctx[@]}" get pods -o wide
 
   if [ -n "$kill" ]; then
-    # Once the first query's first pass is done, kill a worker outright (no
-    # grace period, as a node failure would), or stop it as Kubernetes does
-    # (SIGTERM, then its grace period). Its replacement joins the head.
+    # Once the first query's first pass is done, kill a worker outright, as
+    # a crash would, or stop it as Kubernetes does (SIGTERM, then its grace
+    # period). Its restarted container, or its replacement, joins the head.
     for _ in $(seq 300); do
       kubectl "${ctx[@]}" logs job/dista-taxi 2>/dev/null | grep -q '^TIME ' && break
       sleep 1
@@ -95,8 +95,14 @@ run_program() {
     local victim
     victim=$(kubectl "${ctx[@]}" get pods -l app=dista-taxi,role=worker -o name | head -1)
     if [ "$kill" = kill ]; then
+      # SIGKILL from its node, as a crash: deleting the pod, even with no
+      # grace period, sends SIGTERM first, and the worker would drain.
       echo "killing $victim"
-      kubectl "${ctx[@]}" delete "$victim" --grace-period=0 --force --wait=false
+      local node cid pid
+      node=$(kubectl "${ctx[@]}" get "$victim" -o jsonpath='{.spec.nodeName}')
+      cid=$(kubectl "${ctx[@]}" get "$victim" -o jsonpath='{.status.containerStatuses[0].containerID}')
+      pid=$(docker exec "$node" crictl inspect --output go-template --template '{{.info.pid}}' "${cid#containerd://}")
+      docker exec "$node" kill -9 "$pid"
     else
       echo "stopping $victim"
       kubectl "${ctx[@]}" delete "$victim" --wait=false
