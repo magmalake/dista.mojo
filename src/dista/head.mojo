@@ -102,6 +102,13 @@ from dista.socket import (
     wall_ns,
 )
 from dista.checkpoint import newest_checkpoint
+from dista.metrics import (
+    Histogram,
+    answer_scrape,
+    metrics_listener,
+    write_metric,
+    write_outcomes,
+)
 from dista.store import Location
 
 comptime DRIVER_SHIFT = 40
@@ -269,6 +276,16 @@ struct Head(Movable):
     var _clients: Dict[Int, Bool]
     """Driver connections that are workers' clients (`ROLE_CLIENT`): they
     don't keep a local-mode head alive."""
+    var _metrics: Optional[Listener]
+    """Where `/metrics` is served, with `DISTA_METRICS_PORT` set."""
+    var _submitted: Int
+    var _finished_ok: Int
+    var _finished_err: Int
+    var _durations: Histogram
+    """Tasks' and calls' run times on their workers."""
+    var _restarts: Int
+    var _checkpoints: Int
+    var _checkpoint_failures: Int
 
     def __init__(
         out self,
@@ -316,6 +333,18 @@ struct Head(Movable):
         self._unplaced = List[UInt64]()
         self._hosting = List[UInt64]()
         self._clients = Dict[Int, Bool]()
+        self._metrics = None
+        try:
+            self._metrics = metrics_listener()
+        except e:
+            print("dista head: no metrics:", e)
+        self._submitted = 0
+        self._finished_ok = 0
+        self._finished_err = 0
+        self._durations = Histogram()
+        self._restarts = 0
+        self._checkpoints = 0
+        self._checkpoint_failures = 0
 
     def run(mut self) raises:
         """Serves until the last driver leaves, in local mode; else forever."""
@@ -329,6 +358,10 @@ struct Head(Movable):
             var fds: List[c_int] = [self._listener.fd]
             var events: List[Int16] = [POLLIN]
             var which: List[Int] = [-1]
+            if self._metrics:
+                fds.append(self._metrics.value().fd)
+                events.append(POLLIN)
+                which.append(-2)
             for i in range(len(self._conns)):
                 if self._roles[i] == _ROLE_GONE:
                     continue
@@ -343,6 +376,10 @@ struct Head(Movable):
                 self._accept()
             for k in range(1, len(fds)):
                 var i = which[k]
+                if i == -2:
+                    if revents[k] & POLLIN:
+                        answer_scrape(self._metrics.value(), self._page())
+                    continue
                 if revents[k] == 0 or self._roles[i] == _ROLE_GONE:
                     continue
                 try:
@@ -362,6 +399,99 @@ struct Head(Movable):
                 except e:
                     print("dista head: dropping connection:", e)
                     self._drop(i)
+
+    def _page(self) -> String:
+        """The head's `/metrics` page."""
+        var workers = 0
+        for i in range(len(self._roles)):
+            if self._roles[i] == ROLE_WORKER:
+                workers += 1
+        var held = 0
+        for entry in self._results.items():
+            held += len(entry.value)
+        var out = String()
+        write_metric(
+            out,
+            "counter",
+            "dista_tasks_submitted_total",
+            "Tasks, actor calls and actors submitted to the head.",
+            self._submitted,
+        )
+        write_outcomes(
+            out,
+            "dista_tasks_finished_total",
+            "Tasks, actor calls and actors settled, by outcome.",
+            self._finished_ok,
+            self._finished_err,
+        )
+        self._durations.write(
+            out,
+            "dista_task_duration_seconds",
+            "How long tasks and actor calls ran on their workers.",
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_queue_depth",
+            "Tasks waiting for a worker or for their inputs.",
+            self._queued() + len(self._waiting),
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_objects",
+            "Objects the head counts references to.",
+            len(self._refs),
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_head_result_bytes",
+            "Bytes of small results the head holds.",
+            held,
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_stored_results",
+            "Results that stayed on the workers that made them.",
+            len(self._location),
+        )
+        write_metric(
+            out, "gauge", "dista_workers", "Workers connected.", workers
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_drivers",
+            "Drivers connected, not counting tasks' clients.",
+            len(self._driver_conn) - len(self._clients),
+        )
+        write_metric(
+            out, "gauge", "dista_actors", "Live actors.", len(self._actors)
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_actors_waiting",
+            "Actors waiting for a worker of their own.",
+            len(self._unplaced),
+        )
+        write_metric(
+            out,
+            "counter",
+            "dista_actor_restarts_total",
+            "Actors restarted on another worker after theirs went away.",
+            self._restarts,
+        )
+        write_outcomes(
+            out,
+            "dista_checkpoints_total",
+            "Actor checkpoints the workers reported, by outcome.",
+            self._checkpoints,
+            self._checkpoint_failures,
+        )
+        return out^
 
     def _accept(mut self) raises:
         var s = self._listener.accept()
@@ -734,7 +864,10 @@ struct Head(Movable):
                 rest.append(act.log[k].copy())
             act.log = rest^
             act.saved = calls
-        if not ok:
+        if ok:
+            self._checkpoints += 1
+        else:
+            self._checkpoint_failures += 1
             print("dista head: actor", a, "checkpoint failed:", why)
         var still = List[_Waiter]()
         for ref w in act.waiters:
@@ -984,6 +1117,7 @@ struct Head(Movable):
 
     # ── timeline ─────────────────────────────────────────────────────────
     def _open_span(mut self, object_id: UInt64, task_id: UInt64):
+        self._submitted += 1
         self._spans[object_id] = _Span(
             object_id, task_id, -1, wall_ns(), 0, 0, 0, 0, 0, 0
         )
@@ -1002,6 +1136,12 @@ struct Head(Movable):
         if sp.submitted == 0:
             return
         sp.settled = wall_ns()
+        if object_id in self._errors:
+            self._finished_err += 1
+        else:
+            self._finished_ok += 1
+        if sp.ended > sp.started and sp.started > 0:
+            self._durations.observe(Float64(sp.ended - sp.started) / 1e9)
         var d = owner_of(object_id)
         if d not in self._finished:
             self._finished[d] = List[_Span]()
@@ -1117,6 +1257,7 @@ struct Head(Movable):
                         # their first answer.
                         act.worker = -1
                         act.restarts += 1
+                        self._restarts += 1
                         act.pending = act.log.copy()
                         self._unplaced.insert(0, a)
                         replays[a] = True

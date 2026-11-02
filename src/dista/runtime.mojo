@@ -52,6 +52,7 @@ from dista.client import (
     connect_head,
 )
 from dista.head import Head
+from dista.signals import exit_on_sigterm
 from dista.socket import Listener, Stream, exit_now, fork, wait_child, wall_ns
 from dista.task import ActorLike, MethodLike, StatePtr, TaskLike, fnv1a64
 from dista.worker import Worker
@@ -124,6 +125,9 @@ struct Runtime[*Ts: TaskLike](Movable):
         if pipeline < 1:
             raise Error("pipeline must be at least 1")
         var role = getenv("DISTA_ROLE")
+        if role == "head" or role == "worker":
+            # A container's PID 1 would otherwise ignore Kubernetes' SIGTERM.
+            exit_on_sigterm()
         if role == "head":
             var port = Int(getenv("DISTA_PORT", String(DEFAULT_PORT)))
             var listener = Listener(port, any_interface=True)

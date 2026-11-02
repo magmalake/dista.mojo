@@ -3,7 +3,9 @@
 # image, loads it into the cluster, starts a head and three workers, and runs
 # a driver job against them. Then the actor gate: a second driver job starts
 # a checkpointed counter, and this script deletes the pod hosting it mid-run;
-# the driver checks the count comes out exact. Needs docker, kind and kubectl.
+# the driver checks the count comes out exact. Every pod's /metrics is read
+# along the way: the head's count of finished tasks climbs, and every worker
+# reports the tasks it ran. Needs docker, kind and kubectl.
 #
 # KEEP_CLUSTER=1 leaves the cluster up afterwards for poking at.
 set -euo pipefail
@@ -37,6 +39,20 @@ if [ $status != 0 ] || ! kubectl "${ctx[@]}" logs job/dista-driver | grep -q '^P
 fi
 echo "PASS kind: head, 3 workers on 3 nodes and a driver job"
 
+# A pod's metric, read through the API server's proxy to its port 9090.
+metric() {
+  kubectl "${ctx[@]}" get --raw "/api/v1/namespaces/default/pods/$1:9090/proxy/metrics" \
+    | awk -v m="$2" '$1 == m {print $2}'
+}
+ok='dista_tasks_finished_total{outcome="ok"}'
+before=$(metric dista-head-0 "$ok")
+echo "the head has finished $before tasks"
+for p in $(kubectl "${ctx[@]}" get pods -l role=worker -o name | sed 's|pod/||'); do
+  ran=$(metric "$p" 'dista_worker_tasks_finished_total{outcome="ok"}')
+  echo "worker $p ran $ran tasks"
+  [ "${ran:-0}" -gt 0 ] || { echo "FAIL: worker $p reports no tasks"; exit 1; }
+done
+
 # The actor gate. The driver prints the counter's pod once it's up; delete
 # that pod a couple of seconds into its 2,000 calls.
 kubectl "${ctx[@]}" apply -f deploy/k8s/actor-job.yaml
@@ -52,10 +68,9 @@ if [ -z "$pod" ]; then
   exit 1
 fi
 sleep 2
-# Without grace: the worker is its container's PID 1, which ignores SIGTERM,
-# so a plain delete would leave it serving for the 30 s grace period.
+# A plain delete: the worker exits on the SIGTERM it sends.
 echo "deleting the counter's pod $pod"
-kubectl "${ctx[@]}" delete pod "$pod" --grace-period=0 --force --wait=false
+kubectl "${ctx[@]}" delete pod "$pod" --wait=false
 status=1
 for _ in $(seq 300); do
   done_=$(kubectl "${ctx[@]}" get job dista-actor-driver -o jsonpath='{.status.succeeded}/{.status.failed}')
@@ -73,3 +88,11 @@ if [ $status != 0 ] || ! kubectl "${ctx[@]}" logs job/dista-actor-driver | grep 
   exit 1
 fi
 echo "PASS kind: the counter's pod was deleted mid-run and the count is exact"
+
+after=$(metric dista-head-0 "$ok")
+restarts=$(metric dista-head-0 dista_actor_restarts_total)
+echo "the head has finished $after tasks, and restarted $restarts actors"
+if [ "${after:-0}" -le "${before:-0}" ] || [ "${restarts:-0}" -lt 1 ]; then
+  echo "FAIL: the head's metrics didn't move"; exit 1
+fi
+echo "PASS kind: every pod's /metrics answers, and the head's count climbed"
