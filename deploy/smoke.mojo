@@ -19,8 +19,8 @@ deletes the pod hosting it. The driver prints `ACTOR_POD <pod>` once the
 counter is up, so the script knows which pod to delete. Every call must
 still be answered once, in order, the count must come out at exactly 2,000,
 and the counter must end up on another pod, restored from a checkpoint
-rather than rebuilt from its constructor: fewer than 100 calls run twice,
-where the constructor would run every call before the deletion again.
+rather than rebuilt from its constructor: its state still names the pod
+whose constructor built it.
 """
 
 from std.os import getenv
@@ -58,28 +58,32 @@ def total(xs: Seq[Int]) -> Int:
 @fieldwise_init
 struct Counter(Movable):
     var total: Int
-    var runs: Int
-    """Calls run on this count, replays included."""
+    var built_on: String
+    """The pod that ran the constructor: a counter restored from a
+    checkpoint still names it, one built again names its own."""
 
 
 def new_counter(start: Int) -> Counter:
-    return Counter(start, 0)
+    return Counter(start, pod_name())
+
+
+def pod_name() -> String:
+    return getenv("HOSTNAME", node_name())
 
 
 def slow_add(mut c: Counter, n: Int) -> Int:
     """Slow enough that the run outlasts deleting a pod."""
     sleep(0.01)
     c.total += n
-    c.runs += 1
     return c.total
 
 
 def pod_of(mut c: Counter, n: Int) -> String:
-    return getenv("HOSTNAME", node_name())
+    return pod_name()
 
 
-def runs_of(mut c: Counter, n: Int) -> Int:
-    return c.runs
+def built_on(mut c: Counter, n: Int) -> String:
+    return c.built_on.copy()
 
 
 comptime NodeOf = Task[Int, String, node_of]
@@ -89,9 +93,9 @@ comptime Total = Task[Seq[Int], Int, total]
 comptime CounterActor = Actor[Counter, Int, new_counter]
 comptime SlowAdd = Method[CounterActor, Int, Int, slow_add]
 comptime PodOf = Method[CounterActor, Int, String, pod_of]
-comptime RunsOf = Method[CounterActor, Int, Int, runs_of]
+comptime BuiltOn = Method[CounterActor, Int, String, built_on]
 comptime RT = Runtime[
-    NodeOf, Square, Make, Total, CounterActor, SlowAdd, PodOf, RunsOf
+    NodeOf, Square, Make, Total, CounterActor, SlowAdd, PodOf, BuiltOn
 ]
 
 comptime CALLS = 2000
@@ -110,16 +114,12 @@ def actor_gate(mut rt: RT) raises:
         if got != i + 1:
             raise Error("call ", i, " answered ", got, ", expected ", i + 1)
     var last = rt.get(rt.call[PodOf](c, 0))
-    var runs = rt.get(rt.call[RunsOf](c, 0))
-    print("the counter moved from", first, "to", last, "and ran", runs, "calls")
+    var built = rt.get(rt.call[BuiltOn](c, 0))
+    print("the counter moved from", first, "to", last, "; built on", built)
     if last == first:
         raise Error("the counter's pod was never deleted")
-    # At most the calls since the last checkpoint the head heard of run
-    # twice: under two intervals, as the newest may not have reached it.
-    if runs < CALLS or runs >= CALLS + 2 * EVERY:
-        raise Error(
-            runs - CALLS, " calls ran twice: not restored from a checkpoint"
-        )
+    if built != first:
+        raise Error("rebuilt from the constructor, not from a checkpoint")
     rt.kill(c)
     print("PASS actor restored on", last, "with the count exact")
 

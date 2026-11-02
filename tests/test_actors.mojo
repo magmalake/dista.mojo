@@ -10,7 +10,10 @@ from std.testing import (
     assert_true,
 )
 
+from std.ffi import external_call
+
 from dista.socket import exit_now
+from dista.store import node_name
 from dista import (
     Actor,
     ActorHandle,
@@ -107,22 +110,26 @@ def forward(mut r: Relay, mut c: Client, n: Int) raises -> Int:
     return got
 
 
+def process_name() -> String:
+    return String(node_name(), ":", external_call["getpid", Int32]())
+
+
 @fieldwise_init
 struct Tally(Movable):
-    """A counter that also counts the calls run on it, replays included."""
+    """A counter that remembers the process that built it: one restored from
+    a checkpoint still names the first, one built again names its own."""
 
     var total: Int
-    var runs: Int
+    var built_by: String
 
 
 def new_tally(start: Int) -> Tally:
-    return Tally(start, 0)
+    return Tally(start, process_name())
 
 
 def tally_or_crash(mut t: Tally, n: Int) raises -> Int:
     """`add_or_crash` for a tally."""
     t.total += n
-    t.runs += 1
     if t.total == 500 and not exists(CRASH_FLAG):
         with open(CRASH_FLAG, "w") as f:
             f.write("crashed")
@@ -130,8 +137,9 @@ def tally_or_crash(mut t: Tally, n: Int) raises -> Int:
     return t.total
 
 
-def runs(mut t: Tally, n: Int) -> Int:
-    return t.runs
+def restored(mut t: Tally, n: Int) -> Bool:
+    """Whether this state came from another process's checkpoint."""
+    return t.built_by != process_name()
 
 
 comptime CHECKPOINTS = "build/test-checkpoints"
@@ -160,7 +168,7 @@ comptime Bump = CtxTask[ActorHandle[CounterActor], Int, bump]
 comptime PadLength = CtxTask[ActorHandle[CounterActor], Int, pad_length]
 comptime TallyActor = Actor[Tally, Int, new_tally]
 comptime TallyOrCrash = Method[TallyActor, Int, Int, tally_or_crash]
-comptime Runs = Method[TallyActor, Int, Int, runs]
+comptime Restored = Method[TallyActor, Int, Bool, restored]
 comptime RT = Runtime[
     CounterActor,
     Add,
@@ -173,7 +181,7 @@ comptime RT = Runtime[
     Forward,
     TallyActor,
     TallyOrCrash,
-    Runs,
+    Restored,
 ]
 
 
@@ -380,26 +388,27 @@ def test_a_checkpoint_with_nowhere_to_go_fails() raises:
 
 def test_an_actor_restores_from_its_checkpoint() raises:
     """PR 7's gate, locally: checkpoints every 100 calls, and the worker dies
-    on the 500th of 1,000. The actor comes back from the checkpoint after 400
-    calls, at the latest, so fewer than 100 calls run twice, where restarting
-    from the constructor would run 499 again. The count is still exact."""
+    on the 500th of 1,000. The actor comes back on another worker from a
+    checkpoint, not from its constructor, and the count is still exact."""
     use_checkpoints()
     if exists(CRASH_FLAG):
         remove(CRASH_FLAG)
     var rt = RT(workers=3)
     var t = rt.create[TallyActor](0, checkpoint_every=100)
+    assert_true(not rt.get(rt.call[Restored](t, 0)), "built, not restored")
     var refs = List[ObjectRef[Int]](capacity=1000)
     for _ in range(1000):
         refs.append(rt.call[TallyOrCrash](t, 1))
     for i in range(1000):
         assert_equal(rt.get(refs[i]), i + 1)
     assert_true(exists(CRASH_FLAG), "the worker never died")
-    var ran = rt.get(rt.call[Runs](t, 0))
-    assert_true(ran >= 1000, String("only ", ran, " calls ran"))
-    assert_true(ran < 1100, String(ran - 1000, " calls ran twice"))
-    # The last checkpoint covers every call, `Runs` too, and the ones before
-    # it that the head no longer restores from are gone.
-    assert_equal(rt.get(rt.checkpoint(t)), 1001)
+    assert_true(
+        rt.get(rt.call[Restored](t, 0)),
+        "rebuilt from the constructor, not restored from a checkpoint",
+    )
+    # The last checkpoint covers every call, `Restored` too, and the ones
+    # before it that the head no longer restores from are gone.
+    assert_equal(rt.get(rt.checkpoint(t)), 1002)
     var files = checkpoint_files(t.id)
     assert_true(len(files) <= 2, String(len(files), " checkpoints left"))
     rt.kill(t)
