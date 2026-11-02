@@ -50,6 +50,7 @@ from dista.client import (
     TaskContext,
     TaskSpan,
     connect_head,
+    write_trace,
 )
 from dista.head import Head
 from dista.signals import exit_on_sigterm
@@ -58,53 +59,6 @@ from dista.task import ActorLike, MethodLike, StatePtr, TaskLike, fnv1a64
 from dista.worker import Worker
 
 comptime DEFAULT_PORT = 6390
-
-
-def _us(ns: UInt64) -> String:
-    return String(Float64(ns) / 1000.0)
-
-
-def _json_string(s: String) -> String:
-    var out = String('"')
-    for cp in s.codepoint_slices():
-        if cp == '"' or cp == "\\":
-            out += "\\"
-        out += cp
-    return out + '"'
-
-
-def _meta(pid: Int, what: String, name: String, tid: Int = 0) -> String:
-    return String(
-        '{"name":"',
-        what,
-        '","ph":"M","pid":',
-        pid,
-        ',"tid":',
-        tid,
-        ',"args":{"name":',
-        _json_string(name),
-        "}},\n",
-    )
-
-
-def _event(
-    name: String, pid: Int, tid: Int, ts: UInt64, dur: UInt64, args: String
-) -> String:
-    return String(
-        '{"name":',
-        _json_string(name),
-        ',"ph":"X","pid":',
-        pid,
-        ',"tid":',
-        tid,
-        ',"ts":',
-        _us(ts),
-        ',"dur":',
-        _us(dur),
-        ',"args":',
-        args,
-        "},\n",
-    )
 
 
 struct Runtime[*Ts: TaskLike](Movable):
@@ -316,7 +270,7 @@ struct Runtime[*Ts: TaskLike](Movable):
         ](head^, Self._registry_hash(), head_addr, rejoin_at)
         while True:
             w.run()
-            if rejoin_at == "":
+            if rejoin_at == "" or w.stopped:
                 return
             print("dista worker: head gone, rejoining", rejoin_at)
             w.rejoin(connect_head(rejoin_at), Self._registry_hash())
@@ -453,68 +407,4 @@ struct Runtime[*Ts: TaskLike](Movable):
         submission or driver span; each run's arguments carry the head's
         waits too. Driver spans are written once, like task spans.
         """
-        var spans = self.spans()
-        var mine = self._c.take_driver_spans()
-        var t0 = UInt64(0)
-        for ref sp in spans:
-            if t0 == 0 or sp.submitted < t0:
-                t0 = sp.submitted
-        for ref d in mine:
-            if t0 == 0 or d.start < t0:
-                t0 = d.start
-        var pids = Dict[String, Int]()
-        var out = String("[\n")
-        if len(mine) > 0:
-            out += _meta(0, "process_name", "driver")
-            out += _meta(0, "thread_name", "driver", 1)
-        for ref d in mine:
-            out += _event(
-                d.name,
-                0,
-                1,
-                d.start - t0,
-                d.end - d.start if d.end > d.start else 0,
-                String("{}"),
-            )
-        for ref sp in spans:
-            if sp.worker == "" or sp.started == 0:
-                continue
-            if sp.worker not in pids:
-                var p = len(pids) + 1
-                pids[sp.worker] = p
-                out += _meta(p, "process_name", "worker " + sp.worker)
-                out += _meta(p, "thread_name", "running", 1)
-                out += _meta(p, "thread_name", "waiting for inputs", 2)
-            var pid = pids.get(sp.worker, 0)
-            if sp.started > sp.arrived:
-                out += _event(
-                    "inputs",
-                    pid,
-                    2,
-                    sp.arrived - t0,
-                    sp.started - sp.arrived,
-                    String('{"object":', sp.object_id, "}"),
-                )
-            out += _event(
-                sp.task,
-                pid,
-                1,
-                sp.started - t0,
-                sp.ended - sp.started,
-                String(
-                    '{"object":',
-                    sp.object_id,
-                    ',"queued_after_submit_us":',
-                    _us(sp.queued - sp.submitted) if sp.queued else String(0),
-                    ',"dispatch_wait_us":',
-                    _us(sp.dispatched - sp.queued) if sp.queued else String(0),
-                    ',"settle_after_end_us":',
-                    _us(sp.settled - sp.ended) if sp.settled
-                    > sp.ended else String(0),
-                    "}",
-                ),
-            )
-        out += '{"name":"end","ph":"i","ts":0,"pid":0,"tid":0,"s":"g"}\n]\n'
-        with open(path, "w") as f:
-            f.write(out)
-        return len(spans)
+        return write_trace(path, self.spans(), self._c.take_driver_spans())

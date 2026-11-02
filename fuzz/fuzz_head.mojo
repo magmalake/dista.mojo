@@ -72,6 +72,7 @@ def _connect(mut head: Head, mut peers: List[Stream]) raises -> Int:
     head._inflight.append(List[UInt64]())
     head._worker_addr.append(List[UInt8]())
     head._hosting.append(0)
+    head._hashes.append(0)
     return len(head._conns) - 1
 
 
@@ -96,7 +97,7 @@ def target(data: List[UInt8]) raises:
     while pos + 5 <= len(data):
         var who = Int(data[pos] & 1)
         var hang_up = (data[pos] & 2) != 0
-        var kind = data[pos + 1] % 26
+        var kind = data[pos + 1] % 28
         var obj = (UInt64(1) << DRIVER_SHIFT) | UInt64(data[pos + 2] % 16)
         var task = UInt64(data[pos + 3] % 4)
         var n = min(Int(data[pos + 4]), len(data) - pos - 5)

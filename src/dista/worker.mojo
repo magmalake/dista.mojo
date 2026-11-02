@@ -52,6 +52,7 @@ from dista.frame import (
     KIND_HOLDING,
     KIND_RESULT,
     KIND_SPAN,
+    KIND_STOP,
     KIND_STORED,
     KIND_TASK,
     KIND_TASK_INPUTS,
@@ -315,6 +316,8 @@ struct Worker[
     """Tasks and actor frames finished here, failed ones included."""
     var _failed: Int
     var _durations: Histogram
+    var stopped: Bool
+    """The head said stop: `run` returned for good."""
 
     def __init__(
         out self,
@@ -370,6 +373,7 @@ struct Worker[
         self._ran = 0
         self._failed = 0
         self._durations = Histogram()
+        self.stopped = False
 
     @staticmethod
     def _hello(
@@ -530,6 +534,10 @@ struct Worker[
             self._parked.append(
                 _Parked(f.object_id, f.task_id, gather, inputs^)
             )
+        elif f.kind == KIND_STOP:
+            # `dista stop`: leave for good, instead of waiting to rejoin.
+            self.stopped = True
+            self._head.closed = True
         elif f.kind == KIND_FREE:
             _ = self._objects.pop(f.object_id, List[UInt8]())
             if f.object_id in self._files:

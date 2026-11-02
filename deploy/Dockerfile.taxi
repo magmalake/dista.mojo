@@ -12,7 +12,7 @@ COPY . /src
 WORKDIR /src/dista.mojo
 RUN pixi install --locked -e data
 RUN mkdir -p /out && pixi run -e data bash -c \
-    'mojo build -I src $DEP_INC deploy/taxi.mojo -o /out/dista'
+    'mojo build -I src $DEP_INC deploy/taxi.mojo -o /out/app && mojo build -I src $DEP_INC cli/main.mojo -o /out/dista'
 # The binary links the Mojo runtime, and dlopens the codec and object-store
 # shims from $CONDA_PREFIX/lib at run time. Take those, and what they link,
 # out of the pixi environment, stripped. The SQL shims' libraries (libpq,
@@ -20,18 +20,18 @@ RUN mkdir -p /out && pixi run -e data bash -c \
 # file and never opens a SQL catalog, and libpq alone brought ICU's i18n
 # library and most of the image's size with it.
 RUN set -e; env=/src/dista.mojo/.pixi/envs/data; mkdir -p /out/lib; \
-    roots="/out/dista $(ls $env/lib/lib*mojo*.so)"; \
+    roots="/out/app /out/dista $(ls $env/lib/lib*mojo*.so)"; \
     for f in $roots; do \
         case "$f" in /out/*) ;; *) cp -L "$f" /out/lib/ ;; esac; \
         ldd "$f" | awk '/=> \// {print $3}' | grep "^$env" | xargs -r cp -L -t /out/lib; \
     done; \
-    strip --strip-unneeded /out/dista /out/lib/*
+    strip --strip-unneeded /out/app /out/dista /out/lib/*
 
 # distroless's cc image is glibc and little else: no shell, no package
 # manager. The libraries above bring their own libstdc++, newer than Debian's.
 FROM gcr.io/distroless/cc-debian12@sha256:e5d81ddde149641e2a9ba55be4545bc125c67de07508b03ba4c22e6eb0ded5aa
 COPY --from=build /out/lib /opt/dista/lib
-COPY --from=build /out/dista /opt/dista/bin/dista
+COPY --from=build /out/app /out/dista /opt/dista/bin/
 # conda's libcurl looks for its CA bundle at the path its environment was
 # installed at, and nothing in the shim overrides that; without the bundle
 # there, every HTTPS request (S3 included) fails to verify.
@@ -39,4 +39,4 @@ COPY --from=build /src/dista.mojo/.pixi/envs/data/ssl/cacert.pem \
     /src/dista.mojo/.pixi/envs/data/ssl/cacert.pem
 # The shims are found as $CONDA_PREFIX/lib/<name>.
 ENV LD_LIBRARY_PATH=/opt/dista/lib CONDA_PREFIX=/opt/dista
-ENTRYPOINT ["/opt/dista/bin/dista"]
+ENTRYPOINT ["/opt/dista/bin/app"]

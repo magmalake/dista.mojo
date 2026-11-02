@@ -20,9 +20,11 @@ test-timeline = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test
 test-cluster = { cmd = "tests/cluster.sh" }
 test-restart = { cmd = "tests/head_restart.sh" }
 test-metrics = { cmd = "tests/metrics.sh" }
+test-cli = { cmd = "tests/cli.sh" }
 test-chaos = { cmd = "CHAOS_FAST=1 tests/chaos.sh" }
 test-kind = { cmd = "tests/kind.sh" }
-test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-timeline", "test-actors", "test-cluster", "test-restart", "test-metrics", "test-chaos"] }
+test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-timeline", "test-actors", "test-cluster", "test-restart", "test-metrics", "test-cli", "test-chaos"] }
+cli = { cmd = "mkdir -p build && mojo build -I src $DEP_INC cli/main.mojo -o build/dista" }
 bench = { cmd = "mkdir -p build && mojo build -I src $DEP_INC bench/fanout.mojo -o build/bench-fanout && ./build/bench-fanout" }
 
 [package]
@@ -92,8 +94,8 @@ objectstore-shim = { git = "https://github.com/magmalake/objectstore.mojo", rev 
 modular = ">=26.8.0.dev2026102305,<28"
 
 [feature.fmt.tasks]
-fmt = { cmd = "mojo format src tests bench examples deploy fuzz" }
-format-check = { cmd = "mojo format src tests bench examples deploy fuzz && git diff --exit-code -- src tests bench examples deploy fuzz" }
+fmt = { cmd = "mojo format src tests bench examples deploy fuzz cli" }
+format-check = { cmd = "mojo format src tests bench examples deploy fuzz cli && git diff --exit-code -- src tests bench examples deploy fuzz cli" }
 
 # The data environment runs dista tasks over parquet.mojo and iceberg.mojo.
 # Their Mojo sources compile from checkouts next to this one, as their own

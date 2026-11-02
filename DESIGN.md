@@ -303,15 +303,15 @@ The taxi benchmark is mostly reading Parquet from S3. A second benchmark should 
 
 1 and 3 come first, before the second benchmark; 4 and 5 once it shows they matter.
 
-### To do: a `dista` command for operating a cluster
+### The `dista` command (done)
 
-With the metrics (PR 8), as a binary of its own. Today one binary runs as head, worker or driver, but only the workers and drivers run the user's code: the tasks and actors, and whatever those depend on (Arrow, Iceberg, a model's library). The head routes frames and checks registry hashes. So the head and the command line go into a generic `dista` binary that depends on dista's core alone, released and versioned on its own, while the user's binary stays the driver and the worker. One head can then serve jobs built from different code, told apart by their registry hashes.
+The head and the command line are a generic `dista` binary (`cli/main.mojo`) that depends on dista's core alone, while the user's binary stays the driver and the worker. Only the workers and drivers run the user's code; the head routes frames. So one head serves jobs built from different code, told apart by their registry hashes: a generic head (registry hash 0) keeps each peer's hash, queues tasks by the hash of the program that submitted them, and hands a driver's tasks and actors only to workers with the same hash. A head built into a program still refuses any peer whose hash isn't its own.
 
 | Command | What it does |
 |---|---|
-| `dista head` | The head, as `DISTA_ROLE=head` runs it today from the user's binary. |
-| `dista status` | The head's view: workers, actors, objects held, queue depth (the stats frame, extended). |
-| `dista timeline -o trace.json` | Every driver's finished tasks, not only the caller's own. |
-| `dista stop` | Asks the head to shut down, and its workers with it. |
+| `dista head [--port] [--pipeline]` | A generic head. The kind manifests run it from the image, where the program is `/opt/dista/bin/app` and the command `/opt/dista/bin/dista`. |
+| `dista status` | The head's view: workers with their registry and what they run or host, drivers, actors with their worker, calls and checkpoint. |
+| `dista timeline -o trace.json` | Every driver's finished tasks, departed drivers' included (up to `MAX_SPANS` of theirs), without taking them from the drivers. Tasks are named by wire ID, since the head doesn't know the names. |
+| `dista stop` | Shuts the head down, and its workers: they exit instead of rejoining. |
 
-`status` and `timeline` need an observer role: a peer that says hello to the head and asks, without being a driver that owns objects, and without a registry hash to check. A head that serves several jobs checks each driver's hash against the workers it hands that driver's tasks to, rather than against its own. The benchmark's own command, `bench/cloud/bench`, is separate: it runs the AWS clusters and the frameworks on them.
+`status`, `timeline` and `stop` connect as observers (`ROLE_OBSERVER`): a peer that says hello without a registry hash, owns no objects, and isn't counted as a driver. Gate: `tests/cli.sh` runs the smoke test and the head-restart driver, each with two workers of its own, against one `dista head` at once; both pass, `status` shows the two registries, `timeline` writes their tasks, and `stop` ends every process. On kind, `dista status` in the head pod lists the three workers. The benchmark's own command, `bench/cloud/bench`, is separate: it runs the AWS clusters and the frameworks on them.
