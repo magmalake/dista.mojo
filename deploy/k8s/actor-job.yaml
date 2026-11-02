@@ -1,0 +1,22 @@
+# The actor gate's driver: the smoke image with DISTA_SMOKE=actor. It starts a
+# checkpointed counter and prints the pod hosting it, which tests/kind.sh
+# deletes mid-run.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dista-actor-driver
+  labels: {app: dista, role: driver}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {app: dista, role: driver}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: driver
+          image: dista:smoke
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: DISTA_HEAD, value: "dista-head:6390"}
+            - {name: DISTA_SMOKE, value: actor}

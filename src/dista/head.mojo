@@ -37,12 +37,18 @@ each as it arrives, so they run in order. An actor created when every worker
 hosts one waits for a worker to join or an actor to be killed. Killing an
 actor, or its driver leaving, frees its worker for tasks.
 
-The head keeps every call made to an actor. When the actor's worker goes
-away, the actor is placed on another worker, built again from its
-constructor, and every call is run again in order, so its state is rebuilt:
-calls run at least once. Each call is answered once: a call answered before
-the restart keeps its first answer, and the replay's is dropped. A head
-restart still loses actors, since the call log is the head's.
+The head keeps every call made to an actor since its last checkpoint. When
+the actor's worker goes away, the actor is placed on another worker, built
+again from that checkpoint, or from its constructor if it has none, and
+those calls are run again in order, so its state is rebuilt: calls run at
+least once. Each call is answered once: a call answered before the restart
+keeps its first answer, and the replay's is dropped.
+
+A checkpoint is asked for every `checkpoint_every` calls, if the actor was
+created with one, and whenever a driver asks. The head sends it to the
+actor's worker between calls, numbered by the calls it covers, and once the
+worker says it's written, forgets the calls it covers. A head restart still
+loses actors, since the call log is the head's.
 """
 
 from std.ffi import c_int
@@ -55,6 +61,9 @@ from dista.frame import (
     KIND_ACTOR_CALL,
     KIND_ACTOR_CREATE,
     KIND_ACTOR_KILL,
+    KIND_ACTOR_RESTORE,
+    KIND_CHECKPOINT,
+    KIND_CHECKPOINTED,
     KIND_CLAIM,
     KIND_ERROR,
     KIND_FREE,
@@ -159,10 +168,24 @@ struct _Actor(Copyable, Movable):
     """Killed before it was placed: placed anyway, to run its calls, then
     killed."""
     var log: List[_Task]
-    """Every call made to it, in order: what a restart replays."""
+    """Every call made to it since its last checkpoint, in order: what a
+    restart replays."""
     var restarts: Int
+    var every: Int
+    """Calls between checkpoints, or 0 for only those asked for."""
+    var calls: Int
+    """Calls made to it so far."""
+    var saved: Int
+    """The calls its last checkpoint covers, or -1 if it has none."""
+    var asked: Int
+    """The calls the last checkpoint asked of its worker covers, or -1."""
+    var waiters: List[_Waiter]
+    """Checkpoints drivers asked for that aren't written yet, oldest first.
+    """
 
-    def __init__(out self, type_id: UInt64, var args: List[UInt8]):
+    def __init__(
+        out self, type_id: UInt64, var args: List[UInt8], every: Int = 0
+    ):
         self.type_id = type_id
         self.args = args^
         self.worker = -1
@@ -171,6 +194,19 @@ struct _Actor(Copyable, Movable):
         self.killed = False
         self.log = List[_Task]()
         self.restarts = 0
+        self.every = every
+        self.calls = 0
+        self.saved = -1
+        self.asked = -1
+        self.waiters = List[_Waiter]()
+
+
+@fieldwise_init
+struct _Waiter(Copyable, Movable):
+    """A driver's checkpoint: answered once one covering `calls` is written."""
+
+    var object_id: UInt64
+    var calls: Int
 
 
 struct Head(Movable):
@@ -419,16 +455,26 @@ struct Head(Movable):
             elif f.kind == KIND_ACTOR_CREATE:
                 var a = f.object_id
                 var type_id = f.task_id
+                if len(f.payload) < 8:
+                    raise Error("truncated actor-create")
                 if self._known(a):
                     return
+                var pos = 0
+                var every = Int(get_scalar[DType.uint64](f.payload, pos))
+                if every < 0:
+                    raise Error("actor-create with a bad checkpoint_every")
                 self._hold(a)
                 self._open_span(a, type_id)
-                self._actors[a] = _Actor(type_id, f^.take_payload())
+                self._actors[a] = _Actor(
+                    type_id, List[UInt8](f.payload[8:]), every
+                )
                 self._unplaced.append(a)
             elif f.kind == KIND_ACTOR_CALL:
                 self._call(f^)
             elif f.kind == KIND_ACTOR_KILL:
                 self._kill(f.object_id)
+            elif f.kind == KIND_CHECKPOINT:
+                self._ask_checkpoint(f^)
             elif f.kind == KIND_TIMELINE:
                 self._send_timeline(i)
             elif f.kind == KIND_STATS:
@@ -446,6 +492,9 @@ struct Head(Movable):
         elif role == ROLE_WORKER:
             if f.kind == KIND_HOLDING:
                 self._holding(i, f.payload)
+                return
+            if f.kind == KIND_CHECKPOINTED:
+                self._checkpointed(i, f^)
                 return
             if f.kind == KIND_SPAN:
                 if f.object_id in self._spans:
@@ -543,13 +592,113 @@ struct Head(Movable):
             return
         var method = f.task_id
         var t = _Task(obj, method, f^.take_payload(), kind=KIND_ACTOR_CALL)
-        # Kept for as long as the actor lives, so a restart can rebuild its
-        # state by running every call again from the constructor.
+        # Kept until a checkpoint covers it, so a restart can rebuild the
+        # actor's state by running it again.
         act.log.append(t.copy())
+        act.calls += 1
         if act.worker < 0:
             act.pending.append(t^)
         else:
             self._send_to(act.worker, t)
+            self._maybe_checkpoint(a)
+
+    # ── checkpoints ──────────────────────────────────────────────────────
+    def _maybe_checkpoint(mut self, a: UInt64):
+        """Asks actor `a`'s worker for a checkpoint after the calls sent so
+        far, if one is due: `checkpoint_every` calls since the last one, or
+        a driver waiting for one."""
+        var worker: Int
+        var calls: Int
+        var body = List[UInt8]()
+        try:
+            ref act = self._actors[a]
+            if act.worker < 0 or act.failed:
+                return
+            var last = max(act.asked, act.saved)
+            var due = act.every > 0 and act.calls - max(last, 0) >= act.every
+            if len(act.waiters) > 0:
+                due = due or act.waiters[len(act.waiters) - 1].calls > last
+            if not due or act.calls <= last:
+                return
+            act.asked = act.calls
+            worker = act.worker
+            calls = act.calls
+            put_scalar[DType.int64](body, Int64(act.saved))
+        except:
+            return
+        try:
+            self._conns[worker].send(KIND_CHECKPOINT, a, UInt64(calls), body)
+        except e:
+            print("dista head: lost worker:", e)
+            self._drop(worker)
+
+    def _ask_checkpoint(mut self, var f: Frame) raises:
+        """A driver's `checkpoint`: answered with the calls covered once a
+        checkpoint after every call it has made so far is written."""
+        if len(f.payload) != 8:
+            raise Error("checkpoint frame needs the actor's ID")
+        var obj = f.object_id
+        var pos = 0
+        var a = get_scalar[DType.uint64](f.payload, pos)
+        if self._known(obj):
+            return
+        self._hold(obj)
+        if a not in self._actors or self._actors[a].killed:
+            self._fail(obj, String("no such actor: killed, or never created"))
+            return
+        ref act = self._actors[a]
+        if act.failed:
+            self._fail(obj, act.failed.copy())
+            return
+        if act.saved == act.calls:
+            self._answer_checkpoint(obj, act.saved)
+            return
+        act.waiters.append(_Waiter(obj, act.calls))
+        self._maybe_checkpoint(a)
+
+    def _answer_checkpoint(mut self, obj: UInt64, calls: Int):
+        if self._dead.pop(obj, False):
+            return
+        var body = List[UInt8]()
+        put_scalar[DType.int](body, Scalar[DType.int](calls))
+        self._results[obj] = body.copy()
+        self._deliver(obj, KIND_RESULT, body)
+
+    def _checkpointed(mut self, i: Int, var f: Frame) raises:
+        """A worker wrote a checkpoint, or couldn't: forget the calls it
+        covers, and answer the drivers waiting for it."""
+        var a = f.object_id
+        var calls = Int(f.task_id)
+        if a not in self._actors or self._hosting[i] != a:
+            return  # killed since, or from a worker it's no longer on
+        var why = message(f.payload)
+        var done = List[_Waiter]()
+        var ok = len(f.payload) == 0
+        ref act = self._actors[a]
+        if ok and calls > act.saved:
+            var covered = calls - max(act.saved, 0)
+            if covered > len(act.log):
+                raise Error("checkpoint covers calls the head never sent")
+            var rest = List[_Task](capacity=len(act.log) - covered)
+            for k in range(covered, len(act.log)):
+                rest.append(act.log[k].copy())
+            act.log = rest^
+            act.saved = calls
+        if not ok:
+            print("dista head: actor", a, "checkpoint failed:", why)
+        var still = List[_Waiter]()
+        for ref w in act.waiters:
+            if w.calls <= calls:
+                done.append(w.copy())
+            else:
+                still.append(w.copy())
+        act.waiters = still^
+        var saved = act.saved
+        for ref w in done:
+            if ok:
+                self._answer_checkpoint(w.object_id, saved)
+            else:
+                self._fail(w.object_id, String("checkpoint failed: ", why))
 
     def _send_to(mut self, i: Int, t: _Task):
         """Sends a task or call to worker `i` and counts it in flight there."""
@@ -586,9 +735,14 @@ struct Head(Movable):
             self._hosting[best] = a
             ref act = self._actors[a]
             act.worker = best
+            act.asked = act.saved
             var create = _Task(
                 a, act.type_id, act.args.copy(), kind=KIND_ACTOR_CREATE
             )
+            if act.saved >= 0:
+                var body = List[UInt8]()
+                put_scalar[DType.uint64](body, UInt64(act.saved))
+                create = _Task(a, act.type_id, body^, kind=KIND_ACTOR_RESTORE)
             var calls = act.pending.copy()
             act.pending.clear()
             var killed = act.killed
@@ -601,6 +755,8 @@ struct Head(Movable):
                     )
                 else:
                     self._send_to(best, t)
+            if self._roles[best] == ROLE_WORKER:
+                self._maybe_checkpoint(a)
             if killed:
                 self._kill(a)
 
@@ -613,9 +769,13 @@ struct Head(Movable):
                 # Its calls were sent first: they run, then it's killed.
                 act.killed = True
             else:
-                _ = self._actors.pop(a)
+                var act = self._actors.pop(a)
+                for ref w in act.waiters:
+                    self._fail(w.object_id, String("the actor was killed"))
         elif a in self._actors:
             var act = self._actors.pop(a)
+            for ref w in act.waiters:
+                self._fail(w.object_id, String("the actor was killed"))
             var i = act.worker
             if i >= 0 and self._hosting[i] == a:
                 self._hosting[i] = 0
@@ -886,10 +1046,11 @@ struct Head(Movable):
                 try:
                     ref act = self._actors[a]
                     if not act.failed:
-                        # Restart it elsewhere from its constructor, and run
-                        # every call again: the calls in flight here get
-                        # their answers from the replay, and the ones already
-                        # answered keep their first answer.
+                        # Restart it elsewhere from its last checkpoint or
+                        # its constructor, and run every call since again:
+                        # the calls in flight here get their answers from
+                        # the replay, and the ones already answered keep
+                        # their first answer.
                         act.worker = -1
                         act.restarts += 1
                         act.pending = act.log.copy()

@@ -1,9 +1,16 @@
 # The CI cluster: a control plane and three worker nodes. The control plane is
 # tainted, so dista's pods land on the three workers.
+#
+# Every worker node mounts the same host directory at /dista-checkpoints, so
+# an actor restarted on another node finds the checkpoints written on the
+# first: a stand-in for object storage (see deploy/k8s/cluster.yaml).
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
   - role: control-plane
   - role: worker
+    extraMounts: [{hostPath: /tmp/dista-checkpoints, containerPath: /dista-checkpoints}]
   - role: worker
+    extraMounts: [{hostPath: /tmp/dista-checkpoints, containerPath: /dista-checkpoints}]
   - role: worker
+    extraMounts: [{hostPath: /tmp/dista-checkpoints, containerPath: /dista-checkpoints}]

@@ -1,6 +1,7 @@
-"""Actors: create, ordered calls, results as ObjectRefs, kill."""
+"""Actors: create, ordered calls, results as ObjectRefs, kill, restarts and
+checkpoints."""
 
-from std.os import remove
+from std.os import getenv, listdir, remove, setenv, unsetenv
 from std.os.path import exists
 from std.testing import (
     TestSuite,
@@ -106,10 +107,60 @@ def forward(mut r: Relay, mut c: Client, n: Int) raises -> Int:
     return got
 
 
+@fieldwise_init
+struct Tally(Movable):
+    """A counter that also counts the calls run on it, replays included."""
+
+    var total: Int
+    var runs: Int
+
+
+def new_tally(start: Int) -> Tally:
+    return Tally(start, 0)
+
+
+def tally_or_crash(mut t: Tally, n: Int) raises -> Int:
+    """`add_or_crash` for a tally."""
+    t.total += n
+    t.runs += 1
+    if t.total == 500 and not exists(CRASH_FLAG):
+        with open(CRASH_FLAG, "w") as f:
+            f.write("crashed")
+        exit_now(1)
+    return t.total
+
+
+def runs(mut t: Tally, n: Int) -> Int:
+    return t.runs
+
+
+comptime CHECKPOINTS = "build/test-checkpoints"
+
+
+def use_checkpoints() raises:
+    """Points the workers forked after this at a fresh checkpoint directory."""
+    _ = setenv("DISTA_CHECKPOINT_URI", CHECKPOINTS)
+    if exists(CHECKPOINTS):
+        for d in listdir(CHECKPOINTS):
+            var dir = String(CHECKPOINTS, "/", d)
+            for f in listdir(dir):
+                remove(String(dir, "/", f))
+
+
+def checkpoint_files(a: UInt64) raises -> List[String]:
+    var dir = String(CHECKPOINTS, "/", hex(a))
+    if not exists(dir):
+        return List[String]()
+    return listdir(dir)
+
+
 comptime RelayActor = Actor[Relay, ActorHandle[CounterActor], new_relay]
 comptime Forward = CtxMethod[RelayActor, Int, Int, forward]
 comptime Bump = CtxTask[ActorHandle[CounterActor], Int, bump]
 comptime PadLength = CtxTask[ActorHandle[CounterActor], Int, pad_length]
+comptime TallyActor = Actor[Tally, Int, new_tally]
+comptime TallyOrCrash = Method[TallyActor, Int, Int, tally_or_crash]
+comptime Runs = Method[TallyActor, Int, Int, runs]
 comptime RT = Runtime[
     CounterActor,
     Add,
@@ -120,6 +171,9 @@ comptime RT = Runtime[
     PadLength,
     RelayActor,
     Forward,
+    TallyActor,
+    TallyOrCrash,
+    Runs,
 ]
 
 
@@ -284,6 +338,71 @@ def test_an_actor_restarts_when_its_worker_dies() raises:
     assert_equal(rt.get(rt.call[Add](c, 0)), 1000)
     # Tasks still run beside the restarted actor.
     assert_equal(rt.get(rt.remote[Square](12)), 144)
+    remove(CRASH_FLAG)
+
+
+def test_a_checkpoint_covers_the_calls_before_it() raises:
+    use_checkpoints()
+    var rt = RT(workers=2)
+    var c = rt.create[CounterActor](0)
+    for _ in range(10):
+        _ = rt.call[Add](c, 1)
+    assert_equal(rt.get(rt.checkpoint(c)), 10)
+    assert_equal(len(checkpoint_files(c.id)), 1)
+    # Nothing new to save: the same checkpoint answers.
+    assert_equal(rt.get(rt.checkpoint(c)), 10)
+    _ = rt.call[Add](c, 1)
+    assert_equal(rt.get(rt.checkpoint(c)), 11)
+    assert_equal(rt.get(rt.call[Add](c, 0)), 11)
+    # Killing the actor deletes its checkpoints.
+    rt.kill(c)
+    for _ in range(500):
+        if len(checkpoint_files(c.id)) == 0:
+            break
+        _ = rt.get(rt.remote[Square](1))
+    assert_equal(len(checkpoint_files(c.id)), 0)
+
+
+def test_a_checkpoint_with_nowhere_to_go_fails() raises:
+    var uri = getenv("DISTA_CHECKPOINT_URI")
+    _ = unsetenv("DISTA_CHECKPOINT_URI")
+    var rt = RT(workers=2)
+    var c = rt.create[CounterActor](0)
+    _ = rt.call[Add](c, 1)
+    with assert_raises(contains="DISTA_CHECKPOINT_URI is not set"):
+        _ = rt.get(rt.checkpoint(c))
+    # The actor carries on.
+    assert_equal(rt.get(rt.call[Add](c, 1)), 2)
+    rt.kill(c)
+    if uri != "":
+        _ = setenv("DISTA_CHECKPOINT_URI", uri)
+
+
+def test_an_actor_restores_from_its_checkpoint() raises:
+    """PR 7's gate, locally: checkpoints every 100 calls, and the worker dies
+    on the 500th of 1,000. The actor comes back from the checkpoint after 400
+    calls, at the latest, so fewer than 100 calls run twice, where restarting
+    from the constructor would run 499 again. The count is still exact."""
+    use_checkpoints()
+    if exists(CRASH_FLAG):
+        remove(CRASH_FLAG)
+    var rt = RT(workers=3)
+    var t = rt.create[TallyActor](0, checkpoint_every=100)
+    var refs = List[ObjectRef[Int]](capacity=1000)
+    for _ in range(1000):
+        refs.append(rt.call[TallyOrCrash](t, 1))
+    for i in range(1000):
+        assert_equal(rt.get(refs[i]), i + 1)
+    assert_true(exists(CRASH_FLAG), "the worker never died")
+    var ran = rt.get(rt.call[Runs](t, 0))
+    assert_true(ran >= 1000, String("only ", ran, " calls ran"))
+    assert_true(ran < 1100, String(ran - 1000, " calls ran twice"))
+    # The last checkpoint covers every call, `Runs` too, and the ones before
+    # it that the head no longer restores from are gone.
+    assert_equal(rt.get(rt.checkpoint(t)), 1001)
+    var files = checkpoint_files(t.id)
+    assert_true(len(files) <= 2, String(len(files), " checkpoints left"))
+    rt.kill(t)
     remove(CRASH_FLAG)
 
 

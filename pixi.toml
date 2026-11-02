@@ -39,6 +39,7 @@ name = "dista"
 mojo-compiler = "==1.2.0"
 arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "d157bb3296b4f6d36feae2848ebf6e0c7e4f9f5e" }
 memory-region-mojo = { git = "https://github.com/magmalake/memory-region.mojo", rev = "91ff4418b44a89f9354e7d32633e9b11ad365dfd" }
+objectstore-mojo = { git = "https://github.com/magmalake/objectstore.mojo", rev = "748e2d31450a7793592e439d6c69d8c6598d2129" }
 
 [package.build-dependencies]
 mojo-compiler = "==1.2.0"
@@ -47,6 +48,7 @@ mojo-compiler = "==1.2.0"
 mojo-compiler = ">=1.2.0,<2"
 arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "d157bb3296b4f6d36feae2848ebf6e0c7e4f9f5e" }
 memory-region-mojo = { git = "https://github.com/magmalake/memory-region.mojo", rev = "91ff4418b44a89f9354e7d32633e9b11ad365dfd" }
+objectstore-mojo = { git = "https://github.com/magmalake/objectstore.mojo", rev = "748e2d31450a7793592e439d6c69d8c6598d2129" }
 
 # Stable is the default: dista targets Mojo 1.2.0. The nightly environment
 # tracks 1.3.0.dev so breaking changes show up early.
@@ -60,20 +62,26 @@ memory-region-mojo = { git = "https://github.com/magmalake/memory-region.mojo", 
 # RecordBatch, and it travels as an Arrow IPC stream. Pinned at the revision
 # mojoshelf published as arrow-mlake-mojo 0.2.0.
 arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "d157bb3296b4f6d36feae2848ebf6e0c7e4f9f5e" }
+# objectstore writes actor checkpoints to DISTA_CHECKPOINT_URI, a local
+# directory or s3://. Pinned with the data environment's.
+objectstore-mojo = { git = "https://github.com/magmalake/objectstore.mojo", rev = "748e2d31450a7793592e439d6c69d8c6598d2129" }
 
 # A precompiled package only loads in the compiler that built it, and this one
-# is 1.2.0's, so the nightly compiles memory-region and arrow-mlake from
-# checkouts next door instead (CI lays them out). The packages must not be
+# is 1.2.0's, so the nightly compiles memory-region, arrow-mlake and
+# objectstore from checkouts next door instead (CI lays them out). The packages must not be
 # installed there too: an installed package wins over -I. DEP_INC holds the
 # include flags for whichever way the environment gets them.
 [feature.stable.activation.env]
 DEP_INC = "-I src"
 
 [feature.nightly.activation.env]
-DEP_INC = "-I ../memory-region.mojo/src -I ../arrow-mlake.mojo/src"
+DEP_INC = "-I ../memory-region.mojo/src -I ../arrow-mlake.mojo/src -I ../objectstore.mojo/src"
 
 [feature.nightly.dependencies]
 modular = ">=26.8.0.dev2026102305,<28"
+# objectstore's Mojo compiles from its checkout; the shim it dlopens is C, so
+# the nightly takes that as a package.
+objectstore-shim = { git = "https://github.com/magmalake/objectstore.mojo", rev = "748e2d31450a7793592e439d6c69d8c6598d2129", subdirectory = "shim" }
 
 # `mojo-compiler` ships no formatter; the nightly `modular` package does. The
 # environment takes `no-default-feature`, so its tasks live in the feature.
