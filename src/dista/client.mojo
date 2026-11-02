@@ -38,6 +38,9 @@ from dista.frame import (
     KIND_STOP,
     KIND_TASK,
     KIND_TASK_AFTER,
+    KIND_TASK_MANY,
+    GATHER,
+    WITH_VALUE,
     KIND_TIMELINE,
     KIND_WELCOME,
     ROLE_CLIENT,
@@ -50,7 +53,14 @@ from dista.frame import (
 )
 from dista.head import DRIVER_SHIFT
 from dista.socket import Stream, addr_key, poll_readable, wall_ns
-from dista.task import ActorLike, MethodLike, StatePtr, TaskLike, fnv1a64
+from dista.task import (
+    ActorLike,
+    ManyLike,
+    MethodLike,
+    StatePtr,
+    TaskLike,
+    fnv1a64,
+)
 from dista.store import Location
 from memory_region import SharedMapping
 
@@ -502,6 +512,8 @@ struct Client(Movable):
 
     def remote[T: TaskLike](mut self, arg: T.A) raises -> ObjectRef[T.R]:
         """Submits task `T` on `arg` and returns a handle to its result."""
+        if T.is_many():
+            raise Error(T.name(), " has several results: use remote_many")
         var args = List[UInt8]()
         encode(arg, args)
         var id = self._new_id()
@@ -528,6 +540,39 @@ struct Client(Movable):
         for r in args:
             deps.append(r.id)
         return self._submit_after[T.R](T.id(), deps, True)
+
+    def remote[
+        X: AnyType, //, T: TaskLike
+    ](mut self, arg: T.A, args: List[ObjectRef[X]]) raises -> ObjectRef[T.R]:
+        """Submits task `T`, a `TaskWith`, on `arg` and these results: it runs
+        once every result exists, and receives them in order as a `Seq`."""
+        comptime assert (
+            reflect[T].base_name() == "TaskWith"
+        ), "a task given a value and a list of ObjectRefs must be a TaskWith"
+        var value = List[UInt8]()
+        encode(arg, value)
+        var deps = List[UInt64](capacity=len(args))
+        for r in args:
+            deps.append(r.id)
+        return self._submit_after[T.R](T.id(), deps, True, value)
+
+    def remote_many[
+        T: ManyLike
+    ](mut self, arg: T.A, n: Int) raises -> List[ObjectRef[T.Part]]:
+        """Submits task `T`, a `TaskMany`, on `arg`, for `n` results: each is
+        an object of its own, the `n` values of the `Seq` it returns."""
+        if n < 1:
+            raise Error("remote_many needs at least one result")
+        var body = List[UInt8]()
+        put_scalar[DType.uint64](body, UInt64(n))
+        encode(arg, body)
+        var refs = List[ObjectRef[T.Part]](capacity=n)
+        for _ in range(n):
+            refs.append(ObjectRef[T.Part](self._new_id()))
+        for k in range(1, n):
+            self._live[refs[k].id] = True
+        self._submit(refs[0].id, KIND_TASK_MANY, T.id(), body^, List[UInt64]())
+        return refs^
 
     def create[
         T: ActorLike
@@ -597,12 +642,22 @@ struct Client(Movable):
     def _submit_after[
         R: AnyType
     ](
-        mut self, task_id: UInt64, deps: List[UInt64], gather: Bool
+        mut self,
+        task_id: UInt64,
+        deps: List[UInt64],
+        gather: Bool,
+        value: List[UInt8] = List[UInt8](),
     ) raises -> ObjectRef[R]:
-        var body: List[UInt8] = [UInt8(1) if gather else UInt8(0)]
+        var flags = GATHER if gather else UInt8(0)
+        if len(value) > 0:
+            flags |= WITH_VALUE
+        var body: List[UInt8] = [flags]
         put_scalar[DType.uint64](body, UInt64(len(deps)))
         for d in deps:
             put_scalar[DType.uint64](body, d)
+        if len(value) > 0:
+            put_scalar[DType.uint64](body, UInt64(len(value)))
+            body.extend(value.copy())
         var id = self._new_id()
         self._submit(id, KIND_TASK_AFTER, task_id, body^, deps.copy())
         return ObjectRef[R](id)

@@ -43,7 +43,8 @@ type that implements `Codec` chooses what it saves.
 from std.memory.alloc import unsafe_alloc
 from std.reflection import reflect_fn
 
-from dista.codec import decode, encode
+from dista.codec import decode, encode, get_scalar, put_scalar
+from dista.seq import Seq
 
 
 def fnv1a64(s: StringSlice) -> UInt64:
@@ -89,6 +90,11 @@ trait TaskLike:
         return False
 
     @staticmethod
+    def is_many() -> Bool:
+        """Whether its result is several objects (`TaskMany`)."""
+        return False
+
+    @staticmethod
     def owner() -> UInt64:
         """For a method, its actor's ID; 0 for anything else."""
         return 0
@@ -119,6 +125,11 @@ trait TaskLike:
     ) raises:
         """A method: runs on the actor's state, appends the encoded result."""
         raise Error(Self.name(), " is not a method")
+
+
+trait ManyLike(TaskLike):
+    comptime Part: Movable
+    """The type of each of its results."""
 
 
 trait ActorLike(TaskLike):
@@ -165,6 +176,99 @@ struct Task[
         var a = _decode_all[Self.A](Self.name(), args)
         var r = Self.f(a)
         encode(r, out)
+
+
+struct TaskWith[
+    A_: Movable & Deinitable,
+    X: Copyable & Deinitable,
+    R_: Movable & Deinitable,
+    f: def(A_, Seq[X]) thin raises -> R_,
+](TaskLike):
+    """A task taking a value and other tasks' results, gathered in order:
+    `f(a, xs)`, submitted as `rt.remote[T](a, refs)`. A shuffle's reducer is
+    one: its partition number, and the map outputs holding that partition.
+    """
+
+    comptime A = Self.A_
+    comptime R = Self.R_
+
+    @staticmethod
+    def name() -> StaticString:
+        return reflect_fn[Self.f].linkage_name()
+
+    @staticmethod
+    def id() -> UInt64:
+        return fnv1a64(Self.name())
+
+    @staticmethod
+    def run(args: Span[UInt8, _], mut out: List[UInt8]) raises:
+        var pos = 0
+        var a = decode[Self.A](args, pos)
+        var xs = decode[Seq[Self.X]](args, pos)
+        if pos != len(args):
+            raise Error(
+                Self.name(), ": ", len(args) - pos, " argument bytes left over"
+            )
+        var r = Self.f(a, xs)
+        encode(r, out)
+
+
+struct TaskMany[
+    A_: Movable & Deinitable,
+    X: Copyable & Deinitable,
+    f: def(A_) thin raises -> Seq[X],
+](ManyLike):
+    """A task with several results, each its own object: `rt.remote_many[T](a,
+    n)` returns `n` `ObjectRef[X]`s, and `f` must return a `Seq` of exactly
+    `n`. Each is stored, fetched and freed on its own, so a shuffle's map
+    task can make one partition per reducer.
+
+    On the wire its result is a count, then each part as a length and its
+    encoding, so the worker splits it without knowing `X`.
+    """
+
+    comptime A = Self.A_
+    comptime R = Seq[Self.X]
+    comptime Part = Self.X
+
+    @staticmethod
+    def name() -> StaticString:
+        return reflect_fn[Self.f].linkage_name()
+
+    @staticmethod
+    def id() -> UInt64:
+        return fnv1a64(Self.name())
+
+    @staticmethod
+    def is_many() -> Bool:
+        return True
+
+    @staticmethod
+    def run(args: Span[UInt8, _], mut out: List[UInt8]) raises:
+        var a = _decode_all[Self.A](Self.name(), args)
+        var xs = Self.f(a)
+        put_scalar[DType.uint64](out, UInt64(len(xs)))
+        for i in range(len(xs)):
+            var part = List[UInt8]()
+            encode(xs.items[i], part)
+            put_scalar[DType.uint64](out, UInt64(len(part)))
+            out.extend(part^)
+
+
+def split_parts(result: Span[UInt8, _]) raises -> List[List[UInt8]]:
+    """A `TaskMany` result's parts, each as its own encoded object."""
+    var pos = 0
+    var n = Int(get_scalar[DType.uint64](result, pos))
+    if n < 0 or n > (len(result) - pos) // 8:
+        raise Error("a task's parts are malformed: count ", n)
+    var parts = List[List[UInt8]](capacity=n)
+    for _ in range(n):
+        var size = Int(get_scalar[DType.uint64](result, pos))
+        if size < 0 or size > len(result) - pos:
+            raise Error("a task's parts are malformed: size ", size)
+        parts.append(List[UInt8](result[pos : pos + size]))
+        pos += size
+    return parts^
 
 
 struct Actor[
