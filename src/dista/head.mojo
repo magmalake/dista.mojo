@@ -92,6 +92,9 @@ from dista.frame import (
     KIND_WELCOME,
     KIND_STATUS,
     KIND_STOP,
+    KIND_TASK_MANY,
+    GATHER,
+    WITH_VALUE,
     ROLE_CLIENT,
     ROLE_DRIVER,
     ROLE_OBSERVER,
@@ -264,6 +267,9 @@ struct Head(Movable):
     var _driver_hash: Dict[UInt64, UInt64]
     """Each driver's registry hash, by number."""
     var _stopped: Bool
+    var _many: Dict[UInt64, Int]
+    """A running `TaskMany`'s first result, and how many it has: its worker
+    going away fails them all."""
     var _waiting: List[_Task]
     var _results: Dict[UInt64, List[UInt8]]
     var _errors: Dict[UInt64, String]
@@ -346,6 +352,7 @@ struct Head(Movable):
         self._hashes = List[UInt64]()
         self._driver_hash = Dict[UInt64, UInt64]()
         self._stopped = False
+        self._many = Dict[UInt64, Int]()
         self._waiting = List[_Task]()
         self._results = Dict[UInt64, List[UInt8]]()
         self._errors = Dict[UInt64, String]()
@@ -660,7 +667,8 @@ struct Head(Movable):
             elif f.kind == KIND_TASK_AFTER:
                 if len(f.payload) < 9:
                     raise Error("truncated task-after")
-                var gather = f.payload[0] != 0
+                var flags = f.payload[0]
+                var gather = (flags & GATHER) != 0
                 var pos = 1
                 var n = Int(get_scalar[DType.uint64](f.payload, pos))
                 if n < 0 or n > (len(f.payload) - pos) // 8:
@@ -668,6 +676,13 @@ struct Head(Movable):
                 var deps = List[UInt64](capacity=n)
                 for _ in range(n):
                     deps.append(get_scalar[DType.uint64](f.payload, pos))
+                # A `TaskWith`'s value, kept to go before the inputs.
+                var value = List[UInt8]()
+                if flags & WITH_VALUE:
+                    var size = Int(get_scalar[DType.uint64](f.payload, pos))
+                    if size < 0 or size != len(f.payload) - pos:
+                        raise Error("task-after with a bad value length")
+                    value = List[UInt8](f.payload[pos:])
                 if self._known(f.object_id):
                     return
                 self._hold(f.object_id)
@@ -691,11 +706,13 @@ struct Head(Movable):
                     _Task(
                         f.object_id,
                         f.task_id,
-                        List[UInt8](),
+                        value^,
                         deps=deps^,
                         gather=gather,
                     )
                 )
+            elif f.kind == KIND_TASK_MANY:
+                self._task_many(f^)
             elif f.kind == KIND_RESULT or f.kind == KIND_ERROR:
                 # Resuming: a small result or error the driver kept.
                 var obj = f.object_id
@@ -920,6 +937,34 @@ struct Head(Movable):
         except e:
             print("dista head: lost worker:", e)
             self._drop(worker)
+
+    def _task_many(mut self, var f: Frame) raises:
+        """A `TaskMany`: its results are this object and the ones after it,
+        each held, answered and freed on its own."""
+        if len(f.payload) < 8:
+            raise Error("truncated task-many")
+        var pos = 0
+        var n = Int(get_scalar[DType.uint64](f.payload, pos))
+        if n < 1 or n > 1 << 20:
+            raise Error("task-many with a bad result count ", n)
+        var first = f.object_id
+        if owner_of(first + UInt64(n - 1)) != owner_of(first):
+            raise Error("task-many results run past their driver's IDs")
+        var new = False
+        for k in range(n):
+            var id = first + UInt64(k)
+            if not self._known(id):
+                self._hold(id)
+                new = True
+        if not new:
+            return  # sent again, as by a driver resuming
+        self._many[first] = n
+        var task = f.task_id
+        self._open_span(first, task)
+        self._enqueue(
+            _Task(first, task, f^.take_payload(), kind=KIND_TASK_MANY)
+        )
+        self._stamp_queued(first)
 
     def _resume_actor(mut self, a: UInt64):
         """An actor created again by a driver resuming after a head restart:
@@ -1268,6 +1313,7 @@ struct Head(Movable):
 
     def _settle(mut self, object_id: UInt64):
         """`object_id`'s task is done: it no longer holds its inputs."""
+        _ = self._many.pop(object_id, 0)
         var deps = self._deps_of.pop(object_id, List[UInt64]())
         for d in deps:
             self._dec(d)
@@ -1447,7 +1493,16 @@ struct Head(Movable):
             for obj in lost:
                 if obj in replays:
                     continue
-                self._fail(obj, String("worker lost while running this task"))
+                # A `TaskMany`'s worker answers its first result last, so
+                # it's in flight until every result is answered.
+                var parts = self._many.pop(obj, 1)
+                for k in range(parts):
+                    var part = obj + UInt64(k)
+                    if k > 0 and self._answered(part):
+                        continue
+                    self._fail(
+                        part, String("worker lost while running this task")
+                    )
             var held = List[UInt64]()
             for entry in self._location.items():
                 if entry.value == i:
@@ -1486,7 +1541,7 @@ struct Head(Movable):
             elif not settled:
                 still.append(t.copy())
             elif not remote:
-                var args = List[UInt8]()
+                var args = t.args.copy()
                 if t.gather:
                     put_scalar[DType.int64](args, Int64(len(t.deps)))
                 for d in t.deps:
@@ -1497,7 +1552,10 @@ struct Head(Movable):
             else:
                 # Some inputs live on workers: tell the worker that runs this
                 # task where to fetch them, and pass the rest inline.
-                var spec: List[UInt8] = [UInt8(1) if t.gather else UInt8(0)]
+                var flags = GATHER if t.gather else UInt8(0)
+                if len(t.args) > 0:
+                    flags |= WITH_VALUE
+                var spec: List[UInt8] = [flags]
                 put_scalar[DType.uint64](spec, UInt64(len(t.deps)))
                 for d in t.deps:
                     if d in self._location:
@@ -1510,6 +1568,9 @@ struct Head(Movable):
                         put_scalar[DType.uint64](spec, d)
                         put_scalar[DType.uint64](spec, UInt64(len(r)))
                         spec.extend(r^)
+                if len(t.args) > 0:
+                    put_scalar[DType.uint64](spec, UInt64(len(t.args)))
+                    spec.extend(t.args.copy())
                 var id = t.object_id
                 self._enqueue(
                     _Task(id, t.task_id, spec^, kind=KIND_TASK_INPUTS)
