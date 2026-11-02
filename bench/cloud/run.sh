@@ -10,7 +10,9 @@
 #   NODES="3 6 12" FRAMEWORKS="dista rust ray" PASSES=5 SLOTS=16 bench/cloud/run.sh
 #   JOB=shuffle bench/cloud/run.sh   the shuffle benchmark (bench/shuffle),
 #                               on dista and Ray; REDUCERS reduce tasks
-#                               (default: every worker slot)
+#                               (default: one per worker slot, at most 96,
+#                               the fastest in the reducer sweep of
+#                               results/shuffle-reducers-2026-11-02)
 #
 # The one-process scan takes from minutes (dista) to most of an hour (Rust,
 # Ray) on 1.4 billion rows, so it runs once, before the workers exist, and
@@ -61,6 +63,11 @@ run_job() {
   if [ $ok = 0 ] || ! grep -q '^PASS' "$log"; then
     echo "FAIL: see $log"; tail -20 "$log"
     kubectl logs -l "app=$app" --prefix --tail=20 || true
+    # Why the job's pods ended (OOMKilled, Error, ...) and the node's
+    # pressure conditions: a pod that dies leaves no log of its own.
+    { echo "# the job's pods:"
+      kubectl get pods -l job-name=taxi -o jsonpath='{range .items[*]}{.metadata.name} {.status.phase} {.status.containerStatuses[*].state.terminated.reason} {.status.containerStatuses[*].lastState.terminated.reason}{"\n"}{end}' || true
+      kubectl get events --sort-by=.lastTimestamp 2>/dev/null | tail -15 || true; } >> "$log" 2>&1
   fi
   kubectl delete -f "$manifest" --wait >/dev/null
 }
@@ -100,14 +107,15 @@ slots=${SLOTS:-$(kubectl get nodes -l dista-bench/role=worker -o jsonpath='{.ite
 for nodes in ${NODES:-3 6 12}; do
   for fw in ${FRAMEWORKS:-$frameworks}; do
     echo "== $job: $fw on $nodes nodes, $slots slots each"
+    reducers=${REDUCERS:-$((nodes * slots < 96 ? nodes * slots : 96))}
     aws_secret
     sed -e "s|@NODES@|$nodes|g" -e "s|@SLOTS@|$slots|g" \
       -e "s|@REPLICAS@|$((nodes * slots))|g" -e "s|@PASSES@|$passes|g" \
       -e "s|@DISTA_PROGRAM@|$dista_program|g" -e "s|@RAY_SCRIPT@|$ray_script|g" \
-      -e "s|@REDUCERS@|${REDUCERS:-$((nodes * slots))}|g" \
+      -e "s|@REDUCERS@|$reducers|g" \
       -e "s|@TAXI_METADATA@|$metadata|g" "bench/cloud/k8s/$fw.yaml" > "$state/$fw.yaml"
     log=$results/$fw-$nodes.log
-    { echo "# $fw job=$job nodes=$nodes slots=$slots passes=$passes reducers=${REDUCERS:-$((nodes * slots))}"
+    { echo "# $fw job=$job nodes=$nodes slots=$slots passes=$passes reducers=$reducers"
       echo "# metadata=$metadata"; } > "$log"
     run_job "$state/$fw.yaml" "$log" "$fw-taxi"
     if [ "$fw" = dista ]; then

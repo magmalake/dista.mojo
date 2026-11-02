@@ -299,3 +299,66 @@ likely starved it. Not yet retried with fewer threads.
 which compiling is 124 s, against 116–122 s and 51–54 s in section 5. The
 image now compiles three programs: the taxi queries, the shuffle and the
 `dista` command. Ray 47 s, Rust 169 s, as before.
+
+## 8. The shuffle again, after the faster per-row loop
+
+dista `a432b1f` (#58 and #62): the per-row loop runs in two passes over the
+columns where the batch holds them, and the one-process run gives each
+thread whole files and accumulator arrays of its own. Ray unchanged. Every
+distributed answer below matches both one-process references, checked by
+summarizing each folder together with `shuffle-local-2026-11-02-3/t1/`.
+
+### 8a. One process, on the head node
+
+`shuffle-local-2026-11-02-3/`, ms:
+
+| threads | dista | ray | dista before (§7b) |
+|---|---:|---:|---:|
+| 16 | **15,897** | failed | 126,383 |
+| 12 | **19,087** | failed | – |
+| 8 | **26,650** | 114,993 | – |
+| 1 | **105,656** | 112,448 | 202,154 |
+
+dista is now 8× faster on 16 threads, and ahead of Ray on one. Ray's time
+doesn't move with threads (115 s on 8, 112 s on 1): only its decoding
+uses them, and its per-batch NumPy work runs on one thread. Ray failed on
+16 and 12 threads again, with an empty log: on 16 its pod ended within a
+minute, on 12 `kubectl` lost the head node's API server ("TLS handshake
+timeout") for about seven minutes. Both point at memory pressure on the
+head node, which also runs k3s; it isn't confirmed. `run.sh` now records
+why a failed job's pods ended and the cluster's recent events.
+
+### 8b. Distributed, 3, 6 and 12 nodes
+
+`shuffle-matrix-2026-11-02-2/`, 5 passes, one reducer per task slot (48, 96
+and 192), median pass in ms:
+
+| | dista ×3 | ray ×3 | dista ×6 | ray ×6 | dista ×12 | ray ×12 |
+|---|---:|---:|---:|---:|---:|---:|
+| median pass | **6,291** | **14,537** | **3,795** | **11,407** | **7,822** | **10,634** |
+| slowest pass | 7,516 | 18,442 | 5,315 | 15,494 | 9,753 | 19,814 |
+| §7a, before | 8,462 | 14,169 | 5,139 | 10,955 | 7,282 | 11,439 |
+
+### 8c. How many reducers
+
+`shuffle-reducers-2026-11-02/n<nodes>-r<reducers>/`, 3 passes each; the
+192-reducer row on 12 nodes and the 96-reducer row on 6 are 8b's. Median
+pass, ms:
+
+| nodes | reducers | dista | ray |
+|---:|---:|---:|---:|
+| 6 | 48 | 3,938 | 11,590 |
+| 6 | 96 | **3,795** | 11,407 |
+| 6 | 192 | 7,688 | 10,235 |
+| 12 | 48 | 4,044 | **9,644** |
+| 12 | 96 | **3,976** | 10,570 |
+| 12 | 192 | 7,822 | 10,634 |
+| 12 | 384 | 8,387 | 13,812 |
+
+dista is fastest at 48 to 96 reducers on both node counts, and twice as
+slow from 192: every map task makes one partition per reducer, so 416 map
+tasks and 192 reducers are 80,000 objects, each stored, fetched and freed on
+its own. That, not the node count, is why 12 nodes looked slower than 6.
+Ray varies less with the count, and is best at 48 on 12 nodes. Best against
+best on 12 nodes: dista 3,976 ms, Ray 9,644 ms, 2.4×. `run.sh` now
+defaults to one reducer per slot up to 96.
