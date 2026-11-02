@@ -131,6 +131,16 @@ def _decode_batch(buf: Span[UInt8, _], mut pos: Int) raises -> RecordBatch:
     return s.batches.pop()
 
 
+comptime _NESTED_REF = (
+    "dista can't send an ObjectRef inside a value: pass it as the task's"
+    " argument (rt.remote[T](ref)), in a list (rt.remote[T](refs)), or beside a"
+    " value with a TaskWith (rt.remote[T](value, refs)). Refs nested in a"
+    " struct or a Seq would need Ray's borrowing, which is out of scope; to ask"
+    " for it, see https://github.com/magmalake/dista.mojo/issues/68"
+)
+"""The compile error for an `ObjectRef` the codec meets inside a value."""
+
+
 def encode[T: AnyType](ref value: T, mut out: List[UInt8]):
     """Appends the bytes of `value` to `out`."""
     comptime name = reflect[T].name()
@@ -146,6 +156,8 @@ def encode[T: AnyType](ref value: T, mut out: List[UInt8]):
             out.append(b)
     elif name == "arrow_mlake.batch.RecordBatch":
         _encode_batch(rebind[RecordBatch](value), out)
+    elif reflect[T].base_name() == "ObjectRef":
+        comptime assert False, _NESTED_REF
     elif conforms_to(T, Codec):
         comptime assert conforms_to(T, Codec)
         value.encode(out)
@@ -173,6 +185,8 @@ def decode[T: Movable](buf: Span[UInt8, _], mut pos: Int) raises -> T:
         return rebind_var[T](s^)
     elif name == "arrow_mlake.batch.RecordBatch":
         return rebind_var[T](_decode_batch(buf, pos))
+    elif reflect[T].base_name() == "ObjectRef":
+        comptime assert False, _NESTED_REF
     elif conforms_to(T, Codec):
         comptime assert conforms_to(T, Codec)
         return T.decode(buf, pos)
