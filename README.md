@@ -21,7 +21,7 @@ def main() raises:
     print(total)  # 332833500
 ```
 
-**Status: phase 3, actors, nearly done; phase 2 done.** Phase 2's gate, a distributed Iceberg scan of the NYC taxi table on a 3-node cluster matching one machine, passes ([tests/kind_taxi.sh](tests/kind_taxi.sh)). One binary runs as driver, head or worker, chosen by environment. Run it on its own and it forks a head and workers on one machine; point it at a head and it joins a cluster:
+**Status: phase 3 done** (actors, restarts, checkpoints, metrics). Phase 2's gate, a distributed Iceberg scan of the NYC taxi table on a 3-node cluster matching one machine, passes ([tests/kind_taxi.sh](tests/kind_taxi.sh)). One binary runs as driver, head or worker, chosen by environment. Run it on its own and it forks a head and workers on one machine; point it at a head and it joins a cluster:
 
 ```
 DISTA_ROLE=head DISTA_PORT=6390 ./app                  # the head
@@ -40,6 +40,7 @@ What works today:
 - **Parquet:** tasks can read row groups with parquet.mojo and hand them to other tasks as batches ([tests/test_parquet_tasks.mojo](tests/test_parquet_tasks.mojo)).
 - **Iceberg:** a scan planned by iceberg.mojo runs as one task per data file, deletes and filters included, and returns what a local scan returns ([tests/test_iceberg_scan.mojo](tests/test_iceberg_scan.mojo)).
 - **Actors:** state on a worker of its own, with methods called in order, from the driver, from tasks or from other actors ([tests/test_actors.mojo](tests/test_actors.mojo)). An actor whose worker dies comes back on another one, from its last checkpoint if it has one (`checkpoint_every`, `rt.checkpoint`, written to `DISTA_CHECKPOINT_URI`, a directory or `s3://`), with the calls since run again. On kind, deleting the actor's pod mid-run leaves the count exact. Actors survive a head restart too: the new head restores them from their newest checkpoint, and their callers resend the calls since.
+- **Metrics:** with `DISTA_METRICS_PORT` set, the head and every worker serve Prometheus metrics at `/metrics`: tasks by outcome, task durations, queue depth, objects held, actors and checkpoints. The kind manifests turn it on at 9090.
 
 - [VISION.md](VISION.md): what dista is for, its principles and phases.
 - [DESIGN.md](DESIGN.md): how it works, and what's verified on Mojo 1.2.0.

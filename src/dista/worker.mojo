@@ -67,6 +67,13 @@ from dista.checkpoint import (
     write_checkpoint,
 )
 from dista.client import TaskContext
+from dista.metrics import (
+    Histogram,
+    answer_scrape,
+    metrics_listener,
+    write_metric,
+    write_outcomes,
+)
 from dista.head import owner_of
 from dista.task import StatePtr
 from dista.store import (
@@ -302,6 +309,12 @@ struct Worker[
     covers, that may still be restored from."""
     var _ctx: TaskContext
     """The client a `CtxTask` calls actors through, opened on first use."""
+    var _metrics: Optional[Listener]
+    """Where `/metrics` is served, with `DISTA_METRICS_PORT` set."""
+    var _ran: Int
+    """Tasks and actor frames finished here, failed ones included."""
+    var _failed: Int
+    var _durations: Histogram
 
     def __init__(
         out self,
@@ -349,6 +362,14 @@ struct Worker[
         self._calls = 0
         self._checkpointed = False
         self._ctx = TaskContext(head_addr, resume_at, registry_hash)
+        self._metrics = None
+        try:
+            self._metrics = metrics_listener()
+        except e:
+            print("dista worker: no metrics:", e)
+        self._ran = 0
+        self._failed = 0
+        self._durations = Histogram()
 
     @staticmethod
     def _hello(
@@ -412,6 +433,9 @@ struct Worker[
         for i in range(len(self._peers)):
             fds.append(self._peers[i].fd())
             events.append(self._events(self._peers[i]))
+        if self._metrics:
+            fds.append(self._metrics.value().fd)
+            events.append(POLLIN)
         # Handling frames can accept a fetcher or open a peer connection; only
         # the connections that were polled have results.
         var n_serving = len(self._serving)
@@ -453,6 +477,8 @@ struct Worker[
                         break
                     self._from_peer(f.take())
             k += 1
+        if self._metrics and rev[k] & POLLIN:
+            answer_scrape(self._metrics.value(), self._page())
         for j in range(len(dead) - 1, -1, -1):
             _ = self._serving.pop(dead[j])
         if rev[1] & POLLIN:
@@ -626,7 +652,59 @@ struct Worker[
             _ = self._fetched.pop(obj, False)
             _ = self._objects.pop(obj, List[UInt8]())
 
+    def _page(self) -> String:
+        """This worker's `/metrics` page."""
+        var held = 0
+        for entry in self._files.items():
+            held += entry.value.size
+        for entry in self._objects.items():
+            if entry.key not in self._fetched:
+                held += len(entry.value)
+        var out = String()
+        write_outcomes(
+            out,
+            "dista_worker_tasks_finished_total",
+            "Tasks and actor calls this worker finished, by outcome.",
+            self._ran - self._failed,
+            self._failed,
+        )
+        self._durations.write(
+            out,
+            "dista_worker_task_duration_seconds",
+            "How long tasks and actor calls ran here.",
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_worker_results",
+            "Large results this worker holds.",
+            len(self._files) + len(self._objects) - len(self._fetched),
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_worker_result_bytes",
+            "Bytes of the large results this worker holds.",
+            held,
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_worker_queue_depth",
+            "Tasks here waiting to run, or for their inputs.",
+            len(self._ready) + len(self._parked),
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_worker_hosts_actor",
+            "1 while this worker hosts an actor.",
+            1 if self._actor != 0 else 0,
+        )
+        return out^
+
     def _report_error(mut self, obj: UInt64, msg: String):
+        self._failed += 1
         try:
             self._head.send(KIND_ERROR, obj, 0, msg.as_bytes())
         except:
@@ -900,10 +978,14 @@ struct Worker[
 
     def _span(mut self, obj: UInt64, arrived: UInt64, started: UInt64):
         """Tells the head when `obj`'s task arrived, started and ended here."""
+        var ended = wall_ns()
+        self._ran += 1
+        if ended > started:
+            self._durations.observe(Float64(ended - started) / 1e9)
         var body = List[UInt8]()
         put_scalar[DType.uint64](body, arrived)
         put_scalar[DType.uint64](body, started)
-        put_scalar[DType.uint64](body, wall_ns())
+        put_scalar[DType.uint64](body, ended)
         self._to_head(KIND_SPAN, obj, body)
 
     def _to_head(mut self, kind: UInt8, obj: UInt64, payload: Span[UInt8, _]):
