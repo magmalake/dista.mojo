@@ -25,6 +25,14 @@ needs one fails, naming it, and an orchestrator runs the job again. The
 tasks it was running are sent to another worker, up to `DISTA_TASK_RETRIES`
 times (default 3), unless an input they read from that worker is gone too.
 
+Submissions are admitted, not just accepted. While the tasks queued or
+waiting on inputs reach `DISTA_MAX_QUEUED` (default 100,000), or their
+arguments `DISTA_MAX_QUEUED_BYTES` (default 1 GiB), the head stops reading
+from drivers. Their sockets fill, and `remote` blocks until workers drain the
+queue: backpressure through TCP, with no frame of its own. Clients inside a
+worker's task are read regardless, since pausing one would hold that worker,
+and with every worker held, nothing would drain. 0 turns a limit off.
+
 Every object is reference counted: its driver holds it until it releases it
 (or disconnects), and each submitted task taking it as input holds it until
 that task settles. At zero the head forgets the object and tells the worker
@@ -291,6 +299,14 @@ def _lost_result(obj: UInt64) -> String:
     )
 
 
+def _env_int(name: String, default: Int) -> Int:
+    """An integer from the environment, or `default` if it's unset or bad."""
+    try:
+        return max(Int(getenv(name, String(default))), 0)
+    except:
+        return default
+
+
 comptime LOOKAHEAD = 64
 """How far into its queue a free worker looks for a task to take."""
 
@@ -404,6 +420,18 @@ struct Head(Movable):
     from it, to that worker: it stays until they settle, since they may not
     have fetched yet."""
     var _moved: Int
+    var _max_queued: Int
+    """`DISTA_MAX_QUEUED`: past this many tasks queued or waiting, drivers
+    aren't read; 0, no limit."""
+    var _max_queued_bytes: Int
+    """`DISTA_MAX_QUEUED_BYTES`, the same for their arguments' bytes."""
+    var _queued_bytes: Int
+    """Bytes of the arguments of the tasks in `_queues`."""
+    var _waiting_bytes: Int
+    """And of those in `_waiting`."""
+    var _paused: Bool
+    var _pauses: Int
+    """Times the head stopped reading drivers, for the metrics."""
 
     def __init__(
         out self,
@@ -486,6 +514,12 @@ struct Head(Movable):
         self._stuck = Dict[UInt64, Bool]()
         self._holdouts = Dict[UInt64, Int]()
         self._moved = 0
+        self._max_queued = _env_int("DISTA_MAX_QUEUED", 100_000)
+        self._max_queued_bytes = _env_int("DISTA_MAX_QUEUED_BYTES", 1 << 30)
+        self._queued_bytes = 0
+        self._waiting_bytes = 0
+        self._paused = False
+        self._pauses = 0
 
     def run(mut self) raises:
         """Serves until the last driver leaves, in local mode; else forever."""
@@ -501,6 +535,11 @@ struct Head(Movable):
             if self._stopped:
                 self._shutdown()
                 return
+            self._admit_buffered()
+            var paused = self._full()
+            if paused and not self._paused:
+                self._pauses += 1
+            self._paused = paused
             var fds: List[c_int] = [self._listener.fd]
             var events: List[Int16] = [POLLIN]
             var which: List[Int] = [-1]
@@ -513,6 +552,8 @@ struct Head(Movable):
                     continue
                 fds.append(self._conns[i].fd())
                 var ev = POLLIN
+                if paused and self._held_back(i):
+                    ev = 0  # a hang-up still shows, as POLLHUP
                 if self._conns[i].wants_write():
                     ev |= POLLOUT
                 events.append(ev)
@@ -533,7 +574,7 @@ struct Head(Movable):
                         self._conns[i].flush()
                     if revents[k] & (POLLIN | POLLERR | POLLHUP):
                         self._conns[i].read_available()
-                        while True:
+                        while not (self._held_back(i) and self._full()):
                             var f = self._conns[i].next_frame()
                             if not f:
                                 break
@@ -588,6 +629,30 @@ struct Head(Movable):
             "dista_queue_depth",
             "Tasks waiting for a worker or for their inputs.",
             self._queued() + len(self._waiting),
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_queued_bytes",
+            "Bytes of the arguments of tasks waiting for a worker or inputs.",
+            self._queued_bytes + self._waiting_bytes,
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_admission_paused",
+            (
+                "1 while the queue is full and drivers aren't read"
+                " (DISTA_MAX_QUEUED, DISTA_MAX_QUEUED_BYTES)."
+            ),
+            1 if self._paused else 0,
+        )
+        write_metric(
+            out,
+            "counter",
+            "dista_admission_pauses_total",
+            "Times a full queue stopped the head reading drivers.",
+            self._pauses,
         )
         write_metric(
             out,
@@ -852,6 +917,7 @@ struct Head(Movable):
                     self._refs[d] = self._refs.get(d, 0) + 1
                 self._deps_of[f.object_id] = deps.copy()
                 self._open_span(f.object_id, f.task_id)
+                self._waiting_bytes += len(value)
                 self._waiting.append(
                     _Task(
                         f.object_id,
@@ -1724,6 +1790,43 @@ struct Head(Movable):
                         continue
                     self._fail(part, why.copy())
 
+    def _held_back(self, i: Int) -> Bool:
+        """Whether connection `i` is one admission control stops reading: a
+        driver, not a task's client."""
+        return self._roles[i] == ROLE_DRIVER and i not in self._clients
+
+    def _full(self) -> Bool:
+        """Whether the queued and waiting tasks reach a limit, so drivers
+        aren't read until they drain."""
+        if self._max_queued > 0:
+            if self._queued() + len(self._waiting) >= self._max_queued:
+                return True
+        if self._max_queued_bytes > 0:
+            if (
+                self._queued_bytes + self._waiting_bytes
+                >= self._max_queued_bytes
+            ):
+                return True
+        return False
+
+    def _admit_buffered(mut self):
+        """Handles drivers' frames read before the queue filled, as far as
+        there's room: no poll will say they're there."""
+        for i in range(len(self._conns)):
+            if not self._held_back(i):
+                continue
+            try:
+                while not self._full():
+                    var f = self._conns[i].next_frame()
+                    if not f:
+                        break
+                    self._handle(i, f.take())
+                    if self._roles[i] == _ROLE_GONE:
+                        break
+            except e:
+                print("dista head: dropping connection:", e)
+                self._drop(i)
+
     def _drain(mut self):
         """Moves draining workers' results to other workers, and lets each
         draining worker go once it runs no task and holds nothing."""
@@ -1843,6 +1946,7 @@ struct Head(Movable):
             for k in range(q.head, len(q.tasks)):
                 queued.append(q.tasks[k].copy())
         self._queues = Dict[UInt64, _Queue]()
+        self._queued_bytes = 0
         for ref t in queued:
             var parts = self._many.get(t.object_id, 1)
             for k in range(parts):
@@ -1941,6 +2045,9 @@ struct Head(Movable):
                 )
                 self._stamp_queued(id)
         self._waiting = still^
+        self._waiting_bytes = 0
+        for ref t in self._waiting:
+            self._waiting_bytes += len(t.args)
 
     def _inputs_spec(self, t: _Task) -> List[UInt8]:
         """A task-inputs payload for `t`: where each input that lives on a
@@ -2072,6 +2179,7 @@ struct Head(Movable):
         return False
 
     def _enqueue(mut self, var t: _Task):
+        self._queued_bytes += len(t.args)
         var h = self._hash_of(t.object_id)
         if h not in self._queues:
             self._queues[h] = _Queue()
@@ -2115,6 +2223,7 @@ struct Head(Movable):
                     if k != q.head:
                         q.tasks.swap_elements(q.head, k)
                     t = q.tasks[q.head].copy()
+                    self._queued_bytes -= len(t.args)
                     q.head += 1
                     if q.head == len(q.tasks):
                         q.tasks.clear()

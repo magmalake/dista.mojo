@@ -39,6 +39,7 @@ What works today:
 - **Spilling:** past `DISTA_STORE_BYTES` of results, or when the store is full, a worker writes the rest to `DISTA_SPILL_DIR` on disk, and readers map or fetch them as before ([tests/test_spill.mojo](tests/test_spill.mojo)).
 - **Data-aware scheduling:** a task goes to the node holding most of its inputs' bytes, unless that node has no worker free ([tests/locality.sh](tests/locality.sh)).
 - **Speed:** small tasks cost about 6 µs each.
+- **Backpressure:** past `DISTA_MAX_QUEUED` tasks (default 100,000) or `DISTA_MAX_QUEUED_BYTES` of arguments (default 1 GiB) waiting at the head, `remote` blocks until workers catch up ([tests/test_admission.mojo](tests/test_admission.mojo)).
 - **Kubernetes:** one image for every role, and manifests for a head and workers, in [deploy/](deploy). CI runs a smoke test on a 3-node kind cluster.
 - **Parquet:** tasks can read row groups with parquet.mojo and hand them to other tasks as batches ([tests/test_parquet_tasks.mojo](tests/test_parquet_tasks.mojo)).
 - **Iceberg:** a scan planned by iceberg.mojo runs as one task per data file, deletes and filters included, and returns what a local scan returns ([tests/test_iceberg_scan.mojo](tests/test_iceberg_scan.mojo)).
