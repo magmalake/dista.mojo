@@ -2,7 +2,7 @@
 authors = ["Marius S <39998+winding-lines@users.noreply.github.com>"]
 channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "dista.mojo"
-version = "0.1.0"
+version = "0.2.0"
 description = "Distributed tasks for Mojo: mark a function remote, call it, and the work runs across a cluster."
 preview = ["pixi-build"]
 # linux-aarch64 lets the container image build natively on ARM hosts, such as
@@ -38,7 +38,7 @@ bench = { cmd = "mkdir -p build && mojo build -I src $DEP_INC bench/fanout.mojo 
 
 [package]
 name = "dista-mojo"
-version = "0.1.0"
+version = "0.2.0"
 
 [package.build]
 backend = { name = "pixi-build-mojo", version = "0.*" }
