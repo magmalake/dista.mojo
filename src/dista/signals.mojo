@@ -14,6 +14,8 @@ duplicated onto a fixed descriptor, `WAKE_FD`, which the handler writes to.
 
 from std.ffi import c_int, external_call
 
+from dista.socket import fcntl
+
 comptime SIGTERM: c_int = 15
 comptime WAKE_FD: c_int = 250
 """The descriptor a worker's handler writes to: below macOS's default limit
@@ -44,7 +46,7 @@ def wake_on_sigterm() -> c_int:
     be made. Both ends block (setting O_NONBLOCK needs a variadic `fcntl`,
     which `external_call` can't make on Apple's arm64), so read it only once
     `poll` says it's readable."""
-    if external_call["fcntl", c_int](WAKE_FD, _F_GETFD) != -1:
+    if fcntl(WAKE_FD, _F_GETFD, 0) != -1:
         exit_on_sigterm()
         return -1
     var fds = Array[c_int, 2](fill=-1)

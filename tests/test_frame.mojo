@@ -15,7 +15,14 @@ from dista.frame import (
     read_frame,
     write_frame,
 )
-from dista.socket import Listener, Stream, exit_now, fork, wait_child
+from dista.socket import (
+    Listener,
+    Stream,
+    exit_now,
+    fork,
+    send_some,
+    wait_child,
+)
 
 
 def bytes_of(s: String) -> List[UInt8]:
@@ -93,6 +100,30 @@ def test_close_mid_frame_raises() raises:
     c.close()
     with assert_raises(contains="closed"):
         _ = read_frame(s)
+
+
+def test_a_full_socket_doesnt_block_a_send() raises:
+    """`send_some` to a peer that doesn't read returns 0 once the socket is
+    full, rather than wait: macOS ignored MSG_DONTWAIT there, and the head's
+    loop stalled on one slow driver. A blocked send hangs this test."""
+    var l = Listener()
+    var c = Stream.connect(l.port)
+    var s = l.accept()
+    var buf = List[UInt8](length=60_000, fill=1)
+    var total = 0
+    var full = False
+    for _ in range(10_000):  # 600 MB: more than any socket buffers
+        var n = send_some(s.fd, buf.unsafe_ptr(), len(buf))
+        total += n
+        if n == 0:
+            full = True
+            break
+    assert_true(full, "the socket never filled")
+    assert_true(total > 0, "nothing was sent")
+    # The bytes sent still arrive, and `read_into` waits for them.
+    var got = List[UInt8](length=len(buf), fill=0)
+    assert_equal(c.read_into(got.unsafe_ptr(), len(got)), len(got))
+    assert_equal(got[0], 1)
 
 
 def test_fork_and_exit_status() raises:
