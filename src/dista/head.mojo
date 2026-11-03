@@ -33,6 +33,13 @@ queue: backpressure through TCP, with no frame of its own. Clients inside a
 worker's task are read regardless, since pausing one would hold that worker,
 and with every worker held, nothing would drain. 0 turns a limit off.
 
+A driver that doesn't read what the head sends it, busy elsewhere, would
+grow the head's output buffer by every result. Past `DISTA_MAX_DRIVER_BUFFER`
+bytes waiting for it (default 256 MiB), its queued tasks aren't sent to
+workers until it reads; its queue then fills, and admission control stops its
+submissions. A driver waiting to submit reads meanwhile (see `Client`), so
+this doesn't deadlock it.
+
 Every object is reference counted: its driver holds it until it releases it
 (or disconnects), and each submitted task taking it as input holds it until
 that task settles. At zero the head forgets the object and tells the worker
@@ -51,8 +58,12 @@ its copy, the head records where the result is now, and tells the driver
 that owns it. A task sent the old location still finds the result, since the
 draining worker keeps serving until it's gone. Once the worker runs no task
 and holds nothing, the head lets it go, and it leaves without anything
-failing or running again. An actor on a draining worker is restarted
-elsewhere when the worker leaves, as for one lost.
+failing or running again. An actor on a draining worker moves: the head
+holds its new calls, asks for a checkpoint after the ones it sent, and once
+that's written, restores the actor on another worker and sends the held
+calls there, so none runs twice. Without `DISTA_CHECKPOINT_URI` the
+checkpoint fails, and the actor restarts when its worker leaves, replaying
+its calls, as for one lost.
 
 An actor is placed on a worker that hosts no other, the one with the fewest
 tasks in flight, as soon as it's created; the worker builds it once those
@@ -247,6 +258,9 @@ struct _Actor(Copyable, Movable):
     var waiters: List[_Waiter]
     """Checkpoints drivers asked for that aren't written yet, oldest first.
     """
+    var moving: Int
+    """While its worker drains: the calls the checkpoint it moves from
+    covers, with later calls held in `pending`; -1 otherwise."""
 
     def __init__(
         out self, type_id: UInt64, var args: List[UInt8], every: Int = 0
@@ -264,6 +278,7 @@ struct _Actor(Copyable, Movable):
         self.saved = -1
         self.asked = -1
         self.waiters = List[_Waiter]()
+        self.moving = -1
 
 
 @fieldwise_init
@@ -424,6 +439,7 @@ struct Head(Movable):
     from it, to that worker: it stays until they settle, since they may not
     have fetched yet."""
     var _moved: Int
+    var _actors_moved: Int
     var _max_queued: Int
     """`DISTA_MAX_QUEUED`: past this many tasks queued or waiting, drivers
     aren't read; 0, no limit."""
@@ -434,6 +450,9 @@ struct Head(Movable):
     var _waiting_bytes: Int
     """And of those in `_waiting`."""
     var _paused: Bool
+    var _max_driver_buffer: Int
+    """`DISTA_MAX_DRIVER_BUFFER`: past this many bytes waiting for a driver,
+    its tasks wait; 0, no limit."""
     var _pauses: Int
     """Times the head stopped reading drivers, for the metrics."""
 
@@ -518,11 +537,13 @@ struct Head(Movable):
         self._stuck = Dict[UInt64, Bool]()
         self._holdouts = Dict[UInt64, Int]()
         self._moved = 0
+        self._actors_moved = 0
         self._max_queued = _env_int("DISTA_MAX_QUEUED", 100_000)
         self._max_queued_bytes = _env_int("DISTA_MAX_QUEUED_BYTES", 1 << 30)
         self._queued_bytes = 0
         self._waiting_bytes = 0
         self._paused = False
+        self._max_driver_buffer = _env_int("DISTA_MAX_DRIVER_BUFFER", 1 << 28)
         self._pauses = 0
 
     def run(mut self) raises:
@@ -655,6 +676,25 @@ struct Head(Movable):
             ),
             1 if self._paused else 0,
         )
+        var behind = 0
+        if self._max_driver_buffer > 0:
+            for entry in self._driver_conn.items():
+                if (
+                    entry.value not in self._clients
+                    and self._conns[entry.value].unsent()
+                    > self._max_driver_buffer
+                ):
+                    behind += 1
+        write_metric(
+            out,
+            "gauge",
+            "dista_drivers_behind",
+            (
+                "Drivers with more than DISTA_MAX_DRIVER_BUFFER bytes waiting"
+                " for them, whose tasks wait."
+            ),
+            behind,
+        )
         write_metric(
             out,
             "counter",
@@ -716,6 +756,13 @@ struct Head(Movable):
             "dista_actors_waiting",
             "Actors waiting for a worker of their own.",
             len(self._unplaced),
+        )
+        write_metric(
+            out,
+            "counter",
+            "dista_actors_moved_total",
+            "Actors moved off draining workers, from a checkpoint.",
+            self._actors_moved,
         )
         write_metric(
             out,
@@ -1034,6 +1081,8 @@ struct Head(Movable):
                             if self._location.get(d, -1) == i:
                                 self._holdouts[entry.key] = i
                                 break
+                    if self._hosting[i] != 0:
+                        self._move_actor(self._hosting[i])
                 return
             if f.kind == KIND_ADOPTED:
                 self._adopted(i, f^)
@@ -1144,7 +1193,7 @@ struct Head(Movable):
         # actor's state by running it again.
         act.log.append(t.copy())
         act.calls += 1
-        if act.worker < 0:
+        if act.worker < 0 or act.moving >= 0:
             act.pending.append(t^)
         else:
             self._send_to(act.worker, t)
@@ -1160,7 +1209,7 @@ struct Head(Movable):
         var body = List[UInt8]()
         try:
             ref act = self._actors[a]
-            if act.worker < 0 or act.failed:
+            if act.worker < 0 or act.failed or act.moving >= 0:
                 return
             var last = max(act.asked, act.saved)
             var due = act.every > 0 and act.calls - max(last, 0) >= act.every
@@ -1322,6 +1371,8 @@ struct Head(Movable):
                 self._answer_checkpoint(w.object_id, saved)
             else:
                 self._fail(w.object_id, String("checkpoint failed: ", why))
+        if a in self._actors and self._actors[a].moving == calls:
+            self._moved_actor(i, a, ok)
 
     def _send_to(mut self, i: Int, t: _Task):
         """Sends a task or call to worker `i` and counts it in flight there."""
@@ -1742,6 +1793,7 @@ struct Head(Movable):
             if a in self._actors:
                 try:
                     ref act = self._actors[a]
+                    act.moving = -1
                     if not act.failed:
                         # Restart it elsewhere from its last checkpoint or
                         # its constructor, and run every call since again:
@@ -1797,6 +1849,61 @@ struct Head(Movable):
                     if k > 0 and self._answered(part):
                         continue
                     self._fail(part, why.copy())
+
+    def _move_actor(mut self, a: UInt64):
+        """Starts moving actor `a` off its draining worker: holds its new
+        calls, and asks for a checkpoint after those it was sent."""
+        var worker: Int
+        var calls: Int
+        var body = List[UInt8]()
+        try:
+            ref act = self._actors[a]
+            if act.failed or act.worker < 0:
+                return
+            act.moving = act.calls
+            act.asked = act.calls
+            worker = act.worker
+            calls = act.calls
+            put_scalar[DType.int64](body, Int64(act.saved))
+        except:
+            return
+        try:
+            self._conns[worker].send(KIND_CHECKPOINT, a, UInt64(calls), body)
+        except e:
+            print("dista head: lost worker:", e)
+            self._drop(worker)
+
+    def _moved_actor(mut self, i: Int, a: UInt64, ok: Bool):
+        """The checkpoint actor `a` moves from is written, or failed. Written,
+        the actor leaves worker `i` for another, restored from it, with the
+        calls held since; failed, its calls go on to `i`, and it restarts
+        when `i` leaves, as for a worker lost."""
+        try:
+            ref act = self._actors[a]
+            act.moving = -1
+            var held = act.pending.copy()
+            act.pending.clear()
+            if not ok:
+                print(
+                    "dista head: actor",
+                    a,
+                    (
+                        "can't move without a checkpoint; it restarts when its"
+                        " worker leaves"
+                    ),
+                )
+                for ref t in held:
+                    self._send_to(i, t)
+                return
+            # Placed like a restart, but with nothing to replay: the
+            # checkpoint covers every call sent to `i`.
+            act.worker = -1
+            act.pending = held^
+            self._hosting[i] = 0
+            self._unplaced.insert(0, a)
+            self._actors_moved += 1
+        except:
+            pass
 
     def _held_back(self, i: Int) -> Bool:
         """Whether connection `i` is one admission control stops reading: a
@@ -1870,6 +1977,13 @@ struct Head(Movable):
             # it restarts elsewhere. And tasks elsewhere that may still fetch
             # from here.
             var busy = False
+            var a = self._hosting[i]
+            if a != 0 and a in self._actors:
+                try:
+                    if self._actors[a].moving >= 0:
+                        busy = True  # its checkpoint isn't written yet
+                except:
+                    pass
             for obj in self._inflight[i]:
                 if obj in self._running:
                     busy = True
@@ -2096,6 +2210,18 @@ struct Head(Movable):
                 return self._errors.get(d, String())
         return String()
 
+    def _driver_behind(self, obj: UInt64) -> Bool:
+        """Whether the driver `obj` is for has more than
+        `DISTA_MAX_DRIVER_BUFFER` bytes waiting to be sent to it: its tasks
+        wait until it reads. A task's client never waits, as with admission.
+        """
+        if self._max_driver_buffer == 0:
+            return False
+        var j = self._driver_conn.get(owner_of(obj), -1)
+        if j < 0 or j in self._clients:
+            return False
+        return self._conns[j].unsent() > self._max_driver_buffer
+
     def _on_draining(self, t: _Task) -> Bool:
         """Whether an input of `t` is on a draining worker, about to move:
         sent now, `t` would be told to fetch it from there."""
@@ -2157,6 +2283,8 @@ struct Head(Movable):
         var end = min(q.head + LOOKAHEAD, len(q.tasks))
         for k in range(q.head, end):
             if self._on_draining(q.tasks[k]):
+                continue
+            if self._driver_behind(q.tasks[k].object_id):
                 continue
             ref want = q.tasks[k].node
             if want == "":

@@ -103,3 +103,7 @@ struct Conn(Movable):
 
     def wants_write(self) -> Bool:
         return self._out_pos < len(self._out)
+
+    def unsent(self) -> Int:
+        """Bytes queued to send that the peer hasn't taken yet."""
+        return len(self._out) - self._out_pos

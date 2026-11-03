@@ -6,9 +6,12 @@
 # driver reads every result and tasks use each, with nothing failed and no
 # task run again. Twice: with the node store, where an adopting worker maps
 # the file, and with it off (DISTA_SHM=0), where it fetches over a socket.
+# Then an actor's worker: the actor moves from a checkpoint, with no call run
+# twice and no restart.
 set -euo pipefail
 mkdir -p build
 mojo build -I src ${DEP_INC:--I src} tests/drain_driver.mojo -o build/drain-driver
+mojo build -I src ${DEP_INC:--I src} tests/drain_actor.mojo -o build/drain-actor
 
 pids=()
 cleanup() { kill -9 "${pids[@]}" 2>/dev/null || true; }
@@ -71,6 +74,48 @@ run() {
   wait "$head" "${workers[@]:1}" 2>/dev/null || true
 }
 
+run_actor() {
+  local log=build/drain-actor
+  rm -rf "$log"-*.log "$log.go" build/drain-checkpoints
+  export DISTA_CHECKPOINT_URI=build/drain-checkpoints
+  DISTA_ROLE=head DISTA_PORT=0 DISTA_METRICS_PORT=0 ./build/drain-actor > "$log-head.log" 2>&1 &
+  local head=$!; pids+=($head)
+  local port metrics
+  port=$(port_in "$log-head.log" "dista head listening")
+  metrics=$(port_in "$log-head.log" "dista metrics")
+  local workers=()
+  for w in 1 2 3; do
+    DISTA_ROLE=worker DISTA_HEAD=localhost:$port ./build/drain-actor > "$log-worker$w.log" 2>&1 &
+    workers+=($!); pids+=($!)
+  done
+  DRAIN_GO="$log.go" DISTA_HEAD=localhost:$port ./build/drain-actor > "$log-driver.log" 2>&1 &
+  local driver=$!; pids+=($driver)
+  local victim=""
+  for _ in $(seq 300); do
+    victim=$(sed -n 's/^ACTOR //p' "$log-driver.log")
+    [ -n "$victim" ] && break
+    sleep 0.1
+  done
+  [ -n "$victim" ] || { echo "FAIL (actor): the driver never said where its actor is"; cat "$log-driver.log"; exit 1; }
+  kill -TERM "$victim"
+  for _ in $(seq 200); do kill -0 "$victim" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$victim" 2>/dev/null; then echo "FAIL (actor): the worker didn't leave"; exit 1; fi
+  touch "$log.go"
+  wait "$driver" || { echo "FAIL (actor): the driver"; cat "$log-driver.log"; cat "$log-head.log"; exit 1; }
+  local moved restarts failed
+  moved=$(value "$metrics" dista_actors_moved_total)
+  restarts=$(value "$metrics" dista_actor_restarts_total)
+  failed=$(value "$metrics" 'dista_tasks_finished_total{outcome="error"}')
+  echo "actor: $(grep '^PASS' "$log-driver.log"); head: $moved actors moved, $restarts restarts, $failed failed"
+  if [ "${moved:-0}" != 1 ] || [ "${restarts:-1}" != 0 ] || [ "${failed:-1}" != 0 ]; then
+    echo "FAIL (actor): the actor restarted instead of moving"; cat "$log-head.log"; exit 1
+  fi
+  kill -9 "$head" "${workers[@]}" 2>/dev/null || true
+  wait "$head" "${workers[@]}" 2>/dev/null || true
+  unset DISTA_CHECKPOINT_URI
+}
+
 run store 1
 run sockets 0
-echo "PASS drain: a worker given SIGTERM finished its tasks, its results moved, nothing failed or ran again"
+run_actor
+echo "PASS drain: a worker given SIGTERM finished its tasks, its results and its actor moved, nothing failed or ran again"
