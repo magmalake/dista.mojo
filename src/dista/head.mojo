@@ -735,7 +735,10 @@ struct Head(Movable):
             out,
             "gauge",
             "dista_workers_draining",
-            "Workers draining, after SIGTERM or `dista drain`, that haven't left.",
+            (
+                "Workers draining, after SIGTERM or `dista drain`, that haven't"
+                " left."
+            ),
             self._n_draining,
         )
         write_metric(
@@ -960,8 +963,11 @@ struct Head(Movable):
         var work = self._queued() + len(self._waiting) + len(self._running)
         if others == 0 and work > 0:
             return String(
-                "not draining ", addr, ": it's the last worker and ",
-                work, " tasks are queued or running",
+                "not draining ",
+                addr,
+                ": it's the last worker and ",
+                work,
+                " tasks are queued or running",
             )
         self._start_drain(found)
         try:
