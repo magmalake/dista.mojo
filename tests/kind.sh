@@ -74,7 +74,8 @@ if [ -z "$pod" ]; then
   exit 1
 fi
 sleep 2
-# A plain delete: the worker exits on the SIGTERM it sends.
+# A plain delete: the worker drains on the SIGTERM it sends, and the actor
+# moves to another worker.
 echo "deleting the counter's pod $pod"
 kubectl "${ctx[@]}" delete pod "$pod" --wait=false
 status=1
@@ -97,8 +98,11 @@ echo "PASS kind: the counter's pod was deleted mid-run and the count is exact"
 
 after=$(metric dista-head-0 "$ok")
 restarts=$(metric dista-head-0 dista_actor_restarts_total)
-echo "the head has finished $after tasks, and restarted $restarts actors"
-if [ "${after:-0}" -le "${before:-0}" ] || [ "${restarts:-0}" -lt 1 ]; then
+moved=$(metric dista-head-0 dista_actors_moved_total)
+echo "the head has finished $after tasks, restarted $restarts actors and moved $moved"
+# A graceful delete drains the worker, so the actor moves from a checkpoint;
+# without one it restarts. Either way it came back.
+if [ "${after:-0}" -le "${before:-0}" ] || [ $((${restarts:-0} + ${moved:-0})) -lt 1 ]; then
   echo "FAIL: the head's metrics didn't move"; exit 1
 fi
 echo "PASS kind: every pod's /metrics answers, and the head's count climbed"
