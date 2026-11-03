@@ -1,14 +1,16 @@
 """`dista`: a head for any dista program, and a look at a running cluster.
 
     dista head [--port 6390] [--pipeline 2]
-    dista status [--head host:port]
+    dista status [--json] [--head host:port]
+    dista drain WORKER [--head host:port]
     dista timeline -o trace.json [--head host:port]
     dista stop [--head host:port]
 
 The head here is generic: it holds no tasks of its own, so it serves drivers
 and workers built from any program, and gives each driver's tasks and actors
-only to workers built from the same one. `status`, `timeline` and `stop`
-connect as observers. Their head is `--head`, else `DISTA_HEAD`, else
+only to workers built from the same one. `status`, `drain`, `timeline` and
+`stop` connect as observers. `status --json` is the head's demand, for an
+autoscaler; `drain` takes a worker's address as `status` shows it. Their head is `--head`, else `DISTA_HEAD`, else
 `localhost:6390`.
 
 It depends on dista's core alone, so it's built and released on its own,
@@ -25,7 +27,8 @@ from dista.socket import Listener, exit_now
 
 comptime USAGE = """usage:
   dista head [--port 6390] [--pipeline 2]   run a head for any program
-  dista status [--head host:port]           the head's workers, drivers and actors
+  dista status [--json] [--head host:port]  the head's workers, drivers and actors
+  dista drain WORKER [--head host:port]     drain the worker at ip:port, as SIGTERM would
   dista timeline -o FILE [--head host:port] every driver's finished tasks, as a Chrome trace
   dista stop [--head host:port]             shut the head and its workers down"""
 
@@ -40,9 +43,18 @@ def main() raises:
     var pipeline = 2
     var head = getenv("DISTA_HEAD", "localhost:6390")
     var out = String()
+    var json = False
+    var worker = String()
     var i = 2
+    if cmd == "drain" and i < len(args) and not String(args[i]).startswith("-"):
+        worker = String(args[i])
+        i += 1
     while i < len(args):
         var a = String(args[i])
+        if a == "--json":
+            json = True
+            i += 1
+            continue
         if i + 1 >= len(args):
             print("dista: ", a, " needs a value\n", USAGE, sep="")
             exit_now(2)
@@ -68,7 +80,18 @@ def main() raises:
         h.run()
     elif cmd == "status":
         var o = Observer(head)
-        print(o.status(), end="")
+        print(o.status_json() if json else o.status(), end="")
+    elif cmd == "drain":
+        if worker == "":
+            print("dista: drain needs a worker, ip:port\n", USAGE, sep="")
+            exit_now(2)
+        var o = Observer(head)
+        try:
+            o.drain(worker)
+        except e:
+            print("dista: ", e, sep="")
+            exit_now(1)
+        print("draining", worker)
     elif cmd == "timeline":
         if out == "":
             print("dista: timeline needs -o FILE\n", USAGE, sep="")

@@ -34,6 +34,7 @@ from dista.frame import (
     KIND_RESULT,
     KIND_RESUMED,
     KIND_STATS,
+    KIND_DRAIN,
     KIND_STATUS,
     KIND_STOP,
     KIND_TASK,
@@ -261,8 +262,13 @@ struct Observer(Movable):
         self._head = Stream.connect(hp[0], hp[1])
         _ = _hello(self._head, ROLE_OBSERVER, 0)
 
-    def _ask(mut self, kind: UInt8) raises -> Frame:
-        write_frame(self._head, kind, 0, 0, List[UInt8]())
+    def _ask(
+        mut self,
+        kind: UInt8,
+        object_id: UInt64 = 0,
+        payload: List[UInt8] = List[UInt8](),
+    ) raises -> Frame:
+        write_frame(self._head, kind, object_id, 0, payload)
         var f = read_frame(self._head)
         if not f:
             raise Error("the head closed the connection")
@@ -275,6 +281,23 @@ struct Observer(Movable):
     def status(mut self) raises -> String:
         """The head's workers, drivers and actors, as text."""
         return message(self._ask(KIND_STATUS).payload)
+
+    def status_json(mut self) raises -> String:
+        """The head's demand and its workers, as one JSON object: tasks
+        ready, waiting for inputs and running, actors waiting for a worker,
+        and each worker's address, node, tasks in flight, seconds idle,
+        bytes held, actor and whether it's draining."""
+        return message(self._ask(KIND_STATUS, 1).payload)
+
+    def drain(mut self, worker: String) raises:
+        """Drains the worker whose object server is at `worker`, `ip:port`,
+        as SIGTERM would: it takes no new work, what it holds moves, and it
+        exits once it's done. Raises if the head won't."""
+        var why = message(
+            self._ask(KIND_DRAIN, 0, List[UInt8](worker.as_bytes())).payload
+        )
+        if why:
+            raise Error(why)
 
     def spans(mut self) raises -> List[TaskSpan]:
         """Every driver's finished tasks the head still holds."""
