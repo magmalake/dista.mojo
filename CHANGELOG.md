@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and each worker's tasks in flight, seconds idle and bytes held. `/metrics`
   adds `dista_tasks_ready`, `dista_tasks_waiting`, `dista_tasks_running` and
   `dista_workers_idle`.
+- **`dista.scale`**: `decide(demand, policy, now, pending, short_since)`
+  says how many workers to start and which to drain, from
+  `Demand.parse(status_json)` and a `Policy` (`min_workers`, which may be 0,
+  `max_workers`, `tasks_per_worker`, `up_after`, `idle_before_down`,
+  `max_step`). It has no clock or I/O of its own.
 - **`dista drain <ip:port>`** drains one worker from an observer, the same
   drain as SIGTERM's, for a provider that can't signal the worker's process.
 
