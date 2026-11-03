@@ -25,6 +25,13 @@ checkpoint: the worker writes the state through the codec to
 `DISTA_CHECKPOINT_URI` (see `checkpoint.mojo`), and deletes the checkpoint
 before it. An actor restarted elsewhere is restored from the last one.
 
+A worker told to stop (SIGTERM, as Kubernetes sends) drains: it tells the
+head, which sends it no more work and has other workers adopt the results it
+holds, each fetching its copy from here. It finishes what it was given, and
+once the head says stop, it serves fetches a moment longer, for tasks given
+its old locations, and exits. `DISTA_DRAIN_SECONDS` (default 25, inside
+Kubernetes' default grace period of 30) bounds the whole drain.
+
 If the head goes away, `run` returns and the results here stay. `rejoin`
 introduces the worker to a new head and reports what it holds; the tasks it
 had queued are dropped, since their drivers resubmit them. An actor it
@@ -43,8 +50,11 @@ from dista.frame import (
     KIND_ACTOR_CREATE,
     KIND_ACTOR_KILL,
     KIND_ACTOR_RESTORE,
+    KIND_ADOPT,
+    KIND_ADOPTED,
     KIND_CHECKPOINT,
     KIND_CHECKPOINTED,
+    KIND_DRAIN,
     KIND_ERROR,
     KIND_FETCH,
     KIND_FREE,
@@ -80,6 +90,7 @@ from dista.metrics import (
     write_outcomes,
 )
 from dista.head import owner_of
+from dista.signals import take_wakes, wake_on_sigterm
 from dista.task import StatePtr, split_parts
 from dista.store import (
     Location,
@@ -107,6 +118,9 @@ from dista.socket import (
 
 comptime INLINE_LIMIT = 64 * 1024
 """Results up to this size travel through the head; larger ones stay put."""
+comptime LINGER_NS: UInt64 = 1_000_000_000
+"""How long a drained worker keeps serving fetches after the head says stop:
+a task sent before its inputs moved may still fetch them from here."""
 
 comptime DispatchFn = def(
     UInt64, List[UInt8], mut List[UInt8], mut TaskContext
@@ -355,8 +369,18 @@ struct Worker[
     """Tasks and actor frames finished here, failed ones included."""
     var _failed: Int
     var _durations: Histogram
+    var _wake_fd: c_int
+    """The pipe SIGTERM writes to (see `signals.mojo`), or -1."""
+    var _draining: Bool
+    var _deadline: UInt64
+    """When a drain gives up and the worker leaves anyway."""
+    var _leave_at: UInt64
+    """Once the head lets a draining worker go: when it exits; else 0."""
+    var _adopting: Dict[UInt64, Bool]
+    """Results the head asked this worker to adopt, being fetched."""
+    var _adopted: Int
     var stopped: Bool
-    """The head said stop: `run` returned for good."""
+    """The head said stop, or the worker drained: `run` returned for good."""
 
     def __init__(
         out self,
@@ -416,6 +440,12 @@ struct Worker[
         self._ran = 0
         self._failed = 0
         self._durations = Histogram()
+        self._wake_fd = wake_on_sigterm()
+        self._draining = False
+        self._deadline = 0
+        self._leave_at = 0
+        self._adopting = Dict[UInt64, Bool]()
+        self._adopted = 0
         self.stopped = False
 
     @staticmethod
@@ -462,10 +492,30 @@ struct Worker[
             remove_file(entry.value.path)
 
     def run(mut self) raises:
-        """Serves until the head hangs up."""
+        """Serves until the head hangs up, or until a drain ends."""
         while True:
-            self._poll_once(timeout_ms=0 if len(self._ready) > 0 else -1)
+            var timeout = -1
+            if len(self._ready) > 0:
+                timeout = 0
+            elif self._draining:
+                timeout = 100  # to notice the deadline, or the linger's end
+            self._poll_once(timeout_ms=timeout)
+            if self._draining:
+                var now = wall_ns()
+                if self._leave_at != 0 and now >= self._leave_at:
+                    print("dista worker: drained")
+                    self.stopped = True
+                    return
+                if now >= self._deadline:
+                    print(
+                        "dista worker: DISTA_DRAIN_SECONDS passed; leaving"
+                        " undrained"
+                    )
+                    self.stopped = True
+                    return
             if self._head.closed:
+                if self._draining:
+                    self.stopped = True
                 return
             self._unpark()
             if len(self._ready) > 0:
@@ -482,6 +532,9 @@ struct Worker[
             events.append(self._events(self._peers[i]))
         if self._metrics:
             fds.append(self._metrics.value().fd)
+            events.append(POLLIN)
+        if self._wake_fd >= 0:
+            fds.append(self._wake_fd)
             events.append(POLLIN)
         # Handling frames can accept a fetcher or open a peer connection; only
         # the connections that were polled have results.
@@ -524,8 +577,16 @@ struct Worker[
                         break
                     self._from_peer(f.take())
             k += 1
-        if self._metrics and rev[k] & POLLIN:
-            answer_scrape(self._metrics.value(), self._page())
+        if self._metrics:
+            if rev[k] & POLLIN:
+                answer_scrape(self._metrics.value(), self._page())
+            k += 1
+        if self._wake_fd >= 0 and rev[k] & POLLIN:
+            if take_wakes(self._wake_fd) > 0:
+                if self._draining:
+                    # A second SIGTERM: leave now.
+                    external_call["_exit", NoneType](c_int(143))
+                self._start_drain()
         for j in range(len(dead) - 1, -1, -1):
             _ = self._serving.pop(dead[j])
         if rev[1] & POLLIN:
@@ -587,9 +648,18 @@ struct Worker[
                 )
             )
         elif f.kind == KIND_STOP:
-            # `dista stop`: leave for good, instead of waiting to rejoin.
-            self.stopped = True
-            self._head.closed = True
+            if self._draining:
+                # Drained: serve late fetches a moment, then go.
+                if self._leave_at == 0:
+                    self._leave_at = wall_ns() + LINGER_NS
+            else:
+                # `dista stop`: leave for good, instead of waiting to rejoin.
+                self.stopped = True
+                self._head.closed = True
+        elif f.kind == KIND_ADOPT:
+            var pos = 0
+            var loc = Location.decode(f.payload, pos)
+            self._adopt(f.object_id, loc)
         elif f.kind == KIND_FREE:
             _ = self._objects.pop(f.object_id, List[UInt8]())
             if f.object_id in self._files:
@@ -628,12 +698,77 @@ struct Worker[
 
     def _from_peer(mut self, var f: Frame) raises:
         _ = self._requested.pop(f.object_id, False)
+        var obj = f.object_id
+        var adopting = self._adopting.pop(obj, False)
         if f.kind == KIND_RESULT:
-            var obj = f.object_id
             self._fetched[obj] = True
             self._objects[obj] = f^.take_payload()
+            if adopting:
+                self._keep(obj, self._objects[obj].copy())
         else:
-            self._lost[f.object_id] = message(f.payload)
+            self._lost[obj] = message(f.payload)
+            if adopting:
+                var why = self._lost[obj]
+                self._refuse(obj, why)
+
+    def _start_drain(mut self):
+        """SIGTERM: ask the head for no more work, and to move what's here."""
+        var secs = 25
+        try:
+            secs = Int(getenv("DISTA_DRAIN_SECONDS", "25"))
+        except:
+            pass
+        self._draining = True
+        self._deadline = wall_ns() + UInt64(max(secs, 0)) * 1_000_000_000
+        print("dista worker: draining")
+        self._to_head(KIND_DRAIN, 0, List[UInt8]())
+
+    def _adopt(mut self, obj: UInt64, loc: Location) raises:
+        """Takes `obj` from a draining worker at `loc`, as this one's own."""
+        if obj in self._files or (
+            obj in self._objects and obj not in self._fetched
+        ):
+            self._refuse(obj, String("object ", obj, " is already here"))
+            return
+        if obj in self._objects:
+            # Fetched already, as a task's input.
+            self._keep(obj, self._objects[obj].copy())
+            return
+        if loc.is_local():
+            try:
+                self._keep(obj, read_shared(loc.path, loc.size))
+            except e:
+                self._refuse(obj, String(e))
+            return
+        self._adopting[obj] = True
+        if obj in self._requested:
+            return  # on its way, for a task: `_from_peer` keeps it too
+        self._request(obj, loc.ip, loc.port)
+        if obj not in self._requested:
+            _ = self._adopting.pop(obj, False)
+            self._refuse(obj, self._lost.pop(obj, String("unreachable")))
+
+    def _keep(mut self, obj: UInt64, var data: List[UInt8]):
+        """Stores an adopted result as if this worker had made it, and tells
+        the head where it is now."""
+        var path = self._write(obj, data)
+        var loc = Location(self._ip, self._port, self._node, path, len(data))
+        if path != "":
+            self._files[obj] = loc.copy()
+        else:
+            self._objects[obj] = data^
+            _ = self._fetched.pop(obj, False)
+        self._adopted += 1
+        var body: List[UInt8] = [1]
+        body.extend(loc.encode())
+        self._to_head(KIND_ADOPTED, obj, body)
+
+    def _refuse(mut self, obj: UInt64, why: String):
+        """Tells the head this worker couldn't adopt `obj`."""
+        print("dista worker: couldn't adopt", obj, ":", why)
+        var body: List[UInt8] = [0]
+        body.extend(why.as_bytes())
+        self._to_head(KIND_ADOPTED, obj, body)
 
     def _serve_fetch(mut self, i: Int, var f: Frame) raises:
         if f.kind != KIND_FETCH:
@@ -773,6 +908,20 @@ struct Worker[
                 " full."
             ),
             self._spilled,
+        )
+        write_metric(
+            out,
+            "counter",
+            "dista_worker_results_adopted_total",
+            "Results this worker took from draining workers.",
+            self._adopted,
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_worker_draining",
+            "1 while this worker drains, after SIGTERM.",
+            1 if self._draining else 0,
         )
         write_metric(
             out,

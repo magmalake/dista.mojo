@@ -37,6 +37,15 @@ reconnects under its old number and restores, claims or resubmits everything
 it still needs (see `frame.mojo`). A reported result no resumed driver
 claimed is freed. A task that was running when the head died may run again.
 
+A worker told to stop drains (see `worker.mojo`). The head sends it no more
+tasks and has the other workers adopt every result it holds: each fetches
+its copy, the head records where the result is now, and tells the driver
+that owns it. A task sent the old location still finds the result, since the
+draining worker keeps serving until it's gone. Once the worker runs no task
+and holds nothing, the head lets it go, and it leaves without anything
+failing or running again. An actor on a draining worker is restarted
+elsewhere when the worker leaves, as for one lost.
+
 An actor is placed on a worker that hosts no other, the one with the fewest
 tasks in flight, as soon as it's created; the worker builds it once those
 tasks finish. From then on the head sends that worker only the actor's calls,
@@ -75,10 +84,13 @@ from dista.frame import (
     KIND_ACTOR_CREATE,
     KIND_ACTOR_KILL,
     KIND_ACTOR_RESTORE,
+    KIND_ADOPT,
+    KIND_ADOPTED,
     KIND_CHECKPOINT,
     KIND_CHECKPOINTED,
     KIND_CLAIM,
     KIND_COVERED,
+    KIND_DRAIN,
     KIND_ERROR,
     KIND_FREE,
     KIND_HELLO,
@@ -134,6 +146,9 @@ comptime MAX_SPANS = 1_000_000
 """Finished task spans the head keeps per driver until it asks for them."""
 comptime _ROLE_NONE: UInt8 = 0
 comptime _ROLE_GONE: UInt8 = 255
+comptime _DRAIN_NO: UInt8 = 0
+comptime _DRAIN_YES: UInt8 = 1
+comptime _DRAIN_LET_GO: UInt8 = 2
 
 
 def owner_of(object_id: UInt64) -> UInt64:
@@ -166,7 +181,9 @@ struct _Task(Copyable, Movable):
     var deps: List[UInt64]
     var gather: Bool
     var kind: UInt8
-    """`KIND_TASK` with the argument, or `KIND_TASK_INPUTS` with input specs."""
+    """`KIND_TASK` with the argument, or `KIND_TASK_INPUTS`, whose input specs
+    the head writes as it sends the task, from where its inputs are then
+    (`_inputs_spec`); `args` is then a `TaskWith`'s value, or empty."""
     var node: String
     """The node holding more than half of this task's input bytes, which a
     worker there takes first; "" for none."""
@@ -373,6 +390,20 @@ struct Head(Movable):
     """Tasks sent again because their worker went away."""
     var _checkpoints: Int
     var _checkpoint_failures: Int
+    var _draining: List[UInt8]
+    """For each connection: `_DRAIN_NO`, `_DRAIN_YES` while a worker drains,
+    or `_DRAIN_LET_GO` once it's been told it may leave."""
+    var _n_draining: Int
+    var _moving: Dict[UInt64, Int]
+    """Results being adopted from draining workers, to the adopting worker.
+    """
+    var _stuck: Dict[UInt64, Bool]
+    """Results no worker could adopt: they go with their worker."""
+    var _holdouts: Dict[UInt64, Int]
+    """Tasks sent, before a worker started draining, where to fetch inputs
+    from it, to that worker: it stays until they settle, since they may not
+    have fetched yet."""
+    var _moved: Int
 
     def __init__(
         out self,
@@ -449,12 +480,20 @@ struct Head(Movable):
         self._restarts = 0
         self._checkpoints = 0
         self._checkpoint_failures = 0
+        self._draining = List[UInt8]()
+        self._n_draining = 0
+        self._moving = Dict[UInt64, Int]()
+        self._stuck = Dict[UInt64, Bool]()
+        self._holdouts = Dict[UInt64, Int]()
+        self._moved = 0
 
     def run(mut self) raises:
         """Serves until the last driver leaves, in local mode; else forever."""
         while True:
             self._release_waiting()
             self._dispatch()
+            if self._n_draining > 0:
+                self._drain()
             if self._exit_when_idle and self._drivers_seen:
                 if len(self._driver_conn) == len(self._clients):
                     self._shutdown()
@@ -577,6 +616,20 @@ struct Head(Movable):
         write_metric(
             out,
             "gauge",
+            "dista_workers_draining",
+            "Workers draining, after SIGTERM, that haven't left.",
+            self._n_draining,
+        )
+        write_metric(
+            out,
+            "counter",
+            "dista_results_moved_total",
+            "Results moved off draining workers.",
+            self._moved,
+        )
+        write_metric(
+            out,
+            "gauge",
             "dista_drivers",
             "Drivers connected, not counting tasks' clients.",
             len(self._driver_conn) - len(self._clients),
@@ -678,6 +731,8 @@ struct Head(Movable):
             )
             if self._hosting[i] != 0:
                 out += String("  actor ", self._hosting[i])
+            if self._draining[i] != _DRAIN_NO:
+                out += "  draining"
             out += "\n"
         out += "drivers:\n"
         for entry in self._driver_conn.items():
@@ -721,6 +776,7 @@ struct Head(Movable):
         self._node.append(String())
         self._hosting.append(0)
         self._hashes.append(0)
+        self._draining.append(_DRAIN_NO)
         return len(self._conns) - 1
 
     def _handle(mut self, i: Int, var f: Frame) raises:
@@ -891,6 +947,22 @@ struct Head(Movable):
                 return
             if f.kind == KIND_CHECKPOINTED:
                 self._checkpointed(i, f^)
+                return
+            if f.kind == KIND_DRAIN:
+                if self._draining[i] == _DRAIN_NO:
+                    print("dista head: worker", self._addr(i), "is draining")
+                    self._draining[i] = _DRAIN_YES
+                    self._n_draining += 1
+                    for entry in self._running.items():
+                        if entry.value.kind != KIND_TASK_INPUTS:
+                            continue
+                        for d in entry.value.deps:
+                            if self._location.get(d, -1) == i:
+                                self._holdouts[entry.key] = i
+                                break
+                return
+            if f.kind == KIND_ADOPTED:
+                self._adopted(i, f^)
                 return
             if f.kind == KIND_SPAN:
                 if f.object_id in self._spans:
@@ -1207,7 +1279,7 @@ struct Head(Movable):
             for i in range(len(self._conns)):
                 if self._roles[i] != ROLE_WORKER or self._hosting[i] != 0:
                     continue
-                if self._hashes[i] != h:
+                if self._hashes[i] != h or self._draining[i] != _DRAIN_NO:
                     continue
                 if best < 0 or len(self._inflight[i]) < len(
                     self._inflight[best]
@@ -1527,6 +1599,7 @@ struct Head(Movable):
 
     def _free(mut self, object_id: UInt64):
         """Forgets a settled object, and has its worker delete it."""
+        _ = self._stuck.pop(object_id, False)
         _ = self._results.pop(object_id, List[UInt8]())
         _ = self._errors.pop(object_id, String())
         _ = self._where.pop(object_id, List[UInt8]())
@@ -1573,6 +1646,22 @@ struct Head(Movable):
                         self._dec(obj)
         elif role == ROLE_WORKER:
             self._workers_lost += 1
+            if self._draining[i] != _DRAIN_NO:
+                self._draining[i] = _DRAIN_NO
+                self._n_draining -= 1
+            # Results it was adopting stay where they were, to move again.
+            var adopting = List[UInt64]()
+            for entry in self._moving.items():
+                if entry.value == i:
+                    adopting.append(entry.key)
+            for obj in adopting:
+                _ = self._moving.pop(obj, -1)
+            var holding_out = List[UInt64]()
+            for entry in self._holdouts.items():
+                if entry.value == i:
+                    holding_out.append(entry.key)
+            for obj in holding_out:
+                _ = self._holdouts.pop(obj, -1)
             var a = self._hosting[i]
             self._hosting[i] = 0
             var replays = Dict[UInt64, Bool]()
@@ -1634,6 +1723,115 @@ struct Head(Movable):
                     if k > 0 and self._answered(part):
                         continue
                     self._fail(part, why.copy())
+
+    def _drain(mut self):
+        """Moves draining workers' results to other workers, and lets each
+        draining worker go once it runs no task and holds nothing."""
+        for i in range(len(self._conns)):
+            if self._roles[i] != ROLE_WORKER:
+                continue
+            if self._draining[i] != _DRAIN_YES:
+                continue
+            var here = List[UInt64]()
+            for entry in self._location.items():
+                if entry.value == i and entry.key not in self._stuck:
+                    here.append(entry.key)
+            var waiting = False
+            for obj in here:
+                if obj in self._moving:
+                    waiting = True
+                    continue
+                var j = self._adopter(i)
+                if j < 0:
+                    continue  # nowhere to go: it leaves with its worker
+                waiting = True
+                self._moving[obj] = j
+                try:
+                    self._conns[j].send(
+                        KIND_ADOPT, obj, 0, self._where.get(obj, List[UInt8]())
+                    )
+                except e:
+                    print("dista head: lost worker:", e)
+                    self._drop(j)
+            if waiting:
+                continue
+            # Tasks still running here; an actor's calls don't count, since
+            # it restarts elsewhere. And tasks elsewhere that may still fetch
+            # from here.
+            var busy = False
+            for obj in self._inflight[i]:
+                if obj in self._running:
+                    busy = True
+            var done = List[UInt64]()
+            for entry in self._holdouts.items():
+                if entry.value != i:
+                    continue
+                if entry.key in self._running:
+                    busy = True
+                else:
+                    done.append(entry.key)
+            for obj in done:
+                _ = self._holdouts.pop(obj, -1)
+            if busy:
+                continue
+            self._draining[i] = _DRAIN_LET_GO
+            try:
+                self._conns[i].send(KIND_STOP, 0, 0, List[UInt8]())
+            except e:
+                print("dista head: lost worker:", e)
+                self._drop(i)
+
+    def _adopter(self, i: Int) -> Int:
+        """The worker to take a result off draining worker `i`: one not
+        draining, on `i`'s node if one is, with the fewest tasks in flight;
+        -1 if there's none."""
+        var best = -1
+        for j in range(len(self._conns)):
+            if j == i or self._roles[j] != ROLE_WORKER:
+                continue
+            if self._draining[j] != _DRAIN_NO:
+                continue
+            if best < 0:
+                best = j
+                continue
+            var same = self._node[j] == self._node[i]
+            var best_same = self._node[best] == self._node[i]
+            if same != best_same:
+                if same:
+                    best = j
+            elif len(self._inflight[j]) < len(self._inflight[best]):
+                best = j
+        return best
+
+    def _adopted(mut self, j: Int, var f: Frame) raises:
+        """Worker `j` took a draining worker's result, or couldn't."""
+        var obj = f.object_id
+        _ = self._moving.pop(obj, -1)
+        if len(f.payload) < 1:
+            raise Error("truncated adopted")
+        if f.payload[0] != 1:
+            print(
+                "dista head: worker",
+                self._addr(j),
+                "couldn't adopt",
+                obj,
+                ":",
+                message(f.payload[1:]),
+            )
+            self._stuck[obj] = True
+            return
+        var loc = List[UInt8](f.payload[1:])
+        if obj not in self._location:
+            # Freed, or lost, while it moved: this copy isn't needed.
+            self._conns[j].send(KIND_FREE, obj, 0, List[UInt8]())
+            return
+        # The old copy stays until its worker leaves: a task may have been
+        # sent its location.
+        self._location[obj] = j
+        self._where[obj] = loc.copy()
+        self._learn_node(j, loc)
+        self._moved += 1
+        self._deliver(obj, KIND_LOCATED, loc)
 
     def _fail_queued(mut self):
         """Fails every queued task: in local mode, with every worker gone,
@@ -1726,43 +1924,73 @@ struct Head(Movable):
                 self._enqueue(_Task(id, t.task_id, args^, kind=kind))
                 self._stamp_queued(id)
             else:
-                # Some inputs live on workers: tell the worker that runs this
-                # task where to fetch them, and pass the rest inline.
-                var flags = GATHER if t.gather else UInt8(0)
-                if len(t.args) > 0:
-                    flags |= WITH_VALUE
-                if t.many > 0:
-                    flags |= MANY
-                var spec: List[UInt8] = [flags]
-                if t.many > 0:
-                    put_scalar[DType.uint64](spec, UInt64(t.many))
-                put_scalar[DType.uint64](spec, UInt64(len(t.deps)))
-                for d in t.deps:
-                    if d in self._location:
-                        spec.append(1)
-                        put_scalar[DType.uint64](spec, d)
-                        spec.extend(self._where.get(d, List[UInt8]()))
-                    else:
-                        var r = self._results.get(d, List[UInt8]())
-                        spec.append(0)
-                        put_scalar[DType.uint64](spec, d)
-                        put_scalar[DType.uint64](spec, UInt64(len(r)))
-                        spec.extend(r^)
-                if len(t.args) > 0:
-                    put_scalar[DType.uint64](spec, UInt64(len(t.args)))
-                    spec.extend(t.args.copy())
+                # Some inputs live on workers: the worker that runs this task
+                # is told where to fetch them as it's sent the task.
                 var id = t.object_id
                 self._enqueue(
                     _Task(
                         id,
                         t.task_id,
-                        spec^,
+                        t.args.copy(),
+                        deps=t.deps.copy(),
+                        gather=t.gather,
                         kind=KIND_TASK_INPUTS,
                         node=self._preferred_node(t.deps),
+                        many=t.many,
                     )
                 )
                 self._stamp_queued(id)
         self._waiting = still^
+
+    def _inputs_spec(self, t: _Task) -> List[UInt8]:
+        """A task-inputs payload for `t`: where each input that lives on a
+        worker is now, and the rest inline. Written as the task is sent, so
+        it names where an input moved to from a draining worker."""
+        var flags = GATHER if t.gather else UInt8(0)
+        if len(t.args) > 0:
+            flags |= WITH_VALUE
+        if t.many > 0:
+            flags |= MANY
+        var spec: List[UInt8] = [flags]
+        if t.many > 0:
+            put_scalar[DType.uint64](spec, UInt64(t.many))
+        put_scalar[DType.uint64](spec, UInt64(len(t.deps)))
+        for d in t.deps:
+            if d in self._location:
+                spec.append(1)
+                put_scalar[DType.uint64](spec, d)
+                spec.extend(self._where.get(d, List[UInt8]()))
+            else:
+                var r = self._results.get(d, List[UInt8]())
+                spec.append(0)
+                put_scalar[DType.uint64](spec, d)
+                put_scalar[DType.uint64](spec, UInt64(len(r)))
+                spec.extend(r^)
+        if len(t.args) > 0:
+            put_scalar[DType.uint64](spec, UInt64(len(t.args)))
+            spec.extend(t.args.copy())
+        return spec^
+
+    def _input_failed(self, t: _Task) -> String:
+        """Why a queued task's input failed while it waited, as when its
+        worker left with it; "" if none did."""
+        if t.kind != KIND_TASK_INPUTS:
+            return String()
+        for d in t.deps:
+            if d in self._errors:
+                return self._errors.get(d, String())
+        return String()
+
+    def _on_draining(self, t: _Task) -> Bool:
+        """Whether an input of `t` is on a draining worker, about to move:
+        sent now, `t` would be told to fetch it from there."""
+        if self._n_draining == 0 or t.kind != KIND_TASK_INPUTS:
+            return False
+        for d in t.deps:
+            var j = self._location.get(d, -1)
+            if j >= 0 and self._draining[j] != _DRAIN_NO:
+                return True
+        return False
 
     def _queued(self) -> Int:
         var n = 0
@@ -1813,6 +2041,8 @@ struct Head(Movable):
         var fallback = -1
         var end = min(q.head + LOOKAHEAD, len(q.tasks))
         for k in range(q.head, end):
+            if self._on_draining(q.tasks[k]):
+                continue
             ref want = q.tasks[k].node
             if want == "":
                 if fallback < 0:
@@ -1834,6 +2064,7 @@ struct Head(Movable):
                 and self._roles[j] == ROLE_WORKER
                 and self._hosting[j] == 0
                 and self._hashes[j] == self._hashes[i]
+                and self._draining[j] == _DRAIN_NO
                 and self._node[j] == node
                 and len(self._inflight[j]) <= depth
             ):
@@ -1866,6 +2097,8 @@ struct Head(Movable):
             for i in range(len(self._conns)):
                 if self._roles[i] != ROLE_WORKER or self._hosting[i] != 0:
                     continue
+                if self._draining[i] != _DRAIN_NO:
+                    continue
                 if len(self._inflight[i]) != depth:
                     continue
                 var h = self._hashes[i]
@@ -1896,12 +2129,23 @@ struct Head(Movable):
                         sp.dispatched = wall_ns()
                     except:
                         pass
+                var failed = self._input_failed(t)
+                if failed:
+                    _ = self._inflight[i].pop()
+                    self._fail_all(
+                        t.object_id, String("input failed: ", failed)
+                    )
+                    continue
                 self._tries[t.object_id] = self._tries.get(t.object_id, 0) + 1
+                var body = (
+                    self._inputs_spec(t) if t.kind
+                    == KIND_TASK_INPUTS else t.args.copy()
+                )
                 var sent = t.copy()
                 self._running[t.object_id] = t^
                 try:
                     self._conns[i].send(
-                        sent.kind, sent.object_id, sent.task_id, sent.args
+                        sent.kind, sent.object_id, sent.task_id, body
                     )
                 except e:
                     print("dista head: lost worker:", e)

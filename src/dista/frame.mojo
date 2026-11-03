@@ -39,6 +39,9 @@ Every frame is a 4-byte little-endian length, then that many bytes:
 | 26 status | observer to head, head to observer | none; the reply is the head's state as UTF-8 text |
 | 27 stop | observer to head, head to worker | none: shut down; a worker exits instead of rejoining |
 | 28 task-many | driver to head, head to worker | the number of results u64, then the encoded argument; the results are this object ID and the ones after it |
+| 29 drain | worker to head | none: the worker was told to stop; it takes no more work, and leaves once the head says stop |
+| 30 adopt | head to worker | a draining worker's location of the object: fetch it and keep it |
+| 31 adopted | worker to head | 1 and the object's new location, or 0 and why not |
 
 An observer (`dista status`, `timeline`, `stop`) says hello without a
 registry and owns no objects. Its timeline frame gets every driver's
@@ -119,6 +122,15 @@ comptime KIND_COVERED: UInt8 = 25
 comptime KIND_STATUS: UInt8 = 26
 comptime KIND_STOP: UInt8 = 27
 comptime KIND_TASK_MANY: UInt8 = 28
+comptime KIND_DRAIN: UInt8 = 29
+"""Worker to head: it was told to stop (SIGTERM), so send it no more work and
+move what it holds; the head says `KIND_STOP` once it may go."""
+comptime KIND_ADOPT: UInt8 = 30
+"""Head to worker: fetch object `object_id` from the location in the payload,
+a draining worker's, and keep it as its own."""
+comptime KIND_ADOPTED: UInt8 = 31
+"""Worker to head: 1 and the object's new location, or 0 and why it couldn't
+take it."""
 comptime GATHER: UInt8 = 1
 """Task-after and task-inputs flag: the inputs gather into a `Seq`."""
 comptime WITH_VALUE: UInt8 = 2

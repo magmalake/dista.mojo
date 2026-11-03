@@ -6,7 +6,10 @@
 # trips by zone pair and hour as map and reduce tasks, checked against one
 # process too. Then phase 4's gate: the queries again, many passes, with a
 # worker pod killed partway; every answer must still be exact, and the head
-# must have run the dead worker's tasks again.
+# must have run the dead worker's tasks again. Last, the shuffle again, with
+# a worker pod deleted the way Kubernetes stops one, with SIGTERM and a grace
+# period: the worker drains, its map outputs move to the others, and nothing
+# runs again.
 #
 # Needs docker, kind, kubectl, the taxi warehouse (taxibench.example's
 # scripts/load.sh builds it), and the data environment's siblings checked out
@@ -32,7 +35,10 @@ esac
 # compiles, side by side, without build output.
 stage=build/taxi-context
 rm -rf "$stage" && mkdir -p "$stage"
-for repo in dista memory-region arrow-mlake parquet iceberg threads thrift \
+# dista itself from this checkout, which needn't be ../dista.mojo (a
+# worktree isn't).
+rsync -a --exclude .pixi --exclude build --exclude .git ./ "$stage/dista.mojo/"
+for repo in memory-region arrow-mlake parquet iceberg threads thrift \
     hashes snappy deflate avro roaring objectstore zstd lz4 brotli sqlite \
     postgres; do
   rsync -a --exclude .pixi --exclude build --exclude .git \
@@ -61,11 +67,12 @@ ctx=(--context "kind-$cluster")
 
 # Runs program $1 (in /opt/dista/bin) as the workers and the driver, and
 # checks the driver's log has a line starting with $2. With $3 = kill, it
-# runs 20 passes and kills a worker pod once the first query is done.
+# runs 20 passes and kills a worker pod once the first query is done; with
+# $3 = drain, it deletes one gracefully instead.
 run_program() {
   local program=$1 pass=$2 kill=${3:-}
   local passes=1
-  [ "$kill" = kill ] && passes=20
+  [ -n "$kill" ] && passes=20
   sed -e "s|@TAXI_METADATA@|$metadata|" -e "s|@TAXI_PREFIX@|$prefix|" \
     -e "s|@PROGRAM@|/opt/dista/bin/$program|" -e "s|@PASSES@|$passes|" \
     deploy/k8s/taxi.yaml > build/taxi.yaml
@@ -77,17 +84,29 @@ run_program() {
   kubectl "${ctx[@]}" rollout status deployment/dista-worker --timeout=120s
   kubectl "${ctx[@]}" get pods -o wide
 
-  if [ "$kill" = kill ]; then
-    # Once the first query's first pass is done, kill a worker outright: no
-    # grace period, as a node failure would. Its replacement joins the head.
+  if [ -n "$kill" ]; then
+    # Once the first query's first pass is done, kill a worker outright, as
+    # a crash would, or stop it as Kubernetes does (SIGTERM, then its grace
+    # period). Its restarted container, or its replacement, joins the head.
     for _ in $(seq 300); do
       kubectl "${ctx[@]}" logs job/dista-taxi 2>/dev/null | grep -q '^TIME ' && break
       sleep 1
     done
     local victim
     victim=$(kubectl "${ctx[@]}" get pods -l app=dista-taxi,role=worker -o name | head -1)
-    echo "killing $victim"
-    kubectl "${ctx[@]}" delete "$victim" --grace-period=0 --force --wait=false
+    if [ "$kill" = kill ]; then
+      # SIGKILL from its node, as a crash: deleting the pod, even with no
+      # grace period, sends SIGTERM first, and the worker would drain.
+      echo "killing $victim"
+      local node cid pid
+      node=$(kubectl "${ctx[@]}" get "$victim" -o jsonpath='{.spec.nodeName}')
+      cid=$(kubectl "${ctx[@]}" get "$victim" -o jsonpath='{.status.containerStatuses[0].containerID}')
+      pid=$(docker exec "$node" crictl inspect --output go-template --template '{{.info.pid}}' "${cid#containerd://}")
+      docker exec "$node" kill -9 "$pid"
+    else
+      echo "stopping $victim"
+      kubectl "${ctx[@]}" delete "$victim" --wait=false
+    fi
   fi
 
   # Wait for the job to succeed or fail, whichever comes first.
@@ -105,22 +124,28 @@ run_program() {
     kubectl "${ctx[@]}" logs -l app=dista-taxi --prefix --tail=40 || true
     exit 1
   fi
-  if [ "$kill" = kill ]; then
-    # The head's metrics: the dead worker's tasks must have run again.
+  if [ -n "$kill" ]; then
+    # The head's metrics.
     kubectl "${ctx[@]}" port-forward pod/dista-head-0 19090:9090 >/dev/null 2>&1 &
     local fwd=$!
-    local retried=""
+    local page=""
     for _ in $(seq 30); do
       # Until the forward is up, curl fails: keep trying.
-      retried=$(curl -s localhost:19090/metrics 2>/dev/null \
-        | sed -n 's/^dista_tasks_retried_total //p' || true)
-      [ -n "$retried" ] && break
+      page=$(curl -s localhost:19090/metrics 2>/dev/null || true)
+      [ -n "$page" ] && break
       sleep 1
     done
     kill $fwd 2>/dev/null || true
-    echo "tasks retried: ${retried:-unknown}"
-    if [ -z "$retried" ] || [ "$retried" -lt 1 ]; then
+    local retried moved
+    retried=$(echo "$page" | sed -n 's/^dista_tasks_retried_total //p')
+    moved=$(echo "$page" | sed -n 's/^dista_results_moved_total //p')
+    echo "tasks retried: ${retried:-unknown}; results moved: ${moved:-unknown}"
+    if [ "$kill" = kill ] && { [ -z "$retried" ] || [ "$retried" -lt 1 ]; }; then
       echo "FAIL: the killed worker's tasks were never run again"
+      exit 1
+    fi
+    if [ "$kill" = drain ] && { [ "${retried:-1}" != 0 ] || [ "${moved:-0}" -lt 1 ]; }; then
+      echo "FAIL: the stopped worker didn't drain: tasks ran again, or nothing moved"
       exit 1
     fi
   fi
@@ -129,4 +154,5 @@ run_program() {
 run_program app "PASS taxi"
 run_program shuffle "PASS shuffle"
 run_program app "PASS taxi" kill
-echo "PASS kind taxi: the queries and the shuffle on 3 nodes, each equal to one process; the queries again with a worker killed, still exact"
+run_program shuffle "PASS shuffle" drain
+echo "PASS kind taxi: the queries and the shuffle on 3 nodes, each equal to one process; the queries again with a worker killed, still exact; the shuffle with a worker stopped, drained, nothing run again"

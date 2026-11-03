@@ -21,7 +21,7 @@ def main() raises:
     print(total)  # 332833500
 ```
 
-**Status: phase 4's gate passes.** The taxi queries on a 3-node kind cluster finish exact with a worker pod killed mid-run, its tasks run again elsewhere ([tests/kind_taxi.sh](tests/kind_taxi.sh)). Still to come in phase 4: workers that drain when stopped, so a cluster can shrink. dista creates no pods: Kubernetes or [orca](https://github.com/magmalake/orca.mojo) does ([DESIGN.md](DESIGN.md#kubernetes-dista-and-orca)). One binary runs as driver, head or worker, chosen by environment. Run it on its own and it forks a head and workers on one machine; point it at a head and it joins a cluster:
+**Status: phase 4's gate passes.** The taxi queries on a 3-node kind cluster finish exact with a worker pod killed mid-run, its tasks run again elsewhere ([tests/kind_taxi.sh](tests/kind_taxi.sh)). A worker that Kubernetes stops drains instead of dying, so a cluster can shrink mid-job. dista creates no pods: Kubernetes or [orca](https://github.com/magmalake/orca.mojo) does ([DESIGN.md](DESIGN.md#kubernetes-dista-and-orca)). One binary runs as driver, head or worker, chosen by environment. Run it on its own and it forks a head and workers on one machine; point it at a head and it joins a cluster:
 
 ```
 DISTA_ROLE=head DISTA_PORT=6390 ./app                  # the head
@@ -34,6 +34,7 @@ What works today:
 - **Arguments and results:** scalars, `String`, plain structs of those, `Seq[T]` lists, types that implement `Codec`, and arrow-mlake `RecordBatch`es, which travel as Arrow IPC streams.
 - **Results feeding tasks:** a task can take another task's `ObjectRef`, or gather a list of them into a `Seq`, as in [examples/mapreduce.mojo](examples/mapreduce.mojo).
 - **Errors:** a task that raises re-raises in `get`. A worker that dies has its tasks run again elsewhere, up to `DISTA_TASK_RETRIES` times; the results it held are lost, and a task that needs one fails, naming it.
+- **Draining:** a worker sent SIGTERM, as Kubernetes stops a pod, finishes its tasks while the others adopt its results, then leaves: nothing fails or runs again ([tests/drain.sh](tests/drain.sh)). `DISTA_DRAIN_SECONDS` (default 25) bounds it.
 - **Large results stay on the worker that made them.** On the same host other processes map them from shared memory; across hosts they fetch them directly from that worker. Small ones come back through the head.
 - **Spilling:** past `DISTA_STORE_BYTES` of results, or when the store is full, a worker writes the rest to `DISTA_SPILL_DIR` on disk, and readers map or fetch them as before ([tests/test_spill.mojo](tests/test_spill.mojo)).
 - **Data-aware scheduling:** a task goes to the node holding most of its inputs' bytes, unless that node has no worker free ([tests/locality.sh](tests/locality.sh)).
