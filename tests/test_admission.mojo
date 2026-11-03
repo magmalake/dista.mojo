@@ -1,8 +1,9 @@
 """Admission control: a full queue blocks `remote` until workers drain it.
 
 Each test sets a low limit before its `Runtime` starts, so the head forked in
-local mode reads it, and submits slow tasks with 100 KB arguments, 20 MB in
-all: more than the sockets between driver and head buffer. With the limit,
+local mode reads it, and submits slow tasks with 500 KB arguments, 100 MB
+in all: far more than the sockets between driver and head buffer, which on
+Linux grow to several MB each. With the limit,
 the submit loop can't finish before the workers have run most of the tasks,
 so it takes at least as long as they need. A bound from below, not above, so
 a fast machine can't make it fail.
@@ -15,7 +16,7 @@ from std.time import perf_counter_ns, sleep
 from dista import ObjectRef, Runtime, Seq, Task
 
 comptime N = 200
-comptime SIZE = 100_000
+comptime SIZE = 500_000
 comptime NAP = 0.02
 """Each slow task's seconds."""
 
@@ -58,9 +59,10 @@ def _submit_slow_tasks() raises -> Float64:
 
 def _bound() -> Float64:
     """The least the submit loop can take with a small limit: of `N` tasks,
-    the queue holds a handful and the sockets at most 8 MB, 80 tasks; the
-    rest wait for 2 workers at `NAP` seconds a task. Halved for slack."""
-    return Float64(N - 10 - 80) / 2 * NAP / 2
+    the queue and the workers hold 12, the sockets at most 16 MB and the
+    head's read 1 MB, 34; the rest wait for 2 workers at `NAP` seconds a
+    task. Halved for slack."""
+    return Float64(N - 12 - 34) / 2 * NAP / 2
 
 
 def test_a_full_queue_blocks_submission() raises:

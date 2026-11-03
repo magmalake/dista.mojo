@@ -333,14 +333,14 @@ VISION.md's gate for phase 4 is the taxi suite finishing with a worker killed mi
 
 A driver's `remote` writes a frame and returns, and the head read every connection as frames arrived, so a driver could queue any number of tasks: ten million submissions were ten million tasks in the head's memory. Now the head admits them. While the tasks queued or waiting on inputs reach `DISTA_MAX_QUEUED` (default 100,000), or their arguments' bytes `DISTA_MAX_QUEUED_BYTES` (default 1 GiB), it stops reading drivers. Their frames wait in the socket, the driver's send buffer fills, and `remote` blocks until workers drain the queue. It's backpressure through TCP's flow control, with no frame or protocol of its own, and nothing changes in the client.
 
-- **Frames already read** when the queue filled stay in the connection's buffer, and are handled as room comes back, before the next poll: no poll would report them.
+- **A driver is read 1 MiB at a time**, not until its socket is empty, so the frames past the limits wait in the kernel's buffers, not the head's. Those already read when the queue filled are handled as room comes back, before the next poll: no poll would report them.
 - **Only drivers are paused.** Workers and observers are always read, and so are clients inside a task: pausing one would hold its worker, and with every worker held nothing would drain.
 - **Everything else a paused driver sends waits too**, releases among them. That's safe: the queued tasks need nothing more from it to run.
 - **0 turns a limit off.** The head's metrics show `dista_queued_bytes`, `dista_admission_paused` and `dista_admission_pauses_total`.
 
 Not covered: results waiting for a driver that doesn't read them still queue in the head's output buffer, and small results stay at the head until released, so a driver that never releases its refs still grows the head's memory.
 
-Gate: `tests/test_admission.mojo`. With room for 8 tasks, or for 1 MB of arguments, 200 slow tasks with 100 KB arguments (20 MB, more than the sockets buffer) take 1.7 s to submit to 2 workers, against at least 0.55 s for the workers to run the ones that don't fit; with no limit, 0.01 s. A chain of 100 tasks and a gather over them, with room for 4, still finishes.
+Gate: `tests/test_admission.mojo`. With room for 8 tasks, or for 5 MB of arguments, 200 slow tasks with 500 KB arguments (100 MB, far more than the sockets buffer, which on Linux grow to several MB) take 2.1 s to submit to 2 workers, against at least 0.77 s for the workers to run the ones that don't fit; with no limit, a moment. The first version read a driver's socket dry, which on Linux pulled most of 20 MB into the head before the limit could act, and CI caught it. A chain of 100 tasks and a gather over them, with room for 4, still finishes.
 
 ### Kubernetes: dista and orca
 

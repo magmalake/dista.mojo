@@ -36,10 +36,13 @@ struct Conn(Movable):
     def fd(self) -> c_int:
         return self.stream.fd
 
-    def read_available(mut self) raises:
-        """Reads everything waiting on the socket into the input buffer."""
+    def read_available(mut self, limit: Int = 0) raises:
+        """Reads what's waiting on the socket into the input buffer: all of
+        it, or with `limit`, about that many bytes, leaving the rest in the
+        socket, where `poll` still reports it."""
         var chunk = List[UInt8](length=_READ_CHUNK, fill=0)
-        while True:
+        var got = 0
+        while limit == 0 or got < limit:
             var n = recv_some(self.stream.fd, chunk.unsafe_ptr(), _READ_CHUNK)
             if n < 0:
                 return
@@ -47,6 +50,7 @@ struct Conn(Movable):
                 self.closed = True
                 return
             self._in.extend(Span(chunk)[:n])
+            got += n
 
     def next_frame(mut self) raises -> Optional[Frame]:
         """The next complete frame in the input buffer, if there is one."""

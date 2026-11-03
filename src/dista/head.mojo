@@ -307,6 +307,10 @@ def _env_int(name: String, default: Int) -> Int:
         return default
 
 
+comptime DRIVER_READ = 1 << 20
+"""Bytes read from a driver per poll: frames past the admission limits stay
+in its socket rather than in the head's buffer."""
+
 comptime LOOKAHEAD = 64
 """How far into its queue a free worker looks for a task to take."""
 
@@ -573,7 +577,11 @@ struct Head(Movable):
                     if revents[k] & POLLOUT:
                         self._conns[i].flush()
                     if revents[k] & (POLLIN | POLLERR | POLLHUP):
-                        self._conns[i].read_available()
+                        # A driver's frames are read a little at a time, so
+                        # those past the limits wait in its socket, not here.
+                        self._conns[i].read_available(
+                            limit=DRIVER_READ if self._held_back(i) else 0
+                        )
                         while not (self._held_back(i) and self._full()):
                             var f = self._conns[i].next_frame()
                             if not f:
