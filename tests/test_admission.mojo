@@ -26,6 +26,11 @@ def slow(s: String) -> Int:
     return s.byte_length()
 
 
+def blob(i: Int) -> String:
+    """A result just small enough to come back through the head."""
+    return String("y") * 60_000
+
+
 def add_one(x: Int) -> Int:
     return x + 1
 
@@ -40,6 +45,7 @@ def total(xs: Seq[Int]) -> Int:
 comptime Slow = Task[String, Int, slow]
 comptime AddOne = Task[Int, Int, add_one]
 comptime Total = Task[Seq[Int], Int, total]
+comptime Blob = Task[Int, String, blob]
 
 
 def _submit_slow_tasks() raises -> Float64:
@@ -96,6 +102,39 @@ def test_tasks_waiting_on_inputs_still_drain() raises:
     _ = unsetenv("DISTA_MAX_QUEUED")
     assert_equal(rt.get(chain[99]), 100)
     assert_equal(rt.get(all), 5050)
+
+
+def _hold_back(cap: String) raises -> Int:
+    """Submits 2,000 tasks with 60 KB results, 120 MB, and doesn't read for
+    two seconds, with `DISTA_MAX_DRIVER_BUFFER` at `cap`; how many were
+    still waiting then. Every result must come back after."""
+    _ = setenv("DISTA_MAX_DRIVER_BUFFER", cap)
+    var rt = Runtime[Blob](workers=4)
+    _ = unsetenv("DISTA_MAX_DRIVER_BUFFER")
+    var refs = List[ObjectRef[String]]()
+    for i in range(2000):
+        refs.append(rt.remote[Blob](i))
+    sleep(2.0)  # not reading: the head's buffer for this driver fills
+    var waiting = rt.stats().pending
+    for r in refs:
+        assert_equal(rt.get(r).byte_length(), 60_000)
+    return waiting
+
+
+def test_a_driver_that_doesnt_read_holds_its_tasks() raises:
+    """With room for 4 MB waiting for the driver, most of 120 MB of results
+    can't have been made while it didn't read: its tasks waited. The sockets
+    hold a few MB more, 100 results or so."""
+    var waiting = _hold_back("4000000")
+    print("  ", waiting, "of 2000 tasks waited")
+    assert_true(waiting >= 1000, "tasks ran for a driver that wasn't reading")
+
+
+def test_without_the_cap_every_task_runs() raises:
+    """The same with no cap: 2 s is ample for all 2,000 to run."""
+    var waiting = _hold_back("0")
+    print("  ", waiting, "of 2000 tasks waited")
+    assert_equal(waiting, 0)
 
 
 def main() raises:

@@ -51,9 +51,21 @@ from dista.frame import (
     decode_addr,
     read_frame,
     write_frame,
+    append_frame,
 )
 from dista.head import DRIVER_SHIFT
-from dista.socket import Stream, addr_key, poll_readable, wall_ns
+from dista.socket import (
+    POLLERR,
+    POLLHUP,
+    POLLIN,
+    POLLOUT,
+    Stream,
+    addr_key,
+    poll,
+    poll_readable,
+    send_some,
+    wall_ns,
+)
 from dista.task import (
     ActorLike,
     ManyLike,
@@ -747,9 +759,10 @@ struct Client(Movable):
         self._live[id] = True
         self._subs[id] = _Submission(kind, task_id, payload^, deps^)
         var sent = True
-        ref body = self._subs[id].payload
+        var out = List[UInt8]()
+        append_frame(out, kind, id, task_id, self._subs[id].payload)
         try:
-            write_frame(self._head, kind, id, task_id, body)
+            self._write(out)
         except:
             sent = False
         if not sent:
@@ -758,11 +771,36 @@ struct Client(Movable):
 
     def _send(mut self, kind: UInt8, id: UInt64, payload: List[UInt8]) raises:
         """Sends a frame to the head, resuming with a new head if it's gone."""
+        var out = List[UInt8]()
+        append_frame(out, kind, id, 0, payload)
         try:
-            write_frame(self._head, kind, id, 0, payload)
+            self._write(out)
         except e:
             self._resume(e)
             write_frame(self._head, kind, id, 0, payload)
+
+    def _write(mut self, frames: List[UInt8]) raises:
+        """Writes whole frames to the head, reading what it sends meanwhile.
+        A head whose queue is full stops reading this driver, which then
+        waits here; reading meanwhile lets the head send results, so its
+        output buffer doesn't grow while the driver waits, and the results
+        come here instead."""
+        var sent = 0
+        while sent < len(frames):
+            var n = send_some(
+                self._head.fd,
+                frames.unsafe_ptr().unsafe_offset(sent),
+                len(frames) - sent,
+            )
+            sent += n
+            if sent == len(frames):
+                return
+            var rev = poll([self._head.fd], [POLLOUT | POLLIN], -1)
+            if rev[0] & (POLLIN | POLLHUP | POLLERR):
+                var f = read_frame(self._head)
+                if not f:
+                    raise Error("the head closed the connection")
+                self._take(f.take())
 
     def _settle(mut self, id: UInt64):
         """`id`'s task is done: it no longer needs its inputs kept."""
@@ -896,7 +934,10 @@ struct Client(Movable):
         if not f:
             self._resume(Error("the head closed the connection"))
             return
-        ref frame = f.value()
+        self._take(f.take())
+
+    def _take(mut self, var frame: Frame) raises:
+        """Handles a frame from the head."""
         var id = frame.object_id
         # A released object is still kept while an unsettled task needs it:
         # a restarted head would need it back.
