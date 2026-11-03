@@ -44,6 +44,8 @@ backend = { name = "pixi-build-mojo", version = "0.*" }
 [package.build.config.pkg]
 path = "src/dista"
 name = "dista"
+# The dependencies' .mojoc files, which their packages install there.
+extra-args = ["-I", "$PREFIX/lib/mojo"]
 
 [package.host-dependencies]
 mojo-compiler = "==1.2.0"

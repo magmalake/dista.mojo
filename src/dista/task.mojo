@@ -176,7 +176,6 @@ struct Task[
 
     comptime A = Self.A_
     comptime R = Self.R_
-    comptime Act = Self.Act_
 
     @staticmethod
     def name() -> StaticString:
