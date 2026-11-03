@@ -48,6 +48,20 @@ What works today:
 - **The `dista` command:** `dista head` is a head for any program, serving several at once; `dista status`, `dista timeline -o trace.json` and `dista stop` look at or shut down a running cluster. Build it with `pixi run cli`.
 - **Metrics:** with `DISTA_METRICS_PORT` set, the head and every worker serve Prometheus metrics at `/metrics`: tasks by outcome, task durations, queue depth, objects held, actors and checkpoints. The kind manifests turn it on at 9090.
 
+## Install
+
+dista is a [mojoshelf](https://mojoshelf.org) tin:
+
+```sh
+pixi shelf add dista-mojo     # with arrow-mlake, memory-region and objectstore
+```
+
+Then `from dista import Runtime, Task` as above. Build your program once and
+run the same binary as the head, the workers and the driver.
+
+## More
+
+- [CHANGELOG.md](CHANGELOG.md): what each release changed.
 - [VISION.md](VISION.md): what dista is for, its principles and phases.
 - [DESIGN.md](DESIGN.md): how it works, and what's verified on Mojo 1.2.0.
 

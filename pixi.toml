@@ -2,7 +2,7 @@
 authors = ["Marius S <39998+winding-lines@users.noreply.github.com>"]
 channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "dista.mojo"
-version = "0.0.1"
+version = "0.1.0"
 description = "Distributed tasks for Mojo: mark a function remote, call it, and the work runs across a cluster."
 preview = ["pixi-build"]
 # linux-aarch64 lets the container image build natively on ARM hosts, such as
@@ -36,7 +36,7 @@ bench = { cmd = "mkdir -p build && mojo build -I src $DEP_INC bench/fanout.mojo 
 
 [package]
 name = "dista-mojo"
-version = "0.0.1"
+version = "0.1.0"
 
 [package.build]
 backend = { name = "pixi-build-mojo", version = "0.*" }
@@ -66,14 +66,15 @@ objectstore-mojo = { git = "https://github.com/magmalake/objectstore.mojo", rev 
 mojo-compiler = "==1.2.0"
 # memory-region backs the node-local object store: large results go into
 # shared mappings that other processes on the same host map by path. Pinned
-# at the revision mojoshelf published (memory-region-mojo 0.1.0).
+# at the revision mojoshelf published (memory-region-mojo 0.1.1).
 memory-region-mojo = { git = "https://github.com/magmalake/memory-region.mojo", rev = "40068c4f95ea659e9b78aa91ced45420b07e3e6e" }
 # arrow-mlake carries columnar results: a task can take or return a
 # RecordBatch, and it travels as an Arrow IPC stream. Pinned at the revision
-# mojoshelf published as arrow-mlake-mojo 0.2.0.
+# mojoshelf published as arrow-mlake-mojo 0.2.1.
 arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "178aae6e0da0dbe105f9cb02632a51cfd35b9dda" }
 # objectstore writes actor checkpoints to DISTA_CHECKPOINT_URI, a local
-# directory or s3://. Pinned with the data environment's.
+# directory or s3://. Pinned at the revision mojoshelf published
+# (objectstore-mojo 0.4.0), as the data environment's is.
 objectstore-mojo = { git = "https://github.com/magmalake/objectstore.mojo", rev = "58488efa729351f5894b45a0a92e898171c2e96d" }
 
 # A precompiled package only loads in the compiler that built it, and this one
