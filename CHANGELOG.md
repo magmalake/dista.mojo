@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-03
+
+Autoscaling: the head reports its demand, a policy decides, and whatever
+owns the machines starts and drains workers.
+
 ### Added
 
 - **Demand, for autoscaling.** `dista status --json` prints the head's tasks
@@ -70,5 +75,6 @@ the 1.3 nightly in CI.
   shuffle on 3 nodes against one process, with a worker killed and with one
   drained.
 
-[Unreleased]: https://github.com/magmalake/dista.mojo/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/magmalake/dista.mojo/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/magmalake/dista.mojo/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/magmalake/dista.mojo/releases/tag/v0.1.0
