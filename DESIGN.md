@@ -312,6 +312,8 @@ The head and the command line are a generic `dista` binary (`cli/main.mojo`) tha
 |---|---|
 | `dista head [--port] [--pipeline]` | A generic head. The kind manifests run it from the image, where the program is `/opt/dista/bin/app` and the command `/opt/dista/bin/dista`. |
 | `dista status` | The head's view: workers with their registry and what they run or host, drivers, actors with their worker, calls and checkpoint. |
+| `dista status --json` | The head's demand, for an autoscaler, on one line: tasks ready, waiting for inputs and running, actors waiting for a worker, the pipeline depth, whether there's a checkpoint store, and per worker its address, node, tasks in flight, seconds idle, bytes of results held, actor and whether it's draining. |
+| `dista drain <ip:port>` | Drains the worker at that address, exactly as SIGTERM does; the head refuses the last worker while tasks are queued or running. |
 | `dista timeline -o trace.json` | Every driver's finished tasks, departed drivers' included (up to `MAX_SPANS` of theirs), without taking them from the drivers. Tasks are named by wire ID, since the head doesn't know the names. |
 | `dista stop` | Shuts the head down, and its workers: they exit instead of rejoining. |
 
@@ -388,7 +390,7 @@ A Spot interruption, where a deployment allows Spot, is the same drain: the inst
 
 | # | PR | Gate | Size |
 |---|---|---|---|
-| 1 | **Demand in `status --json` and `/metrics`**, and `dista drain <worker>`. | `tests/drain.sh` also drains a worker by name from an observer, with the same checks as for SIGTERM; `status --json` reports ready, waiting and running counts that match a driver's submissions, and idle seconds that grow for a worker given nothing. | ~500 |
+| 1 | **Demand in `status --json` and `/metrics`**, and `dista drain <worker>`. Done. | `tests/drain.sh` also drains a worker by name from an observer, with the same checks as for SIGTERM; `status --json` reports ready, waiting and running counts that match a driver's submissions, and idle seconds that grow for a worker given nothing. | ~500 |
 | 2 | **`dista.scale`**: the policy and its decision. | `tests/test_scale.mojo` over tables of demand (a burst grows to `max_workers` in steps of `max_step`; idle workers drain after `idle_before_down` down to `min_workers`; a worker holding an actor with no checkpoint store isn't drained; pending workers count) and `fuzz/fuzz_scale.mojo` (a decision never goes outside the range). | ~400 |
 | 3 | **`tests/autoscale.sh`**: a head, one worker and a provider loop in shell that starts workers as processes and drains them with `dista drain`, from `decide`'s output (`dista scale --once` prints it). | 200 tasks of 0.5 s with `max_workers=6`: the job grows to 6 workers and back to 1 after it, every result is exact, no task runs twice and no result is lost. | ~300 |
 

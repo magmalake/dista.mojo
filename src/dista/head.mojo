@@ -429,6 +429,9 @@ struct Head(Movable):
     """For each connection: `_DRAIN_NO`, `_DRAIN_YES` while a worker drains,
     or `_DRAIN_LET_GO` once it's been told it may leave."""
     var _n_draining: Int
+    var _busy_at: List[UInt64]
+    """For a worker, when it last had a task in flight, an actor, or a task
+    queued that it could take: how long it's been idle, for autoscaling."""
     var _moving: Dict[UInt64, Int]
     """Results being adopted from draining workers, to the adopting worker.
     """
@@ -533,6 +536,7 @@ struct Head(Movable):
         self._checkpoint_failures = 0
         self._draining = List[UInt8]()
         self._n_draining = 0
+        self._busy_at = List[UInt64]()
         self._moving = Dict[UInt64, Int]()
         self._stuck = Dict[UInt64, Bool]()
         self._holdouts = Dict[UInt64, Int]()
@@ -551,6 +555,7 @@ struct Head(Movable):
         while True:
             self._release_waiting()
             self._dispatch()
+            self._note_busy()
             if self._n_draining > 0:
                 self._drain()
             if self._exit_when_idle and self._drivers_seen:
@@ -730,7 +735,10 @@ struct Head(Movable):
             out,
             "gauge",
             "dista_workers_draining",
-            "Workers draining, after SIGTERM, that haven't left.",
+            (
+                "Workers draining, after SIGTERM or `dista drain`, that haven't"
+                " left."
+            ),
             self._n_draining,
         )
         write_metric(
@@ -749,6 +757,34 @@ struct Head(Movable):
         )
         write_metric(
             out, "gauge", "dista_actors", "Live actors.", len(self._actors)
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_tasks_ready",
+            "Tasks whose inputs are ready, waiting for a worker.",
+            self._queued(),
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_tasks_waiting",
+            "Tasks waiting for their inputs.",
+            len(self._waiting),
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_tasks_running",
+            "Tasks and actor calls sent to workers and not settled.",
+            len(self._running),
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_workers_idle",
+            "Workers with nothing to do that aren't draining.",
+            self._idle_workers(),
         )
         write_metric(
             out,
@@ -781,10 +817,16 @@ struct Head(Movable):
         return out^
 
     def _observe(mut self, i: Int, var f: Frame) raises:
-        """A frame from an observer: status, timeline, stats or stop."""
+        """A frame from an observer: status, timeline, drain or stop."""
         if f.kind == KIND_STATUS:
-            var text = self._status()
+            # Object ID 1 asks for JSON; an older observer sends 0.
+            var text = (
+                self._status_json() if f.object_id == 1 else self._status()
+            )
             self._conns[i].send(KIND_STATUS, 0, 0, text.as_bytes())
+        elif f.kind == KIND_DRAIN:
+            var why = self._drain_by_name(message(f.payload))
+            self._conns[i].send(KIND_DRAIN, 0, 0, why.as_bytes())
         elif f.kind == KIND_TIMELINE:
             self._send_timeline(i)
         elif f.kind == KIND_STOP:
@@ -883,6 +925,162 @@ struct Head(Movable):
             out += "\n"
         return out^
 
+    def _start_drain(mut self, i: Int):
+        """Worker `i` drains: no new work, and what it holds moves. Its own
+        SIGTERM or an observer's `dista drain` starts it."""
+        if self._draining[i] != _DRAIN_NO:
+            return
+        print("dista head: worker", self._addr(i), "is draining")
+        self._draining[i] = _DRAIN_YES
+        self._n_draining += 1
+        for entry in self._running.items():
+            if entry.value.kind != KIND_TASK_INPUTS:
+                continue
+            for d in entry.value.deps:
+                if self._location.get(d, -1) == i:
+                    self._holdouts[entry.key] = i
+                    break
+        if self._hosting[i] != 0:
+            self._move_actor(self._hosting[i])
+
+    def _drain_by_name(mut self, addr: String) -> String:
+        """`dista drain <addr>`: starts draining the worker whose object
+        server is at `addr`, as a SIGTERM would; "" if it did, else why not.
+        """
+        var found = -1
+        var others = 0
+        for i in range(len(self._roles)):
+            if self._roles[i] != ROLE_WORKER:
+                continue
+            if self._addr(i) == addr:
+                found = i
+            elif self._draining[i] == _DRAIN_NO:
+                others += 1
+        if found < 0:
+            return String("no worker at ", addr)
+        if self._draining[found] != _DRAIN_NO:
+            return ""
+        var work = self._queued() + len(self._waiting) + len(self._running)
+        if others == 0 and work > 0:
+            return String(
+                "not draining ",
+                addr,
+                ": it's the last worker and ",
+                work,
+                " tasks are queued or running",
+            )
+        self._start_drain(found)
+        try:
+            self._conns[found].send(KIND_DRAIN, 0, 0, List[UInt8]())
+        except e:
+            print("dista head: lost worker:", e)
+            self._drop(found)
+        return ""
+
+    def _wanted(self, i: Int) -> Bool:
+        """Whether worker `i` has a task in flight, an actor, or a task
+        queued that it could take."""
+        if len(self._inflight[i]) > 0 or self._hosting[i] != 0:
+            return True
+        try:
+            if self._hashes[i] in self._queues:
+                return len(self._queues[self._hashes[i]]) > 0
+        except:
+            pass
+        return False
+
+    def _note_busy(mut self):
+        var now = wall_ns()
+        for i in range(len(self._roles)):
+            if self._roles[i] == ROLE_WORKER and self._wanted(i):
+                self._busy_at[i] = now
+
+    def _idle_seconds(self, i: Int, now: UInt64) -> Float64:
+        """How long worker `i` has had nothing to do; 0 while it has."""
+        if self._wanted(i) or now <= self._busy_at[i]:
+            return 0
+        return Float64(now - self._busy_at[i]) / 1e9
+
+    def _held_bytes(self, i: Int) -> Int:
+        """Bytes of the results that stayed on worker `i`."""
+        var n = 0
+        for entry in self._location.items():
+            if entry.value != i:
+                continue
+            try:
+                var pos = 0
+                n += Location.decode(
+                    self._where.get(entry.key, List[UInt8]()), pos
+                ).size
+            except:
+                pass
+        return n
+
+    def _idle_workers(self) -> Int:
+        var now = wall_ns()
+        var n = 0
+        for i in range(len(self._roles)):
+            if (
+                self._roles[i] == ROLE_WORKER
+                and self._draining[i] == _DRAIN_NO
+                and self._idle_seconds(i, now) > 0
+            ):
+                n += 1
+        return n
+
+    def _status_json(self) -> String:
+        """The head's demand and workers, for `dista status --json` and an
+        autoscaler: one object, on one line."""
+        var now = wall_ns()
+        var out = String(
+            '{"tasks_ready":',
+            self._queued(),
+            ',"tasks_waiting":',
+            len(self._waiting),
+            ',"tasks_running":',
+            len(self._running),
+            ',"actors_waiting":',
+            len(self._unplaced),
+            ',"tasks_done":',
+            self._finished_ok,
+            ',"tasks_failed":',
+            self._finished_err,
+            ',"drivers":',
+            len(self._driver_conn) - len(self._clients),
+            ',"pipeline":',
+            self._pipeline,
+            ',"checkpoints":',
+            "true" if getenv("DISTA_CHECKPOINT_URI") else "false",
+            ',"workers":[',
+        )
+        var first = True
+        for i in range(len(self._roles)):
+            if self._roles[i] != ROLE_WORKER:
+                continue
+            out += String(
+                "" if first else ",",
+                '{"address":"',
+                self._addr(i),
+                '","node":"',
+                self._node[i].replace('"', ""),
+                '","registry":"',
+                hex(self._hashes[i]),
+                '","running":',
+                len(self._inflight[i]),
+                ',"idle_seconds":',
+                self._idle_seconds(i, now),
+                ',"held_bytes":',
+                self._held_bytes(i),
+                ',"actor":',
+                self._hosting[i],
+                ',"draining":',
+                "true" if self._draining[i] != _DRAIN_NO else "false",
+                "}",
+            )
+            first = False
+        out += "]}\n"
+        return out^
+
     def _accept(mut self) raises:
         _ = self._add_conn(Conn(self._listener.accept()))
 
@@ -897,6 +1095,7 @@ struct Head(Movable):
         self._hosting.append(0)
         self._hashes.append(0)
         self._draining.append(_DRAIN_NO)
+        self._busy_at.append(wall_ns())
         return len(self._conns) - 1
 
     def _handle(mut self, i: Int, var f: Frame) raises:
@@ -1070,19 +1269,7 @@ struct Head(Movable):
                 self._checkpointed(i, f^)
                 return
             if f.kind == KIND_DRAIN:
-                if self._draining[i] == _DRAIN_NO:
-                    print("dista head: worker", self._addr(i), "is draining")
-                    self._draining[i] = _DRAIN_YES
-                    self._n_draining += 1
-                    for entry in self._running.items():
-                        if entry.value.kind != KIND_TASK_INPUTS:
-                            continue
-                        for d in entry.value.deps:
-                            if self._location.get(d, -1) == i:
-                                self._holdouts[entry.key] = i
-                                break
-                    if self._hosting[i] != 0:
-                        self._move_actor(self._hosting[i])
+                self._start_drain(i)
                 return
             if f.kind == KIND_ADOPTED:
                 self._adopted(i, f^)

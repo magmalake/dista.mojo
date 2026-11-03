@@ -656,6 +656,10 @@ struct Worker[
                 # `dista stop`: leave for good, instead of waiting to rejoin.
                 self.stopped = True
                 self._head.closed = True
+        elif f.kind == KIND_DRAIN:
+            # `dista drain`: the same drain as SIGTERM's.
+            if not self._draining:
+                self._start_drain()
         elif f.kind == KIND_ADOPT:
             var pos = 0
             var loc = Location.decode(f.payload, pos)
@@ -712,7 +716,8 @@ struct Worker[
                 self._refuse(obj, why)
 
     def _start_drain(mut self):
-        """SIGTERM: ask the head for no more work, and to move what's here."""
+        """SIGTERM, or the head passing on `dista drain`: ask the head for no
+        more work, and to move what's here."""
         var secs = 25
         try:
             secs = Int(getenv("DISTA_DRAIN_SECONDS", "25"))
