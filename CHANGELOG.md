@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Demand.parse(status_json)` and a `Policy` (`min_workers`, which may be 0,
   `max_workers`, `tasks_per_worker`, `up_after`, `idle_before_down`,
   `max_step`). It has no clock or I/O of its own.
+- **`dista scale --once`** prints the decision for the head's current
+  demand; `tests/autoscale.sh` drives a job from 0 workers to 6 and back to
+  0 with it.
 - **`dista drain <ip:port>`** drains one worker from an observer, the same
   drain as SIGTERM's, for a provider that can't signal the worker's process.
 
