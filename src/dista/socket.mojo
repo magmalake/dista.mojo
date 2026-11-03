@@ -31,9 +31,16 @@ comptime IPPROTO_TCP: c_int = 6
 comptime TCP_NODELAY: c_int = 1
 comptime SOCKADDR_IN_SIZE = 16
 comptime EAGAIN: c_int = c_int(_pm["EAGAIN", linux=11, macos=35]())
-# Non-blocking I/O is per call, with MSG_DONTWAIT, not per socket: setting
-# O_NONBLOCK needs fcntl, which is variadic, and Apple's arm64 ABI passes
-# variadic arguments on the stack where `external_call` doesn't put them.
+# Every connected socket is non-blocking (O_NONBLOCK), and the calls that
+# should wait, `write_all` and `read_into`, wait in `poll`. MSG_DONTWAIT alone
+# isn't enough: macOS blocks a send with it once the socket's buffer is full,
+# so a peer that stopped reading stalled the head's whole event loop. Setting
+# O_NONBLOCK needs fcntl, which is variadic: Apple's arm64 ABI passes the
+# variadic argument on the stack, which `num_fixed_args` tells
+# `external_call`.
+comptime F_GETFL: c_int = 3
+comptime F_SETFL: c_int = 4
+comptime O_NONBLOCK: c_int = c_int(_pm["O_NONBLOCK", linux=0x800, macos=0x4]())
 comptime MSG_DONTWAIT: c_int = c_int(
     _pm["MSG_DONTWAIT", linux=0x40, macos=0x80]()
 )
@@ -146,6 +153,27 @@ def recv_some(fd: c_int, buf: Pointer[UInt8, _], size: Int) raises -> Int:
             _fail("recv")
 
 
+def fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int:
+    """`fcntl(2)` with one int argument: the only declaration of it in dista,
+    since two with different signatures don't link."""
+    # Two fixed arguments, then the variadic one, where Apple's arm64 ABI
+    # expects it.
+    return external_call["fcntl", c_int, num_fixed_args=2](fd, cmd, arg)
+
+
+def set_nonblocking(fd: c_int) -> Bool:
+    """Makes `fd` non-blocking; whether that worked."""
+    var flags = fcntl(fd, F_GETFL, 0)
+    if flags < 0:
+        return False
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0
+
+
+def _wait_for(fd: c_int, event: Int16) raises:
+    """Waits until `fd` is ready for `event`, or has failed."""
+    _ = poll([fd], [event], -1)
+
+
 def _new_socket() raises -> c_int:
     var fd = external_call["socket", c_int](AF_INET, SOCK_STREAM, c_int(0))
     if fd < 0:
@@ -208,12 +236,15 @@ def _refuse_self(fd: c_int) raises:
 
 
 struct Stream(Movable):
-    """A connected, blocking TCP socket. Closes itself when dropped."""
+    """A connected TCP socket. It's non-blocking, but `write_all` and
+    `read_into` wait for it, so to its users it blocks; the head's loop uses
+    `send_some` and `recv_some`, which don't. Closes itself when dropped."""
 
     var fd: c_int
 
     def __init__(out self, fd: c_int):
         self.fd = fd
+        _ = set_nonblocking(fd)
 
     @staticmethod
     def connect(port: Int) raises -> Stream:
@@ -312,7 +343,11 @@ struct Stream(Movable):
                 MSG_NOSIGNAL,
             )
             if n < 0:
-                if get_errno().value == EINTR:
+                var e = get_errno().value
+                if e == EINTR:
+                    continue
+                if e == EAGAIN:
+                    _wait_for(self.fd, POLLOUT)
                     continue
                 _fail("send")
             sent += Int(n)
@@ -332,7 +367,11 @@ struct Stream(Movable):
                 c_int(0),
             )
             if n < 0:
-                if get_errno().value == EINTR:
+                var e = get_errno().value
+                if e == EINTR:
+                    continue
+                if e == EAGAIN:
+                    _wait_for(self.fd, POLLIN)
                     continue
                 _fail("recv")
             if n == 0:
