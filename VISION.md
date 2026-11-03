@@ -21,8 +21,8 @@ dista is the missing layer: the Ray programming model, rebuilt around what Mojo 
 ## Principles
 
 1. **One binary, everywhere.** Every node runs the same compiled program, so every remote function already exists on every worker. A task is a function ID plus its arguments. Deploying new code means rolling out a new image.
-2. **Typed all the way through.** `remote[f](args)` is checked by the compiler like a local call. Anything that crosses the wire must implement `Serializable`; closures don't cross it.
-3. **Arrow is the data plane.** Columnar results stay as Arrow. They're shared between processes on one node without copying, and streamed between nodes over Arrow Flight.
+2. **Typed all the way through.** `remote[f](args)` is checked by the compiler like a local call. Anything that crosses the wire must go through the codec (`Codec`: scalars, strings, lists, `Seq`, Arrow batches and reflected structs); closures don't cross it.
+3. **Arrow is the data plane.** Columnar results stay as Arrow. They're shared between processes on one node without copying, and fetched between nodes as Arrow IPC over dista's own sockets.
 4. **Ownership, not a central bottleneck.** As in Ray, the caller that creates a result owns it. The head service tracks membership and object locations, not every value.
 5. **Built from tins, not from scratch.** RPC, shared memory, Flight, thread pools, durable execution and object storage already exist as magmalake tins. dista adds the scheduler, the object store and the API on top.
 6. **Small and explainable.** A core one person can read in an afternoon beats a feature list. Each feature has to earn its place against a real workload.
@@ -75,7 +75,7 @@ Dista will be a tin on Magmalake.
 
 First focus will be on data batch work.
 
-We will try to use Serializable for plain structs, but big data should use Arrow.
+Plain structs go through the codec by reflection, but big data should use Arrow.
 
 Placing work on GPUs is desirable.
 
