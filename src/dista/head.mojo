@@ -2457,7 +2457,7 @@ struct Head(Movable):
                 self._dec(dep)
             for k in range(parts):
                 var part = obj + UInt64(k)
-                _ = self._held.pop(part, False)
+                _ = self._unhold(part)
                 _ = self._refs.pop(part, 0)
                 _ = self._dead.pop(part, False)
                 self._free(part)
