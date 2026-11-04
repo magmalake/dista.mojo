@@ -268,3 +268,22 @@ jobs:
           cache-write: ${{ github.event_name != 'pull_request' }}
       - name: Format check
         run: pixi run -e fmt format-check
+
+  # One check for every Linux job above: each passed, or, for a prose-only
+  # PR, was skipped. The jobs' own checks still report too, so the ruleset's
+  # stable / ubuntu-latest, nightly / ubuntu-latest and format keep working.
+  # (macOS runs only on the nightly, which this gate doesn't cover.)
+  ci:
+    if: ${{ always() && github.event_name != 'schedule' }}
+    needs: [changes, test, data, kind, fuzz, format]
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+          CODE: ${{ needs.changes.outputs.code }}
+        run: |
+          echo "results: $RESULTS (code: $CODE)"
+          ok='"success"'
+          [ "$CODE" = false ] && ok='"success"|"skipped"'
+          bad=$(printf '%s\n' "$RESULTS" | tr -d '[] \n' | tr ',' '\n' | grep -cvE "^($ok)$" || true)
+          [ "$bad" -eq 0 ] || { echo "$bad job(s) didn't succeed"; exit 1; }
