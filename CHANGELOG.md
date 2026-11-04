@@ -55,6 +55,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before the head noticed its old connection drop replaces it. Results no
   driver comes back for are freed after `DISTA_ORPHAN_SECONDS` (default
   120).
+- **The head's ready queue holds only what's queued.** It cleared its list
+  only once every task in it had been handed out, so under backpressure,
+  with the queue full for a whole job, every task dispatched stayed in
+  memory with its arguments, uncounted by `dista_queued_bytes`. A task
+  handed out now moves into the running set, and the queue compacts once
+  half its list is spent. Dispatch no longer copies a task's arguments
+  twice. `bench/fanout.mojo` gains a backpressure run: the head's peak
+  memory there went from 176 MB to about 95 MB.
 
 ## [0.2.1] - 2026-11-03
 
