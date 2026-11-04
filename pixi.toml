@@ -28,11 +28,12 @@ test-locality = { cmd = "tests/locality.sh" }
 test-compile-fail = { cmd = "tests/compile_fail.sh" }
 test-metrics = { cmd = "tests/metrics.sh" }
 test-drain = { cmd = "tests/drain.sh" }
+test-peer-loss = { cmd = "tests/peer_loss.sh" }
 test-autoscale = { cmd = "tests/autoscale.sh" }
 test-cli = { cmd = "tests/cli.sh" }
 test-chaos = { cmd = "CHAOS_FAST=1 tests/chaos.sh" }
 test-kind = { cmd = "tests/kind.sh" }
-test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-timeline", "test-scale", "test-actors", "test-arity", "test-shuffle", "test-spill", "test-admission", "test-cluster", "test-restart", "test-locality", "test-compile-fail", "test-metrics", "test-drain", "test-autoscale", "test-cli", "test-chaos"] }
+test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-timeline", "test-scale", "test-actors", "test-arity", "test-shuffle", "test-spill", "test-admission", "test-cluster", "test-restart", "test-locality", "test-compile-fail", "test-metrics", "test-drain", "test-peer-loss", "test-autoscale", "test-cli", "test-chaos"] }
 cli = { cmd = "mkdir -p build && mojo build -I src $DEP_INC cli/main.mojo -o build/dista" }
 bench = { cmd = "mkdir -p build && mojo build -I src $DEP_INC bench/fanout.mojo -o build/bench-fanout && ./build/bench-fanout" }
 

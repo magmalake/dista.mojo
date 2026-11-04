@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A task fetching an input from a worker that dies fails** with
+  `input lost: the worker holding it (<ip:port>) went away`, instead of
+  waiting forever. The fetching worker drops the dead connection: it used to
+  poll it at 100% CPU, or die of the reset itself
+  ([#89](https://github.com/magmalake/dista.mojo/issues/89)).
+  `tests/peer_loss.sh` kills a worker while two others fetch from it.
+
 ## [0.2.1] - 2026-11-03
 
 ### Changed
