@@ -17,6 +17,8 @@ the current task finishes.
 A result here lives until the head says free, once nothing references it.
 Inputs fetched from peers are copies, kept only until the tasks waiting on
 them have their arguments.
+A peer that hangs up or resets is dropped, and what was being fetched
+from it is lost: the tasks waiting on it fail with `input lost`.
 
 A worker the head gives an actor builds its state and then runs only that
 actor's calls, in the order they come. A kill destroys the state, and the
@@ -314,7 +316,9 @@ struct Worker[
     var _objects: Dict[UInt64, List[UInt8]]
     """Results stored here, and inputs fetched from peers."""
     var _lost: Dict[UInt64, String]
-    var _requested: Dict[UInt64, Bool]
+    var _requested: Dict[UInt64, String]
+    """Objects being fetched from peers, each with the peer's `ip:port`: if
+    that peer goes away, they're lost."""
     var _parked: List[_Parked]
     var _ready: List[_Ready]
     var _ip: Array[UInt8, 4]
@@ -407,7 +411,7 @@ struct Worker[
         self._peer_index = Dict[String, Int]()
         self._objects = Dict[UInt64, List[UInt8]]()
         self._lost = Dict[UInt64, String]()
-        self._requested = Dict[UInt64, Bool]()
+        self._requested = Dict[UInt64, String]()
         self._parked = List[_Parked]()
         self._ready = List[_Ready]()
         self._ip = ip.copy()
@@ -570,12 +574,16 @@ struct Worker[
             k += 1
         for i in range(n_peers):
             if rev[k] != 0:
-                self._pump(self._peers[i], rev[k])
-                while True:
-                    var f = self._peers[i].next_frame()
-                    if not f:
-                        break
-                    self._from_peer(f.take())
+                try:
+                    self._pump(self._peers[i], rev[k])
+                    while True:
+                        var f = self._peers[i].next_frame()
+                        if not f:
+                            break
+                        self._from_peer(f.take())
+                except:
+                    # A reset from a peer that died, or a frame it garbled.
+                    self._peers[i].closed = True
             k += 1
         if self._metrics:
             if rev[k] & POLLIN:
@@ -589,6 +597,11 @@ struct Worker[
                 self._start_drain()
         for j in range(len(dead) - 1, -1, -1):
             _ = self._serving.pop(dead[j])
+        # A peer that hung up stays readable at end of stream: polled again,
+        # it would return at once, forever. Drop it, and what it owed is lost.
+        for j in range(len(self._peers) - 1, -1, -1):
+            if self._peers[j].closed:
+                self._lose_peer(j)
         if rev[1] & POLLIN:
             self._serving.append(Conn(self._listener.accept()))
 
@@ -687,7 +700,6 @@ struct Worker[
                     "object ", obj, " is not on its worker"
                 )
             return
-        self._requested[obj] = True
         if key not in self._peer_index:
             try:
                 self._peers.append(Conn(Stream.connect(ip, port)))
@@ -697,11 +709,41 @@ struct Worker[
                 )
                 return
             self._peer_index[key] = len(self._peers) - 1
+        self._requested[obj] = key
         var i = self._peer_index.get(key, -1)
-        self._peers[i].send(KIND_FETCH, obj, 0, List[UInt8]())
+        try:
+            self._peers[i].send(KIND_FETCH, obj, 0, List[UInt8]())
+        except:
+            # Gone already: the end of this poll drops it.
+            self._peers[i].closed = True
+
+    def _lose_peer(mut self, i: Int):
+        """Drops the connection to peer `i`, which hung up or failed. What
+        was being fetched from it is lost: tasks waiting on it fail with
+        `input lost`, and adoptions from it are refused."""
+        var key = String()
+        for entry in self._peer_index.items():
+            if entry.value == i:
+                key = entry.key
+        var owed = List[UInt64]()
+        for entry in self._requested.items():
+            if entry.value == key:
+                owed.append(entry.key)
+        var why = String("the worker holding it (", key, ") went away")
+        for obj in owed:
+            _ = self._requested.pop(obj, String())
+            self._lost[obj] = why
+            if self._adopting.pop(obj, False):
+                self._refuse(obj, why)
+        _ = self._peers.pop(i)
+        var index = Dict[String, Int]()
+        for entry in self._peer_index.items():
+            if entry.value != i:
+                index[entry.key] = entry.value - (1 if entry.value > i else 0)
+        self._peer_index = index^
 
     def _from_peer(mut self, var f: Frame) raises:
-        _ = self._requested.pop(f.object_id, False)
+        _ = self._requested.pop(f.object_id, String())
         var obj = f.object_id
         var adopting = self._adopting.pop(obj, False)
         if f.kind == KIND_RESULT:
