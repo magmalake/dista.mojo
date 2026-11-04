@@ -432,6 +432,14 @@ def _hello_payload(role: UInt8, registry_hash: UInt64) -> List[UInt8]:
 
 def _hello(s: Stream, role: UInt8, registry_hash: UInt64) raises -> UInt64:
     """Introduces a driver to the head and returns its driver number."""
+    return _welcome(s, role, registry_hash)[0]
+
+
+def _welcome(
+    s: Stream, role: UInt8, registry_hash: UInt64
+) raises -> Tuple[UInt64, UInt64]:
+    """Introduces a driver to the head and returns its driver number and the
+    head's epoch (0 from a head that sends none)."""
     write_frame(s, KIND_HELLO, 0, 0, _hello_payload(role, registry_hash))
     var f = read_frame(s)
     if not f:
@@ -445,7 +453,11 @@ def _hello(s: Stream, role: UInt8, registry_hash: UInt64) raises -> UInt64:
     if frame.kind != KIND_WELCOME:
         raise Error("expected welcome, got frame kind ", Int(frame.kind))
     var pos = 0
-    return get_scalar[DType.uint64](frame.payload, pos)
+    var n = get_scalar[DType.uint64](frame.payload, pos)
+    var epoch = UInt64(0)
+    if len(frame.payload) >= 16:
+        epoch = get_scalar[DType.uint64](frame.payload, pos)
+    return (n, epoch)
 
 
 struct Client(Movable):
@@ -453,6 +465,11 @@ struct Client(Movable):
 
     var _head: Stream
     var _driver: UInt64
+    var _epoch: UInt64
+    """The epoch of the head that numbered this driver, which a restarted
+    head checks the number against."""
+    var _refusal: String
+    """Why a restarted head refused this driver back, once one has."""
     var _counter: UInt64
     var _hash: UInt64
     var _role: UInt8
@@ -507,7 +524,10 @@ struct Client(Movable):
             registry_hash: The registry every peer must share.
             role: `ROLE_DRIVER`, or `ROLE_CLIENT` for one inside a worker.
         """
-        self._driver = _hello(head, role, registry_hash)
+        var w = _welcome(head, role, registry_hash)
+        self._driver = w[0]
+        self._epoch = w[1]
+        self._refusal = String()
         self._head = head^
         self._hash = registry_hash
         self._role = role
@@ -879,14 +899,25 @@ struct Client(Movable):
                 self._replay()
                 return
             except e:
+                if self._refusal:
+                    # Trying again gets the same answer.
+                    raise Error(
+                        "the restarted head refused this driver: ",
+                        self._refusal,
+                    )
                 print("dista driver: lost the head again resuming (", e, ")")
 
     def _replay(mut self) raises:
         """Says hello under this driver's number and sends back its state."""
         var hello = _hello_payload(self._role, self._hash)
         put_scalar[DType.uint64](hello, self._driver)
+        if self._epoch != 0:
+            put_scalar[DType.uint64](hello, self._epoch)
         write_frame(self._head, KIND_HELLO, 0, 0, hello)
         var f = read_frame(self._head)
+        if f and f.value().kind == KIND_ERROR:
+            self._refusal = message(f.value().payload)
+            raise Error(self._refusal)
         if not f or f.value().kind != KIND_WELCOME:
             raise Error("the restarted head didn't welcome this driver back")
         # Oldest first, so every task's inputs are back before it is, and

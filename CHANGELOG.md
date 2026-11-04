@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Driver numbers no longer restart at 1 when the head does** (#91). A head
+  numbers new drivers from a random start and sends an epoch in its welcome;
+  only a driver resuming under its old number claims results the workers
+  report, so a new driver can't be handed another job's results. A resuming
+  driver whose number this head gave someone else is refused with a reason,
+  and its `Client` raises instead of retrying for ever; one that comes back
+  before the head noticed its old connection drop replaces it. Results no
+  driver comes back for are freed after `DISTA_ORPHAN_SECONDS` (default
+  120).
+
 ## [0.2.1] - 2026-11-03
 
 ### Changed
