@@ -35,4 +35,8 @@ def main() raises:
     var maps = List[ObjectRef[Int]]()
     for i in range(1000):
         maps.append(rt.remote[Square](i))
-    print("total", rt.get(rt.remote[Total](maps)))
+    var sum = rt.remote[Total](maps)
+    # The squares are only Total's inputs: release them now, and Total still
+    # gets them. `take` reads the answer and releases it too.
+    rt.release(maps)
+    print("total", rt.take(sum))

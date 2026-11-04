@@ -15,6 +15,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   poll it at 100% CPU, or die of the reset itself
   ([#89](https://github.com/magmalake/dista.mojo/issues/89)).
   `tests/peer_loss.sh` kills a worker while two others fetch from it.
+### Added
+
+- **`rt.take(ref)`**: `get`, then `release`, for a result read once. A
+  small result is decoded from the bytes it drops rather than a copy;
+  `rt.take(refs)` takes a list in order. `get` and `release` are unchanged
+  ([#98](https://github.com/magmalake/dista.mojo/issues/98)).
+- **What each driver holds.** `dista status` prints the objects each driver
+  holds, `--json` adds `driver_objects` (driver, held, client), `/metrics`
+  adds `dista_driver_held_objects_max`, and the head logs a driver holding
+  `DISTA_WARN_HELD` objects (default 100,000; 0, never), and again at each
+  doubling.
+
+### Changed
+
+- The README, `examples/mapreduce.mojo` and the docstrings read results with
+  `take`: the README's loop of `get`s kept every result in the driver and the
+  head until the program ended.
 
 ## [0.2.1] - 2026-11-03
 
