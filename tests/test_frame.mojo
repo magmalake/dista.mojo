@@ -1,5 +1,6 @@
 """Frames over a real loopback socket, and the process helpers."""
 
+from std.os import setenv, unsetenv
 from std.testing import (
     TestSuite,
     assert_equal,
@@ -22,6 +23,13 @@ from dista.frame import (
     write_frame,
 )
 from dista.socket import (
+    IPPROTO_TCP,
+    SOL_SOCKET,
+    SO_KEEPALIVE,
+    TCP_KEEPCNT,
+    TCP_KEEPIDLE,
+    TCP_KEEPINTVL,
+    get_int_option,
     Listener,
     POLLOUT,
     Stream,
@@ -249,6 +257,37 @@ def test_parts_out_of_order_raise() raises:
     var second = parse_body(Span(out)[at[1] + 4 : at[2]])
     with assert_raises(contains="bad part"):
         _ = parts.add(second.payload)
+
+
+def test_sockets_keep_alive() raises:
+    """Both ends of a connection probe a silent peer: after 10 s idle, every
+    5 s, 3 times. Without it, a peer whose host froze or lost its network
+    was never noticed."""
+    var l = Listener()
+    var c = Stream.connect(l.port)
+    var s = l.accept()
+    for fd in [c.fd, s.fd]:
+        assert_true(get_int_option(fd, SOL_SOCKET, SO_KEEPALIVE) != 0)
+        assert_equal(get_int_option(fd, IPPROTO_TCP, TCP_KEEPIDLE), 10)
+        assert_equal(get_int_option(fd, IPPROTO_TCP, TCP_KEEPINTVL), 5)
+        assert_equal(get_int_option(fd, IPPROTO_TCP, TCP_KEEPCNT), 3)
+    c.close()  # alive until here
+    s.close()
+
+
+def test_keepalive_follows_the_environment() raises:
+    _ = setenv("DISTA_KEEPALIVE_SECONDS", "4")
+    var l = Listener()
+    var c = Stream.connect(l.port)
+    _ = setenv("DISTA_KEEPALIVE_SECONDS", "0")
+    var off = Stream.connect(l.port)
+    _ = unsetenv("DISTA_KEEPALIVE_SECONDS")
+    assert_equal(get_int_option(c.fd, IPPROTO_TCP, TCP_KEEPIDLE), 4)
+    assert_equal(get_int_option(c.fd, IPPROTO_TCP, TCP_KEEPINTVL), 2)
+    assert_equal(get_int_option(off.fd, SOL_SOCKET, SO_KEEPALIVE), 0)
+    c.close()
+    off.close()
+    l.close()
 
 
 def test_fork_and_exit_status() raises:

@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tests/peer_loss.sh` kills a worker while two others fetch from it.
 ### Added
 
+- **Silent peers are noticed.** Every socket has TCP keepalive: a worker,
+  head or driver whose host froze or dropped off the network fails its
+  connections after about 25 s (`DISTA_KEEPALIVE_SECONDS`, default 10 s of
+  silence, then 3 probes; 0 turns it off). The head then drops the worker
+  and runs its tasks again, and a worker rejoins `DISTA_HEAD`, a
+  replacement head included. **`DISTA_TASK_TIMEOUT`** (seconds; unset, no
+  limit) fails a task still running that long after it was sent, and
+  `/metrics` counts them in `dista_tasks_timed_out_total`
+  ([#90](https://github.com/magmalake/dista.mojo/issues/90)).
 - **`rt.take(ref)`**: `get`, then `release`, for a result read once. A
   small result is decoded from the bytes it drops rather than a copy;
   `rt.take(refs)` takes a list in order. `get` and `release` are unchanged

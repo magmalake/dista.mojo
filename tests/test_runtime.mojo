@@ -269,6 +269,23 @@ def test_a_task_that_keeps_losing_its_worker_fails() raises:
     assert_equal(rt.get(rt.remote[Square](12)), 144)
 
 
+def test_a_task_past_its_deadline_fails() raises:
+    """With `DISTA_TASK_TIMEOUT`, a task still running that long after it was
+    sent fails, as when its worker's host froze and nothing closed the
+    connection; the workers carry on. Without it, `get` waited for ever."""
+    _ = setenv("DISTA_TASK_TIMEOUT", "1")
+    var rt = Runtime[Square, Nap](workers=2, pipeline=1)
+    _ = unsetenv("DISTA_TASK_TIMEOUT")
+    assert_equal(rt.get(rt.remote[Nap](100)), 100)  # inside the deadline
+    var t0 = perf_counter_ns()
+    var stuck = rt.remote[Nap](4000)
+    with assert_raises(contains="timed out"):
+        _ = rt.get(stuck)
+    var took = Float64(perf_counter_ns() - t0) / 1e9
+    assert_true(took >= 0.9 and took < 3.0, String("failed after ", took, " s"))
+    assert_equal(rt.get(rt.remote[Square](12)), 144)
+
+
 def test_running_out_of_local_workers_fails_instead_of_hanging() raises:
     """A task that kills every worker it runs on uses up a local runtime's
     workers, which nothing replaces: then it fails, and so does the next
