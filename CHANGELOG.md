@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-04
+
+The merge trains #106 and #109 (#107 large results in part frames, #108
+keepalive and `DISTA_TASK_TIMEOUT`, and the purge/cancel fixes), #110 (one
+copy per hop on the fetch path), and the S3 multipart fix.
+
+### Changed
+
+- Built against objectstore-mojo 0.4.2 (objectstore-shim 0.2.1), the S3
+  multipart fix. The stable, nightly and data environments and the CI
+  checkouts pin the same revision.
+
 ### Fixed
 
 - **A task fetching an input from a worker that dies fails** with

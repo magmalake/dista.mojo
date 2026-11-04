@@ -2,7 +2,7 @@
 authors = ["Marius S <39998+winding-lines@users.noreply.github.com>"]
 channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "dista.mojo"
-version = "0.2.1"
+version = "0.2.2"
 description = "Distributed tasks for Mojo: mark a function remote, call it, and the work runs across a cluster."
 preview = ["pixi-build"]
 # linux-aarch64 lets the container image build natively on ARM hosts, such as
@@ -47,7 +47,7 @@ bench-fetch = { cmd = "mkdir -p build && mojo build -I src $DEP_INC bench/fetch.
 
 [package]
 name = "dista-mojo"
-version = "0.2.1"
+version = "0.2.2"
 
 [package.build]
 backend = { name = "pixi-build-mojo", version = "0.*" }
@@ -62,7 +62,7 @@ extra-args = ["-I", "$PREFIX/lib/mojo"]
 mojo-compiler = "==1.2.0"
 arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "178aae6e0da0dbe105f9cb02632a51cfd35b9dda" }
 memory-region-mojo = { git = "https://github.com/magmalake/memory-region.mojo", rev = "40068c4f95ea659e9b78aa91ced45420b07e3e6e" }
-objectstore-mojo = { git = "https://github.com/magmalake/objectstore.mojo", rev = "41fac2800882e5a64da09729262dfa22bbd4ad13" }
+objectstore-mojo = { git = "https://github.com/magmalake/objectstore.mojo", rev = "ff66975c095f392695facc1b6dd56823dec914bc" }
 
 [package.build-dependencies]
 mojo-compiler = "==1.2.0"
@@ -71,7 +71,7 @@ mojo-compiler = "==1.2.0"
 mojo-compiler = ">=1.2.0,<2"
 arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "178aae6e0da0dbe105f9cb02632a51cfd35b9dda" }
 memory-region-mojo = { git = "https://github.com/magmalake/memory-region.mojo", rev = "40068c4f95ea659e9b78aa91ced45420b07e3e6e" }
-objectstore-mojo = { git = "https://github.com/magmalake/objectstore.mojo", rev = "41fac2800882e5a64da09729262dfa22bbd4ad13" }
+objectstore-mojo = { git = "https://github.com/magmalake/objectstore.mojo", rev = "ff66975c095f392695facc1b6dd56823dec914bc" }
 
 # Stable is the default: dista targets Mojo 1.2.0. The nightly environment
 # tracks 1.3.0.dev so breaking changes show up early.
@@ -88,7 +88,7 @@ arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev 
 # objectstore writes actor checkpoints to DISTA_CHECKPOINT_URI, a local
 # directory or s3://. Pinned at the revision mojoshelf published
 # (objectstore-mojo 0.4.0), as the data environment's is.
-objectstore-mojo = { git = "https://github.com/magmalake/objectstore.mojo", rev = "41fac2800882e5a64da09729262dfa22bbd4ad13" }
+objectstore-mojo = { git = "https://github.com/magmalake/objectstore.mojo", rev = "ff66975c095f392695facc1b6dd56823dec914bc" }
 
 # A precompiled package only loads in the compiler that built it, and this one
 # is 1.2.0's, so the nightly compiles memory-region, arrow-mlake and
@@ -105,7 +105,7 @@ DEP_INC = "-I ../memory-region.mojo/src -I ../arrow-mlake.mojo/src -I ../objects
 modular = ">=26.8.0.dev2026102305,<28"
 # objectstore's Mojo compiles from its checkout; the shim it dlopens is C, so
 # the nightly takes that as a package.
-objectstore-shim = { git = "https://github.com/magmalake/objectstore.mojo", rev = "41fac2800882e5a64da09729262dfa22bbd4ad13", subdirectory = "shim" }
+objectstore-shim = { git = "https://github.com/magmalake/objectstore.mojo", rev = "ff66975c095f392695facc1b6dd56823dec914bc", subdirectory = "shim" }
 
 # `mojo-compiler` ships no formatter; the nightly `modular` package does. The
 # environment takes `no-default-feature`, so its tasks live in the feature.
@@ -127,7 +127,7 @@ format-check = { cmd = "mojo format src tests bench examples deploy fuzz cli && 
 # the package is what installs the C shim each one links.
 [feature.data.dependencies]
 mojo-compiler = "==1.2.0"
-objectstore-mojo = { git = "https://github.com/magmalake/objectstore.mojo", rev = "41fac2800882e5a64da09729262dfa22bbd4ad13" }
+objectstore-mojo = { git = "https://github.com/magmalake/objectstore.mojo", rev = "ff66975c095f392695facc1b6dd56823dec914bc" }
 zstd-mojo = { git = "https://github.com/magmalake/zstd.mojo", rev = "76190bb31012cd2d2f6712c4e1724a66474215db" }
 lz4-mojo = { git = "https://github.com/magmalake/lz4.mojo", rev = "23cd6e54967d7e41573371507228ca5c958ca685" }
 brotli-mojo = { git = "https://github.com/magmalake/brotli.mojo", rev = "dcbf840d22e3deaf24c587d12d28570a9a882b7f" }
