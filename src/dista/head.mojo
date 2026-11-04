@@ -2397,12 +2397,15 @@ struct Head(Movable):
         if obj in self._running:
             self._fail_all(obj, String("cancelled"))
             return
-        for k in range(len(self._waiting)):
-            if self._waiting[k].object_id == obj:
-                var t = self._waiting.pop(k)
+        if obj in self._waiting:
+            try:
+                var t = self._waiting.pop(obj)
                 self._waiting_bytes -= len(t.args)
-                self._fail_all(obj, String("cancelled"))
-                return
+            except:
+                pass
+            _ = self._unsettled.pop(obj, 0)
+            self._fail_all(obj, String("cancelled"))
+            return
         # Queued, most likely: `_dispatch` drops it when it reaches the front
         # of its queue. If it's no task in a queue, the mark goes with the
         # object.
@@ -2433,16 +2436,18 @@ struct Head(Movable):
                 q.head = 0
             except:
                 pass
-        var still = List[_Task]()
-        while len(self._waiting) > 0:
-            var t = self._waiting.pop()
-            if owner_of(t.object_id) == d:
+        var gone = List[UInt64]()
+        for entry in self._waiting.items():
+            if owner_of(entry.key) == d:
+                gone.append(entry.key)
+        for obj in gone:
+            try:
+                var t = self._waiting.pop(obj)
                 self._waiting_bytes -= len(t.args)
-                dropped.append(t.object_id)
-            else:
-                still.append(t^)
-        still.reverse()
-        self._waiting = still^
+            except:
+                continue
+            _ = self._unsettled.pop(obj, 0)
+            dropped.append(obj)
         for obj in dropped:
             var parts = self._many.pop(obj, 1)
             _ = self._tries.pop(obj, 0)
