@@ -96,11 +96,16 @@ struct Conn(Movable):
                 var have = len(self._big)
                 var room = self._big_need - have
                 self._big.resize(unsafe_uninit_length=self._big_need)
-                n = recv_some(
-                    self.stream.fd,
-                    self._big.unsafe_ptr().unsafe_offset(have),
-                    room,
-                )
+                try:
+                    n = recv_some(
+                        self.stream.fd,
+                        self._big.unsafe_ptr().unsafe_offset(have),
+                        room,
+                    )
+                except e:
+                    # A reset: the bytes not read must not count as read.
+                    self._big.shrink(have)
+                    raise e^
                 self._big.shrink(have + max(n, 0))
             else:
                 var have = len(self._in)
@@ -110,11 +115,16 @@ struct Conn(Movable):
                         max(2 * self._in.capacity(), have + _READ_CHUNK)
                     )
                 self._in.resize(unsafe_uninit_length=have + _READ_CHUNK)
-                n = recv_some(
-                    self.stream.fd,
-                    self._in.unsafe_ptr().unsafe_offset(have),
-                    _READ_CHUNK,
-                )
+                try:
+                    n = recv_some(
+                        self.stream.fd,
+                        self._in.unsafe_ptr().unsafe_offset(have),
+                        _READ_CHUNK,
+                    )
+                except e:
+                    # A reset: the bytes not read must not count as read.
+                    self._in.shrink(have)
+                    raise e^
                 self._in.shrink(have + max(n, 0))
                 if n > 0 and self._big_need == 0:
                     self._go_big()

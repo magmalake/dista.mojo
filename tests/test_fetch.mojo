@@ -75,6 +75,28 @@ def test_a_large_frame_is_read_into_its_own_buffer() raises:
     assert_true(most < 2 * BIG_FRAME, "the large frame went through _in")
 
 
+def test_a_failed_read_leaves_no_bytes_behind() raises:
+    """A read that fails, as a reset from a head that died does on Linux,
+    adds nothing to the input buffer: what follows must not parse the
+    buffer's uninitialized room as frames ("bad frame length 0")."""
+    var conns = _nonblocking_pair()
+    conns[0].send(KIND_RESULT, 1, 0, List[UInt8]("whole".as_bytes()))
+    conns[0].send(KIND_RESULT, 2, 0, List[UInt8](length=BIG_FRAME, fill=1))
+    conns[1].read_available()
+    var whole = conns[1].next_frame()
+    assert_true(Bool(whole) and whole.value().object_id == 1)
+    var before = len(conns[1]._in) + len(conns[1]._big)
+    conns[1].stream.close()  # the next recv fails, as a reset's does
+    var failed = False
+    try:
+        conns[1].read_available()
+    except:
+        failed = True
+    assert_true(failed, "a read on a closed socket succeeded")
+    assert_equal(len(conns[1]._in) + len(conns[1]._big), before)
+    assert_true(not conns[1].next_frame(), "a frame came out of nothing")
+
+
 # A worker with no tasks: these only serve.
 def _dispatch(
     t: UInt64, a: List[UInt8], mut o: List[UInt8], mut c: TaskContext
