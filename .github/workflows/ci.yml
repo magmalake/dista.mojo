@@ -19,8 +19,32 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Whether the PR changes anything but prose (*.md, docs/, the licence
+  # files), which no test, build or check reads. Pushes, the nightly, runs by
+  # hand, and a failure here all count as code.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.files.outputs.code }}
+    steps:
+      - id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.number }}
+        run: |
+          code=true
+          if [ "$EVENT" = pull_request ]; then
+            files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename')
+            printf '%s\n' "$files" | grep -qvE '(\.md$|^docs/|^LICENSE$|^NOTICE$)' || code=false
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
   test:
     name: ${{ matrix.env == 'default' && 'stable' || matrix.env }} / ${{ matrix.os }}
+    needs: changes
+    # Runs even if `changes` failed: then everything does.
+    if: ${{ !cancelled() }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -32,33 +56,37 @@ jobs:
       run:
         working-directory: dista.mojo
     steps:
-      - uses: actions/checkout@v4
+      # dista's required checks: for a prose-only PR the job runs and passes,
+      # its steps skipped, so the checks still report.
+      - if: needs.changes.outputs.code != 'false'
+        uses: actions/checkout@v4
         with:
           path: dista.mojo
 
       # The nightly compiles memory-region, arrow-mlake and objectstore from source,
       # because their packages are precompiled by 1.2.0 and a 1.3 compiler
       # refuses them. The refs match the pins in pixi.toml.
-      - if: matrix.env == 'nightly'
+      - if: needs.changes.outputs.code != 'false' && (matrix.env == 'nightly')
         uses: actions/checkout@v4
         with:
           repository: magmalake/memory-region.mojo
           ref: 40068c4f95ea659e9b78aa91ced45420b07e3e6e
           path: memory-region.mojo
-      - if: matrix.env == 'nightly'
+      - if: needs.changes.outputs.code != 'false' && (matrix.env == 'nightly')
         uses: actions/checkout@v4
         with:
           repository: magmalake/arrow-mlake.mojo
           ref: 178aae6e0da0dbe105f9cb02632a51cfd35b9dda
           path: arrow-mlake.mojo
-      - if: matrix.env == 'nightly'
+      - if: needs.changes.outputs.code != 'false' && (matrix.env == 'nightly')
         uses: actions/checkout@v4
         with:
           repository: magmalake/objectstore.mojo
           ref: ff66975c095f392695facc1b6dd56823dec914bc
           path: objectstore.mojo
 
-      - uses: prefix-dev/setup-pixi@v0.10.2
+      - if: needs.changes.outputs.code != 'false'
+        uses: prefix-dev/setup-pixi@v0.10.2
         with:
           # Pinned: pixi.lock is written by this version, and a newer pixi
           # rejects the committed lock with "lock file not up-to-date".
@@ -76,7 +104,8 @@ jobs:
       # code main has built already 4-6x faster. It's content-addressed, so a
       # stale entry is never used. Saved by main and the nightly, like the
       # environment.
-      - uses: actions/cache/restore@v4
+      - if: needs.changes.outputs.code != 'false'
+        uses: actions/cache/restore@v4
         with:
           path: dista.mojo/.pixi/envs/${{ matrix.env }}/share/max/cache
           key: mojo-${{ runner.os }}-${{ matrix.env }}-${{ hashFiles('dista.mojo/pixi.lock') }}-${{ github.run_id }}
@@ -86,15 +115,16 @@ jobs:
       # loopback TCP. Linux is the leg that checks the socket layer's
       # platform constants: sockaddr_in's first byte, SOL_SOCKET and
       # MSG_NOSIGNAL all differ from macOS.
-      - name: Tests
+      - if: needs.changes.outputs.code != 'false'
+        name: Tests
         run: pixi run -e ${{ matrix.env }} test
 
       # Entries a week old go before saving, so the cache can't grow without
       # bound; one still in use is rebuilt once.
-      - if: always() && github.event_name != 'pull_request'
+      - if: always() && needs.changes.outputs.code != 'false' && github.event_name != 'pull_request'
         name: Prune Mojo's compile cache
         run: find .pixi/envs/${{ matrix.env }}/share/max/cache -type f -mtime +7 -delete || true
-      - if: always() && github.event_name != 'pull_request'
+      - if: always() && needs.changes.outputs.code != 'false' && github.event_name != 'pull_request'
         uses: actions/cache/save@v4
         with:
           path: dista.mojo/.pixi/envs/${{ matrix.env }}/share/max/cache
@@ -106,7 +136,8 @@ jobs:
   # lets it share a binary with the standard library's file seek. See the
   # data environment in pixi.toml.
   data:
-    if: github.event_name != 'schedule'
+    needs: changes
+    if: ${{ !cancelled() && github.event_name != 'schedule' && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -180,7 +211,8 @@ jobs:
   # The image builds the program with pixi itself, so this job needs only
   # docker, kubectl (both on the runner) and kind.
   kind:
-    if: github.event_name != 'schedule'
+    needs: changes
+    if: ${{ !cancelled() && github.event_name != 'schedule' && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -193,7 +225,8 @@ jobs:
   # Every fuzz harness under fuzz/, for a short session each, with all bounds
   # checks on. Longer sessions are a FUZZ_RUNS away locally.
   fuzz:
-    if: github.event_name != 'schedule'
+    needs: changes
+    if: ${{ !cancelled() && github.event_name != 'schedule' && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
