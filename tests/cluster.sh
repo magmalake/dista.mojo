@@ -4,8 +4,8 @@
 # that a binary built with different tasks is refused.
 set -euo pipefail
 mkdir -p build
-mojo build -I src ${DEP_INC:--I src} examples/mapreduce.mojo -o build/mapreduce
-mojo build -I src ${DEP_INC:--I src} tests/other_registry.mojo -o build/other-registry
+scripts/mojo-build.sh -I src ${DEP_INC:--I src} examples/mapreduce.mojo -o build/mapreduce
+scripts/mojo-build.sh -I src ${DEP_INC:--I src} tests/other_registry.mojo -o build/other-registry
 
 pids=()
 cleanup() { kill "${pids[@]}" 2>/dev/null || true; }

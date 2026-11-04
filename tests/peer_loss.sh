@@ -9,7 +9,7 @@
 # spin on the connection it closed.
 set -euo pipefail
 mkdir -p build
-mojo build -I src ${DEP_INC:--I src} tests/peer_loss_driver.mojo -o build/peer-loss-driver
+scripts/mojo-build.sh -I src ${DEP_INC:--I src} tests/peer_loss_driver.mojo -o build/peer-loss-driver
 
 pids=()
 cleanup() { kill -9 "${pids[@]}" 2>/dev/null || true; }

@@ -8,8 +8,8 @@
 # and every drained worker exiting 0.
 set -euo pipefail
 mkdir -p build
-mojo build -I src ${DEP_INC:--I src} cli/main.mojo -o build/dista
-mojo build -I src ${DEP_INC:--I src} tests/autoscale_driver.mojo -o build/autoscale-driver
+scripts/mojo-build.sh -I src ${DEP_INC:--I src} cli/main.mojo -o build/dista
+scripts/mojo-build.sh -I src ${DEP_INC:--I src} tests/autoscale_driver.mojo -o build/autoscale-driver
 
 pids=()
 cleanup() { kill -9 "${pids[@]}" 2>/dev/null || true; }

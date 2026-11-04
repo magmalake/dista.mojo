@@ -9,7 +9,7 @@
 # kernel's two minutes.
 set -euo pipefail
 mkdir -p build
-mojo build -I src ${DEP_INC:--I src} tests/peer_connect_driver.mojo -o build/peer-connect-driver
+scripts/mojo-build.sh -I src ${DEP_INC:--I src} tests/peer_connect_driver.mojo -o build/peer-connect-driver
 
 pids=()
 cleanup() { kill -9 "${pids[@]}" 2>/dev/null || true; }

@@ -12,7 +12,7 @@
 # actors bring restarts (phase 3, PR 6), and then workers join the kill list.
 set -euo pipefail
 mkdir -p build
-mojo build -I src ${DEP_INC:--I src} tests/chaos_driver.mojo -o build/chaos-driver
+scripts/mojo-build.sh -I src ${DEP_INC:--I src} tests/chaos_driver.mojo -o build/chaos-driver
 
 for seed in ${CHAOS_SEEDS:-1 2 3}; do
   pids=()
