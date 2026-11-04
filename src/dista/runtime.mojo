@@ -417,6 +417,20 @@ struct Runtime[*Ts: TaskLike](Movable):
         """Waits for `r`'s task and returns its result, or raises its error."""
         return self._c.get(r)
 
+    def get[
+        R: Movable
+    ](mut self, r: ObjectRef[R], timeout: Float64) raises -> R:
+        """Waits up to `timeout` seconds for `r`: see `Client.get`."""
+        return self._c.get(r, timeout)
+
+    def cancel[R: AnyType](mut self, r: ObjectRef[R]) raises:
+        """Gives up on `r`: see `Client.cancel`."""
+        self._c.cancel(r)
+
+    def cancel[R: AnyType](mut self, refs: List[ObjectRef[R]]) raises:
+        """Cancels every ref in `refs`."""
+        self._c.cancel(refs)
+
     def release[R: AnyType](mut self, r: ObjectRef[R]) raises:
         """Says this driver is done with `r`: see `Client.release`."""
         self._c.release(r)

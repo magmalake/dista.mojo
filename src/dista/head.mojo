@@ -105,6 +105,7 @@ from dista.frame import (
     KIND_ACTOR_RESTORE,
     KIND_ADOPT,
     KIND_ADOPTED,
+    KIND_CANCEL,
     KIND_CHECKPOINT,
     KIND_CHECKPOINTED,
     KIND_CLAIM,
@@ -458,6 +459,10 @@ struct Head(Movable):
     its tasks wait; 0, no limit."""
     var _pauses: Int
     """Times the head stopped reading drivers, for the metrics."""
+    var _cancelled: Dict[UInt64, Bool]
+    """Objects a driver cancelled while their task was queued, or that wasn't
+    a task: a queued one is dropped when it reaches the front of its queue.
+    """
 
     def __init__(
         out self,
@@ -549,6 +554,7 @@ struct Head(Movable):
         self._paused = False
         self._max_driver_buffer = _env_int("DISTA_MAX_DRIVER_BUFFER", 1 << 28)
         self._pauses = 0
+        self._cancelled = Dict[UInt64, Bool]()
 
     def run(mut self) raises:
         """Serves until the last driver leaves, in local mode; else forever."""
@@ -1245,6 +1251,8 @@ struct Head(Movable):
                 self._call(f^)
             elif f.kind == KIND_ACTOR_KILL:
                 self._kill(f.object_id)
+            elif f.kind == KIND_CANCEL:
+                self._cancel(f.object_id)
             elif f.kind == KIND_CHECKPOINT:
                 self._ask_checkpoint(f^)
             elif f.kind == KIND_TIMELINE:
@@ -1494,8 +1502,8 @@ struct Head(Movable):
         self._maybe_checkpoint(a)
 
     def _answer_checkpoint(mut self, obj: UInt64, calls: Int):
-        if self._dead.pop(obj, False):
-            return
+        if self._dead.pop(obj, False) or obj in self._errors:
+            return  # released, or cancelled
         var body = List[UInt8]()
         put_scalar[DType.int](body, Scalar[DType.int](calls))
         self._results[obj] = body.copy()
@@ -1912,6 +1920,7 @@ struct Head(Movable):
     def _free(mut self, object_id: UInt64):
         """Forgets a settled object, and has its worker delete it."""
         _ = self._stuck.pop(object_id, False)
+        _ = self._cancelled.pop(object_id, False)
         _ = self._results.pop(object_id, List[UInt8]())
         _ = self._errors.pop(object_id, String())
         _ = self._where.pop(object_id, List[UInt8]())
@@ -1938,6 +1947,9 @@ struct Head(Movable):
                     gone = entry.key
             if gone != 0:
                 _ = self._driver_conn.pop(gone, -1)
+                # Its tasks that haven't run never will: nobody would read
+                # them. Those running finish, and their results are dropped.
+                self._purge(gone)
                 self._forget_spans(gone)
                 # A driver that's gone holds nothing.
                 var mine = List[UInt64]()
@@ -2019,6 +2031,12 @@ struct Head(Movable):
             for obj in lost:
                 if obj in replays:
                     continue
+                if (
+                    obj in self._errors
+                    or obj in self._results
+                    or obj in self._location
+                ):
+                    continue  # answered already: cancelled while it ran
                 var why = self._why_not_retry(obj)
                 if why == "":
                     try:
@@ -2036,6 +2054,77 @@ struct Head(Movable):
                     if k > 0 and self._answered(part):
                         continue
                     self._fail(part, why.copy())
+
+    def _cancel(mut self, obj: UInt64):
+        """A driver's `cancel`: `obj` fails with "cancelled". Its task, if it
+        hasn't run, never does; if it's running, its result is dropped when
+        it comes. An actor call still runs, since the calls after it expect
+        the actor's state to have seen it. A settled object is left alone.
+        """
+        if self._answered(obj):
+            return
+        if obj in self._running:
+            self._fail_all(obj, String("cancelled"))
+            return
+        for k in range(len(self._waiting)):
+            if self._waiting[k].object_id == obj:
+                var t = self._waiting.pop(k)
+                self._waiting_bytes -= len(t.args)
+                self._fail_all(obj, String("cancelled"))
+                return
+        # Queued, most likely: `_dispatch` drops it when it reaches the front
+        # of its queue. If it's no task in a queue, the mark goes with the
+        # object.
+        self._cancelled[obj] = True
+        self._fail_all(obj, String("cancelled"))
+
+    def _purge(mut self, d: UInt64):
+        """Drops departed driver `d`'s tasks that are queued or waiting for
+        inputs. They go entirely, so the same driver resuming with this head
+        submits them afresh."""
+        var dropped = List[UInt64]()
+        var hashes = List[UInt64]()
+        for entry in self._queues.items():
+            hashes.append(entry.key)
+        for h in hashes:
+            try:
+                ref q = self._queues[h]
+                var kept = List[_Task]()
+                while len(q.tasks) > q.head:
+                    var t = q.tasks.pop()
+                    if owner_of(t.object_id) == d:
+                        self._queued_bytes -= len(t.args)
+                        dropped.append(t.object_id)
+                    else:
+                        kept.append(t^)
+                kept.reverse()
+                q.tasks = kept^
+                q.head = 0
+            except:
+                pass
+        var still = List[_Task]()
+        while len(self._waiting) > 0:
+            var t = self._waiting.pop()
+            if owner_of(t.object_id) == d:
+                self._waiting_bytes -= len(t.args)
+                dropped.append(t.object_id)
+            else:
+                still.append(t^)
+        still.reverse()
+        self._waiting = still^
+        for obj in dropped:
+            var parts = self._many.pop(obj, 1)
+            _ = self._tries.pop(obj, 0)
+            _ = self._spans.pop(obj, _Span(0, 0, -1, 0, 0, 0, 0, 0, 0, 0))
+            var deps = self._deps_of.pop(obj, List[UInt64]())
+            for dep in deps:
+                self._dec(dep)
+            for k in range(parts):
+                var part = obj + UInt64(k)
+                _ = self._held.pop(part, False)
+                _ = self._refs.pop(part, 0)
+                _ = self._dead.pop(part, False)
+                self._free(part)
 
     def _move_actor(mut self, a: UInt64):
         """Starts moving actor `a` off its draining worker: holds its new
@@ -2257,6 +2346,8 @@ struct Head(Movable):
         self._queues = Dict[UInt64, _Queue]()
         self._queued_bytes = 0
         for ref t in queued:
+            if self._cancelled.pop(t.object_id, False):
+                continue  # failed already
             var parts = self._many.get(t.object_id, 1)
             for k in range(parts):
                 self._fail(
@@ -2469,6 +2560,8 @@ struct Head(Movable):
         var fallback = -1
         var end = min(q.head + LOOKAHEAD, len(q.tasks))
         for k in range(q.head, end):
+            if q.tasks[k].object_id in self._cancelled:
+                continue  # dropped when it reaches the front
             if self._on_draining(q.tasks[k]):
                 continue
             if self._driver_behind(q.tasks[k].object_id):
@@ -2538,6 +2631,19 @@ struct Head(Movable):
                 var t: _Task
                 try:
                     ref q = self._queues[h]
+                    while (
+                        len(q) > 0
+                        and q.tasks[q.head].object_id in self._cancelled
+                    ):
+                        _ = self._cancelled.pop(
+                            q.tasks[q.head].object_id, False
+                        )
+                        self._queued_bytes -= len(q.tasks[q.head].args)
+                        q.tasks[q.head].args = List[UInt8]()
+                        q.head += 1
+                    if q.head == len(q.tasks):
+                        q.tasks.clear()
+                        q.head = 0
                     if len(q) == 0:
                         continue
                     var k = self._pick(q, i, depth)
