@@ -182,7 +182,7 @@ struct _Span(Copyable, Movable):
     var object_id: UInt64
     var task_id: UInt64
     var worker: Int
-    """The connection that ran it, or -1."""
+    """The worker that ran it, by its entry in the head's `_book`, or -1."""
     var submitted: UInt64
     var queued: UInt64
     var dispatched: UInt64
@@ -360,7 +360,16 @@ struct Head(Movable):
     var _many: Dict[UInt64, Int]
     """A running `TaskMany`'s first result, and how many it has: its worker
     going away fails them all."""
-    var _waiting: List[_Task]
+    var _waiting: Dict[UInt64, _Task]
+    """Tasks waiting for their inputs, by object, oldest first."""
+    var _waiters: Dict[UInt64, List[UInt64]]
+    """For an input that hasn't settled, the waiting tasks that take it, once
+    per time each takes it."""
+    var _unsettled: Dict[UInt64, Int]
+    """For a waiting task, how many of its inputs haven't settled."""
+    var _recheck: List[UInt64]
+    """Waiting tasks whose inputs have all settled, or one failed, since the
+    loop last looked: the only ones `_release_waiting` looks at."""
     var _results: Dict[UInt64, List[UInt8]]
     var _errors: Dict[UInt64, String]
     var _worker_addr: List[List[UInt8]]
@@ -373,6 +382,17 @@ struct Head(Movable):
     """
     var _where: Dict[UInt64, List[UInt8]]
     """Those results' encoded locations, as the worker reported them."""
+    var _held_on: List[Int]
+    """For a worker, the bytes of the results `_location` places on it."""
+    var _free_slots: List[Int]
+    """Connections dropped, whose slots the next connections take: a
+    long-lived head polled every second doesn't scan every connection it
+    ever had."""
+    var _book: List[List[UInt8]]
+    """Every worker's address since the head started, as frames carry it:
+    what a span names its worker by, since a slot outlives its worker."""
+    var _book_of: List[Int]
+    """For a worker, its entry in `_book`; -1 for any other connection."""
     var _refs: Dict[UInt64, Int]
     """Every live object's reference count."""
     var _held: Dict[UInt64, Bool]
@@ -500,13 +520,20 @@ struct Head(Movable):
             self._max_retries = Int(getenv("DISTA_TASK_RETRIES", "3"))
         except:
             pass
-        self._waiting = List[_Task]()
+        self._waiting = Dict[UInt64, _Task]()
+        self._waiters = Dict[UInt64, List[UInt64]]()
+        self._unsettled = Dict[UInt64, Int]()
+        self._recheck = List[UInt64]()
         self._results = Dict[UInt64, List[UInt8]]()
         self._errors = Dict[UInt64, String]()
         self._worker_addr = List[List[UInt8]]()
         self._node = List[String]()
         self._location = Dict[UInt64, Int]()
         self._where = Dict[UInt64, List[UInt8]]()
+        self._held_on = List[Int]()
+        self._free_slots = List[Int]()
+        self._book = List[List[UInt8]]()
+        self._book_of = List[Int]()
         self._refs = Dict[UInt64, Int]()
         self._held = Dict[UInt64, Bool]()
         self._deps_of = Dict[UInt64, List[UInt64]]()
@@ -1003,18 +1030,32 @@ struct Head(Movable):
 
     def _held_bytes(self, i: Int) -> Int:
         """Bytes of the results that stayed on worker `i`."""
-        var n = 0
-        for entry in self._location.items():
-            if entry.value != i:
-                continue
+        return self._held_on[i]
+
+    def _put_location(mut self, obj: UInt64, i: Int, loc: Span[UInt8, _]):
+        """Records that `obj`'s result is on worker `i`, at `loc`; it moves
+        there if it was elsewhere."""
+        _ = self._pop_location(obj)
+        self._location[obj] = i
+        self._where[obj] = List[UInt8](loc)
+        try:
+            var pos = 0
+            self._held_on[i] += Location.decode(loc, pos).size
+        except:
+            pass
+        self._settled(obj)
+
+    def _pop_location(mut self, obj: UInt64) -> Int:
+        """Forgets where `obj`'s result is; the worker it was on, or -1."""
+        var i = self._location.pop(obj, -1)
+        var loc = self._where.pop(obj, List[UInt8]())
+        if i >= 0:
             try:
                 var pos = 0
-                n += Location.decode(
-                    self._where.get(entry.key, List[UInt8]()), pos
-                ).size
+                self._held_on[i] -= Location.decode(loc, pos).size
             except:
                 pass
-        return n
+        return i
 
     def _idle_workers(self) -> Int:
         var now = wall_ns()
@@ -1086,8 +1127,25 @@ struct Head(Movable):
 
     def _add_conn(mut self, var conn: Conn) -> Int:
         """A new connection, with an entry in every per-connection list; its
-        index. The fuzzer adds its connections here too."""
+        index, a dropped connection's if there is one. The fuzzer adds its
+        connections here too."""
+        if len(self._free_slots) > 0:
+            var i = self._free_slots.pop()
+            self._conns[i] = conn^
+            self._roles[i] = _ROLE_NONE
+            self._inflight[i] = List[UInt64]()
+            self._worker_addr[i] = List[UInt8]()
+            self._node[i] = String()
+            self._hosting[i] = 0
+            self._hashes[i] = 0
+            self._draining[i] = _DRAIN_NO
+            self._busy_at[i] = wall_ns()
+            self._held_on[i] = 0
+            self._book_of[i] = -1
+            return i
         self._conns.append(conn^)
+        self._held_on.append(0)
+        self._book_of.append(-1)
         self._roles.append(_ROLE_NONE)
         self._inflight.append(List[UInt64]())
         self._worker_addr.append(List[UInt8]())
@@ -1172,15 +1230,14 @@ struct Head(Movable):
                 self._deps_of[f.object_id] = deps.copy()
                 self._open_span(f.object_id, f.task_id)
                 self._waiting_bytes += len(value)
-                self._waiting.append(
-                    _Task(
-                        f.object_id,
-                        f.task_id,
-                        value^,
-                        deps=deps^,
-                        gather=gather,
-                        many=many,
-                    )
+                self._wait_for(f.object_id, deps)
+                self._waiting[f.object_id] = _Task(
+                    f.object_id,
+                    f.task_id,
+                    value^,
+                    deps=deps^,
+                    gather=gather,
+                    many=many,
                 )
             elif f.kind == KIND_TASK_MANY:
                 self._task_many(f^)
@@ -1190,10 +1247,12 @@ struct Head(Movable):
                 if self._known(obj):
                     return
                 self._hold(obj)
+                var failed = f.kind == KIND_ERROR
                 if f.kind == KIND_RESULT:
                     self._results[obj] = f^.take_payload()
                 else:
                     self._errors[obj] = message(f.payload)
+                self._settled(obj, failed)
             elif f.kind == KIND_CLAIM:
                 var obj = f.object_id
                 if self._known(obj):
@@ -1316,6 +1375,7 @@ struct Head(Movable):
                 return
             elif f.kind == KIND_RESULT:
                 self._results[obj] = f.payload.copy()
+                self._settled(obj)
                 self._deliver(obj, f.kind, f.payload)
             elif f.kind == KIND_STORED:
                 if obj in self._location:
@@ -1324,12 +1384,12 @@ struct Head(Movable):
                     if self._location.get(obj, -1) != i:
                         self._conns[i].send(KIND_FREE, obj, 0, List[UInt8]())
                 else:
-                    self._location[obj] = i
-                    self._where[obj] = f.payload.copy()
+                    self._put_location(obj, i, f.payload)
                     self._learn_node(i, f.payload)
                     self._deliver(obj, KIND_LOCATED, f.payload)
             else:
                 self._errors[obj] = message(f.payload)
+                self._settled(obj, failed=True)
                 self._deliver(obj, f.kind, f.payload)
                 if obj in self._actors and self._hosting[i] == obj:
                     # Its constructor failed: the worker hosts nothing.
@@ -1499,6 +1559,7 @@ struct Head(Movable):
         var body = List[UInt8]()
         put_scalar[DType.int](body, Scalar[DType.int](calls))
         self._results[obj] = body.copy()
+        self._settled(obj)
         self._deliver(obj, KIND_RESULT, body)
 
     def _checkpointed(mut self, i: Int, var f: Frame) raises:
@@ -1567,7 +1628,7 @@ struct Head(Movable):
         if t.object_id in self._spans:
             try:
                 ref sp = self._spans[t.object_id]
-                sp.worker = i
+                sp.worker = self._book_of[i]
                 sp.dispatched = wall_ns()
             except:
                 pass
@@ -1687,8 +1748,7 @@ struct Head(Movable):
                 if self._location.get(obj, -1) != i:
                     self._conns[i].send(KIND_FREE, obj, 0, List[UInt8]())
                 continue
-            self._location[obj] = i
-            self._where[obj] = loc.copy()
+            self._put_location(obj, i, loc)
             self._learn_node(i, loc)
             if obj in self._refs:
                 # Claimed already: tell the driver where it is again.
@@ -1717,6 +1777,8 @@ struct Head(Movable):
             self._conns[i].send(KIND_ERROR, 0, 0, msg.as_bytes())
             self._roles[i] = _ROLE_GONE
             self._conns[i].stream.close()
+            self._conns[i].release_buffers()
+            self._free_slots.append(i)
             return
         if f.payload[0] == ROLE_DRIVER or f.payload[0] == ROLE_CLIENT:
             var n = self._next_driver
@@ -1746,6 +1808,8 @@ struct Head(Movable):
                 raise Error("a worker's hello must carry its address")
             self._roles[i] = ROLE_WORKER
             self._worker_addr[i] = List[UInt8](f.payload[9:])
+            self._book_of[i] = len(self._book)
+            self._book.append(self._worker_addr[i].copy())
         else:
             raise Error("unknown role ", Int(f.payload[0]))
 
@@ -1774,6 +1838,7 @@ struct Head(Movable):
     def _fail(mut self, object_id: UInt64, var msg: String):
         if not self._dead.pop(object_id, False):
             self._errors[object_id] = msg.copy()
+            self._settled(object_id, failed=True)
             self._deliver(object_id, KIND_ERROR, msg.as_bytes())
         self._settle(object_id)
 
@@ -1886,8 +1951,8 @@ struct Head(Movable):
                 sp.ended,
             ]:
                 put_scalar[DType.uint64](body, v)
-            if sp.worker >= 0 and sp.worker < len(self._worker_addr):
-                body.extend(self._worker_addr[sp.worker].copy())
+            if sp.worker >= 0 and sp.worker < len(self._book):
+                body.extend(Span(self._book[sp.worker]))
             else:
                 body.extend(List[UInt8](length=ADDR_SIZE, fill=0))
         self._conns[i].send(KIND_TIMELINE, 0, 0, body)
@@ -1914,8 +1979,7 @@ struct Head(Movable):
         _ = self._stuck.pop(object_id, False)
         _ = self._results.pop(object_id, List[UInt8]())
         _ = self._errors.pop(object_id, String())
-        _ = self._where.pop(object_id, List[UInt8]())
-        var i = self._location.pop(object_id, -1)
+        var i = self._pop_location(object_id)
         if i >= 0 and self._roles[i] == ROLE_WORKER:
             try:
                 self._conns[i].send(KIND_FREE, object_id, 0, List[UInt8]())
@@ -1930,6 +1994,9 @@ struct Head(Movable):
             return
         self._roles[i] = _ROLE_GONE
         self._conns[i].stream.close()
+        # A driver that left may have had results waiting to be sent to it.
+        self._conns[i].release_buffers()
+        self._free_slots.append(i)
         if role == ROLE_DRIVER:
             _ = self._clients.pop(i, False)
             var gone = UInt64(0)
@@ -2006,8 +2073,7 @@ struct Head(Movable):
                 if entry.value == i:
                     held.append(entry.key)
             for obj in held:
-                _ = self._location.pop(obj, -1)
-                _ = self._where.pop(obj, List[UInt8]())
+                _ = self._pop_location(obj)
                 if self._orphans.pop(obj, False):
                     continue
                 self._fail(obj, _lost_result(obj))
@@ -2239,8 +2305,7 @@ struct Head(Movable):
             return
         # The old copy stays until its worker leaves: a task may have been
         # sent its location.
-        self._location[obj] = j
-        self._where[obj] = loc.copy()
+        self._put_location(obj, j, loc)
         self._learn_node(j, loc)
         self._moved += 1
         self._deliver(obj, KIND_LOCATED, loc)
@@ -2302,61 +2367,101 @@ struct Head(Movable):
                 self._roles[i] = _ROLE_GONE
                 self._conns[i].stream.close()
 
+    def _wait_for(mut self, obj: UInt64, deps: List[UInt64]):
+        """Indexes waiting task `obj` by the inputs it waits for. With none
+        unsettled, it's looked at on the next pass."""
+        var n = 0
+        for d in deps:
+            if not self._is_settled(d):
+                n += 1
+                if d not in self._waiters:
+                    self._waiters[d] = List[UInt64]()
+                try:
+                    self._waiters[d].append(obj)
+                except:
+                    pass
+        self._unsettled[obj] = n
+        if n == 0:
+            self._recheck.append(obj)
+
+    def _is_settled(self, d: UInt64) -> Bool:
+        return d in self._errors or d in self._location or d in self._results
+
+    def _settled(mut self, obj: UInt64, failed: Bool = False):
+        """`obj` has its answer: the waiting tasks that take it have one input
+        fewer to wait for, and fail at once if it did."""
+        var waiting = self._waiters.pop(obj, List[UInt64]())
+        for w in waiting:
+            var n = self._unsettled.get(w, 0) - 1
+            if n < 0:
+                continue  # released already, or failed by another input
+            self._unsettled[w] = n
+            if n == 0 or failed:
+                self._recheck.append(w)
+
     def _release_waiting(mut self):
-        if len(self._waiting) == 0:
+        """Queues the waiting tasks whose inputs have all settled, and fails
+        those with an input that failed. Only the tasks `_settled` named are
+        looked at, oldest first."""
+        if len(self._recheck) == 0:
             return
-        var still = List[_Task]()
-        for i in range(len(self._waiting)):
-            ref t = self._waiting[i]
+        var ids = self._recheck^
+        self._recheck = List[UInt64]()
+        sort(ids)
+        var last = UInt64(0)
+        for id in ids:
+            if id == last or id not in self._waiting:
+                continue
+            last = id
             var failed = String()
             var settled = True
             var remote = False
-            for d in t.deps:
-                if d in self._errors:
-                    failed = self._errors.get(d, String())
-                elif d in self._location:
-                    remote = True
-                elif d not in self._results:
-                    settled = False
+            try:
+                ref t = self._waiting[id]
+                for d in t.deps:
+                    if d in self._errors:
+                        failed = self._errors.get(d, String())
+                    elif d in self._location:
+                        remote = True
+                    elif d not in self._results:
+                        settled = False
+            except:
+                continue
+            if not failed and not settled:
+                continue  # one input failed and another settled since
+            var t: _Task
+            try:
+                t = self._waiting.pop(id)
+            except:
+                continue
+            _ = self._unsettled.pop(id, 0)
+            self._waiting_bytes -= len(t.args)
             if failed:
-                self._fail_all(t.object_id, String("input failed: ", failed))
-            elif not settled:
-                still.append(t.copy())
+                self._fail_all(id, String("input failed: ", failed))
             elif not remote:
                 # A `TaskMany` runs on its number of results, then the input.
                 var args = List[UInt8]()
                 if t.many > 0:
                     put_scalar[DType.uint64](args, UInt64(t.many))
-                args.extend(t.args.copy())
+                args.extend(Span(t.args))
                 if t.gather:
                     put_scalar[DType.int64](args, Int64(len(t.deps)))
                 for d in t.deps:
-                    args.extend(self._results.get(d, List[UInt8]()))
-                var id = t.object_id
+                    try:
+                        args.extend(Span(self._results[d]))
+                    except:
+                        pass
                 var kind = KIND_TASK_MANY if t.many > 0 else KIND_TASK
                 self._enqueue(_Task(id, t.task_id, args^, kind=kind))
                 self._stamp_queued(id)
             else:
                 # Some inputs live on workers: the worker that runs this task
                 # is told where to fetch them as it's sent the task.
-                var id = t.object_id
-                self._enqueue(
-                    _Task(
-                        id,
-                        t.task_id,
-                        t.args.copy(),
-                        deps=t.deps.copy(),
-                        gather=t.gather,
-                        kind=KIND_TASK_INPUTS,
-                        node=self._preferred_node(t.deps),
-                        many=t.many,
-                    )
-                )
+                var node = self._preferred_node(t.deps)
+                t.kind = KIND_TASK_INPUTS
+                t.node = node^
+                self._enqueue(t^)
                 self._stamp_queued(id)
-        self._waiting = still^
-        self._waiting_bytes = 0
-        for ref t in self._waiting:
-            self._waiting_bytes += len(t.args)
 
     def _inputs_spec(self, t: _Task) -> List[UInt8]:
         """A task-inputs payload for `t`: where each input that lives on a
@@ -2557,7 +2662,7 @@ struct Head(Movable):
                 if t.object_id in self._spans:
                     try:
                         ref sp = self._spans[t.object_id]
-                        sp.worker = i
+                        sp.worker = self._book_of[i]
                         sp.dispatched = wall_ns()
                     except:
                         pass

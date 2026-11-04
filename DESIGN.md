@@ -223,6 +223,13 @@ That covers a head restart, not a head that's lost for good with the driver. Rep
 
 **Throughput** (done, #33). The head is a single-threaded `poll()` loop. `bench/fanout.mojo` measures tasks per second through it: about 160,000 empty tasks a second, flat from 4 to 192 workers, so the head doesn't limit the 12-node runs.
 
+**What an iteration costs** (#96). The loop's work per iteration has to follow the events, not everything the head holds. Three things didn't:
+- **Waiting tasks.** Every iteration checked every input of every task waiting on inputs, and copied each one still waiting into a new list. Now the head indexes them by input: an input settling (a result, a location, an error) counts down the tasks that take it, and only a task whose inputs have all settled, or one failed, is looked at. 384 reducers gathering 2,000 map outputs went from 1.1 s to 0.07 s in `bench/fanout.mojo`.
+- **Connections.** A connection that closed kept its slot, with its buffers, for good, and every per-connection scan went over them: a head polled by `dista status` every second gathers 86,000 a day. A new connection now takes a closed one's slot, and closing frees its buffers. Spans name their worker through an address book that only grows by a worker joining, so a reused slot can't rename a finished task's worker.
+- **Held bytes.** `dista status --json` decoded every stored result's location once per worker. The head now keeps each worker's held bytes as results are stored, moved and freed.
+
+Gate: `tests/test_head_loop.mojo`. 1,000 observers connecting and leaving leave at most 3 slots; 2,000 iterations with 400 reducers waiting on 1,000 inputs each take 15 ms, against 1.7 s before.
+
 ### How actors work
 
 **Declared at compile time, like tasks.** dista can't load code at runtime, so an actor is a state type and its constructor, and each method is declared once:

@@ -1,6 +1,10 @@
 """Task throughput through the head.
 
-Two measurements:
+Three measurements:
+
+- **Gathers waiting.** 2,000 tiny map tasks on 4 workers while 384 reduce
+  tasks, each gathering every map output, wait for them: the time from the
+  first submission to the last reducer's answer.
 
 - **Pipeline depth.** 10,000 tiny tasks on 4 workers, 1 to 8 tasks in flight
   per worker.
@@ -15,7 +19,7 @@ Two measurements:
 from std.os import getenv
 from std.time import perf_counter_ns
 
-from dista import ObjectRef, Runtime, Task
+from dista import ObjectRef, Runtime, Seq, Task
 
 
 def square(x: Int) -> Int:
@@ -26,12 +30,52 @@ def megabyte(x: Int) -> String:
     return String("x") * (1 << 20)
 
 
+def total(xs: Seq[Int]) -> Int:
+    var t = 0
+    for x in xs.items:
+        t += x
+    return t
+
+
 comptime Square = Task[Int, Int, square]
 comptime Megabyte = Task[Int, String, megabyte]
+comptime Total = Task[Seq[Int], Int, total]
+
+
+def _gathers() raises:
+    comptime MAPS = 2_000
+    comptime REDUCERS = 384
+    var rt = Runtime[Square, Megabyte, Total](workers=4, pipeline=2)
+    _ = rt.get(rt.remote[Square](1))  # warm up every connection
+    var t0 = perf_counter_ns()
+    var maps = List[ObjectRef[Int]](capacity=MAPS)
+    for i in range(MAPS):
+        maps.append(rt.remote[Square](i))
+    var reducers = List[ObjectRef[Int]](capacity=REDUCERS)
+    for _ in range(REDUCERS):
+        reducers.append(rt.remote[Total](maps))
+    var want = 0
+    for i in range(MAPS):
+        want += i * i
+    for r in reducers:
+        if rt.get(r) != want:
+            raise Error("gathers: a wrong total")
+    var secs = Float64(perf_counter_ns() - t0) / 1e9
+    rt.release(reducers)
+    rt.release(maps)
+    print(
+        "gathers :",
+        MAPS,
+        "maps,",
+        REDUCERS,
+        "reducers waiting on all of them:",
+        secs,
+        "s",
+    )
 
 
 def _through_head(workers: Int) raises:
-    var rt = Runtime[Square, Megabyte](workers=workers, pipeline=2)
+    var rt = Runtime[Square, Megabyte, Total](workers=workers, pipeline=2)
     for i in range(workers):
         _ = rt.get(rt.remote[Square](i))  # warm up every connection
 
@@ -66,9 +110,10 @@ def _through_head(workers: Int) raises:
 
 
 def main() raises:
+    _gathers()
     comptime N = 10_000
     for depth in [1, 2, 4, 8]:
-        var rt = Runtime[Square, Megabyte](workers=4, pipeline=depth)
+        var rt = Runtime[Square, Megabyte, Total](workers=4, pipeline=depth)
         _ = rt.get(rt.remote[Square](1))  # warm up every connection
         var t0 = perf_counter_ns()
         var refs = List[ObjectRef[Int]](capacity=N)
