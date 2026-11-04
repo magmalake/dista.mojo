@@ -508,6 +508,11 @@ struct Head(Movable):
     the worker goes away."""
     var _tries: Dict[UInt64, Int]
     """How many times each of those has been sent."""
+    var _task_timeout: UInt64
+    """`DISTA_TASK_TIMEOUT`, in nanoseconds: how long a task may run once
+    sent to a worker before it fails; 0, for ever."""
+    var _due: Dict[UInt64, UInt64]
+    """With a task timeout: when each running task fails, by `wall_ns`."""
     var _max_retries: Int
     """How many times a task whose worker went away runs again:
     `DISTA_TASK_RETRIES`, default 3."""
@@ -537,6 +542,8 @@ struct Head(Movable):
     var _restarts: Int
     var _retried: Int
     """Tasks sent again because their worker went away."""
+    var _timed_out: Int
+    """Tasks failed for running past `DISTA_TASK_TIMEOUT`."""
     var _checkpoints: Int
     var _checkpoint_failures: Int
     var _draining: List[UInt8]
@@ -619,6 +626,14 @@ struct Head(Movable):
         self._many = Dict[UInt64, Int]()
         self._running = Dict[UInt64, _Task]()
         self._tries = Dict[UInt64, Int]()
+        self._task_timeout = 0
+        try:
+            var secs = Float64(getenv("DISTA_TASK_TIMEOUT", "0"))
+            if secs > 0:
+                self._task_timeout = UInt64(secs * 1e9)
+        except:
+            pass
+        self._due = Dict[UInt64, UInt64]()
         self._max_retries = 3
         try:
             self._max_retries = Int(getenv("DISTA_TASK_RETRIES", "3"))
@@ -664,6 +679,7 @@ struct Head(Movable):
         self._finished_ok = 0
         self._finished_err = 0
         self._retried = 0
+        self._timed_out = 0
         self._durations = Histogram()
         self._restarts = 0
         self._checkpoints = 0
@@ -689,6 +705,7 @@ struct Head(Movable):
         """Serves until the last driver leaves, in local mode; else forever."""
         while True:
             self._expire_orphans()
+            self._expire_tasks()
             self._release_waiting()
             self._dispatch()
             self._note_busy()
@@ -724,10 +741,10 @@ struct Head(Movable):
                     ev |= POLLOUT
                 events.append(ev)
                 which.append(i)
-            # While orphans wait for their drivers, wake to expire them.
-            var revents = poll(
-                fds, events, 1000 if len(self._orphan_owners) > 0 else -1
-            )
+            # While orphans wait for their drivers, or tasks run against a
+            # deadline, wake to expire them.
+            var tick = len(self._orphan_owners) > 0 or len(self._due) > 0
+            var revents = poll(fds, events, 1000 if tick else -1)
             if revents[0] & POLLIN:
                 self._accept()
             for k in range(1, len(fds)):
@@ -790,6 +807,13 @@ struct Head(Movable):
             "dista_tasks_retried_total",
             "Tasks sent again because their worker went away.",
             self._retried,
+        )
+        write_metric(
+            out,
+            "counter",
+            "dista_tasks_timed_out_total",
+            "Tasks failed for running longer than DISTA_TASK_TIMEOUT.",
+            self._timed_out,
         )
         self._durations.write(
             out,
@@ -2136,11 +2160,38 @@ struct Head(Movable):
             _ = self._held_by.pop(d, 0)
         return True
 
+    def _expire_tasks(mut self):
+        """Fails the running tasks past `DISTA_TASK_TIMEOUT`. A worker that
+        hangs, or whose host froze without closing its connection, would
+        otherwise hold them for ever. The worker isn't stopped: a result it
+        sends later is a repeat, and dropped."""
+        if len(self._due) == 0:
+            return
+        var now = wall_ns()
+        var late = List[UInt64]()
+        for entry in self._due.items():
+            if now >= entry.value:
+                late.append(entry.key)
+        for obj in late:
+            _ = self._due.pop(obj, 0)
+            if obj not in self._running:
+                continue
+            self._timed_out += 1
+            self._fail_all(
+                obj,
+                String(
+                    "timed out: ran longer than DISTA_TASK_TIMEOUT (",
+                    Float64(self._task_timeout) / 1e9,
+                    " s) on its worker",
+                ),
+            )
+
     def _settle(mut self, object_id: UInt64):
         """`object_id`'s task is done: it no longer holds its inputs."""
         _ = self._many.pop(object_id, 0)
         _ = self._running.pop(object_id, _Task(0, 0, List[UInt8]()))
         _ = self._tries.pop(object_id, 0)
+        _ = self._due.pop(object_id, 0)
         var deps = self._deps_of.pop(object_id, List[UInt64]())
         for d in deps:
             self._dec(d)
@@ -3052,6 +3103,8 @@ struct Head(Movable):
                     continue
                 var obj = t.object_id
                 self._tries[obj] = self._tries.get(obj, 0) + 1
+                if self._task_timeout > 0:
+                    self._due[obj] = wall_ns() + self._task_timeout
                 # Sent from the task itself, which then moves into `_running`:
                 # its arguments aren't copied.
                 var lost = False
