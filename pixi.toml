@@ -10,24 +10,24 @@ preview = ["pixi-build"]
 platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 
 [tasks]
-test-codec = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_codec.mojo -o build/test-codec && ./build/test-codec" }
-test-frame = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_frame.mojo -o build/test-frame && ./build/test-frame" }
-test-runtime = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_runtime.mojo -o build/test-runtime && ./build/test-runtime" }
-test-batches = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_batches.mojo -o build/test-batches && ./build/test-batches" }
-test-free = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_free.mojo -o build/test-free && ./build/test-free" }
-test-actors = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_actors.mojo -o build/test-actors && ./build/test-actors" }
-test-arity = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_arity.mojo -o build/test-arity && ./build/test-arity" }
-test-shuffle = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_shuffle.mojo -o build/test-shuffle && ./build/test-shuffle" }
-test-take = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_take.mojo -o build/test-take && ./build/test-take" }
-test-admission = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_admission.mojo -o build/test-admission && ./build/test-admission" }
-test-head-queue = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_head_queue.mojo -o build/test-head-queue && ./build/test-head-queue" }
-test-head-loop = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_head_loop.mojo -o build/test-head-loop && ./build/test-head-loop" }
-test-fetch = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_fetch.mojo -o build/test-fetch && ./build/test-fetch" }
-test-spill = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_spill.mojo -o build/test-spill && ./build/test-spill" }
-test-timeline = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_timeline.mojo -o build/test-timeline && ./build/test-timeline" }
-test-cancel = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_cancel.mojo -o build/test-cancel && ./build/test-cancel" }
-test-head-drivers = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_head_drivers.mojo -o build/test-head-drivers && ./build/test-head-drivers" }
-test-scale = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_scale.mojo -o build/test-scale && ./build/test-scale" }
+test-codec = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_codec.mojo -o build/test-codec && ./build/test-codec" }
+test-frame = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_frame.mojo -o build/test-frame && ./build/test-frame" }
+test-runtime = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_runtime.mojo -o build/test-runtime && ./build/test-runtime" }
+test-batches = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_batches.mojo -o build/test-batches && ./build/test-batches" }
+test-free = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_free.mojo -o build/test-free && ./build/test-free" }
+test-actors = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_actors.mojo -o build/test-actors && ./build/test-actors" }
+test-arity = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_arity.mojo -o build/test-arity && ./build/test-arity" }
+test-shuffle = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_shuffle.mojo -o build/test-shuffle && ./build/test-shuffle" }
+test-take = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_take.mojo -o build/test-take && ./build/test-take" }
+test-admission = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_admission.mojo -o build/test-admission && ./build/test-admission" }
+test-head-queue = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_head_queue.mojo -o build/test-head-queue && ./build/test-head-queue" }
+test-head-loop = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_head_loop.mojo -o build/test-head-loop && ./build/test-head-loop" }
+test-fetch = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_fetch.mojo -o build/test-fetch && ./build/test-fetch" }
+test-spill = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_spill.mojo -o build/test-spill && ./build/test-spill" }
+test-timeline = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_timeline.mojo -o build/test-timeline && ./build/test-timeline" }
+test-cancel = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_cancel.mojo -o build/test-cancel && ./build/test-cancel" }
+test-head-drivers = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_head_drivers.mojo -o build/test-head-drivers && ./build/test-head-drivers" }
+test-scale = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_scale.mojo -o build/test-scale && ./build/test-scale" }
 test-cluster = { cmd = "tests/cluster.sh" }
 test-restart = { cmd = "tests/head_restart.sh" }
 test-locality = { cmd = "tests/locality.sh" }
@@ -40,10 +40,13 @@ test-autoscale = { cmd = "tests/autoscale.sh" }
 test-cli = { cmd = "tests/cli.sh" }
 test-chaos = { cmd = "CHAOS_FAST=1 tests/chaos.sh" }
 test-kind = { cmd = "tests/kind.sh" }
-test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-take", "test-timeline", "test-scale", "test-head-drivers", "test-actors", "test-arity", "test-shuffle", "test-spill", "test-fetch", "test-admission", "test-head-loop", "test-head-queue", "test-cancel", "test-cluster", "test-restart", "test-locality", "test-compile-fail", "test-metrics", "test-drain", "test-peer-loss", "test-peer-connect", "test-autoscale", "test-cli", "test-chaos"] }
-cli = { cmd = "mkdir -p build && mojo build -I src $DEP_INC cli/main.mojo -o build/dista" }
-bench = { cmd = "mkdir -p build && mojo build -I src $DEP_INC bench/fanout.mojo -o build/bench-fanout && ./build/bench-fanout" }
-bench-fetch = { cmd = "mkdir -p build && mojo build -I src $DEP_INC bench/fetch.mojo -o build/bench-fetch && FETCH_MODE=sockets ./build/bench-fetch && FETCH_MODE=store ./build/bench-fetch" }
+# The test binaries built several at once before the tasks that copy them
+# (scripts/build-tests.sh, scripts/mojo-build.sh).
+build-tests = { cmd = "scripts/build-tests.sh" }
+test = { depends-on = ["build-tests", "test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-take", "test-timeline", "test-scale", "test-head-drivers", "test-actors", "test-arity", "test-shuffle", "test-spill", "test-fetch", "test-admission", "test-head-loop", "test-head-queue", "test-cancel", "test-cluster", "test-restart", "test-locality", "test-compile-fail", "test-metrics", "test-drain", "test-peer-loss", "test-peer-connect", "test-autoscale", "test-cli", "test-chaos"] }
+cli = { cmd = "scripts/mojo-build.sh -I src $DEP_INC cli/main.mojo -o build/dista" }
+bench = { cmd = "scripts/mojo-build.sh -I src $DEP_INC bench/fanout.mojo -o build/bench-fanout && ./build/bench-fanout" }
+bench-fetch = { cmd = "scripts/mojo-build.sh -I src $DEP_INC bench/fetch.mojo -o build/bench-fetch && FETCH_MODE=sockets ./build/bench-fetch && FETCH_MODE=store ./build/bench-fetch" }
 
 [package]
 name = "dista-mojo"
@@ -141,10 +144,11 @@ libpq = ">=16,<19"
 DEP_INC = "-I ../memory-region.mojo/src -I ../arrow-mlake.mojo/src -I ../parquet.mojo/src -I ../parquet.mojo/full/src -I ../threads.mojo/src -I ../threads.mojo/compat -I ../thrift.mojo/src -I ../hashes.mojo/src -I ../snappy.mojo/src -I ../deflate.mojo/src -I ../avro.mojo/src -I ../roaring.mojo/src -I ../objectstore.mojo/src -I ../zstd.mojo/src -I ../lz4.mojo/src -I ../brotli.mojo/src -I ../sqlite.mojo -I ../postgres.mojo/src -I ../iceberg.mojo/src"
 
 [feature.data.tasks]
-test-parquet = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_parquet_tasks.mojo -o build/test-parquet && ./build/test-parquet" }
-test-iceberg = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_iceberg_scan.mojo -o build/test-iceberg && ./build/test-iceberg" }
-test-data = { depends-on = ["test-parquet", "test-iceberg"] }
-bench-readpath = { cmd = "mkdir -p build && mojo build -I src $DEP_INC bench/readpath.mojo -o build/readpath && ./build/readpath" }
+test-parquet = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_parquet_tasks.mojo -o build/test-parquet && ./build/test-parquet" }
+test-iceberg = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_iceberg_scan.mojo -o build/test-iceberg && ./build/test-iceberg" }
+build-data-tests = { cmd = "scripts/build-tests.sh tests/test_parquet_tasks.mojo tests/test_iceberg_scan.mojo" }
+test-data = { depends-on = ["build-data-tests", "test-parquet", "test-iceberg"] }
+bench-readpath = { cmd = "scripts/mojo-build.sh -I src $DEP_INC bench/readpath.mojo -o build/readpath && ./build/readpath" }
 
 # Fuzzing with mozz (packaged for magmalake as mozz_mlake), as flare does: one
 # harness per parser or protocol under fuzz/, built with every bounds check
@@ -155,11 +159,11 @@ bench-readpath = { cmd = "mkdir -p build && mojo build -I src $DEP_INC bench/rea
 mozz_mlake = { git = "https://github.com/magmalake/mozz_mlake.git", rev = "bd84a1f1e376912414a3ddcf0f4151ed65435a44" }
 
 [feature.fuzz.tasks]
-fuzz-frames = { cmd = "mkdir -p build && mojo build -D ASSERT=all -I src $DEP_INC fuzz/fuzz_frames.mojo -o build/fuzz-frames && ./build/fuzz-frames" }
-fuzz-codec = { cmd = "mkdir -p build && mojo build -D ASSERT=all -I src $DEP_INC fuzz/fuzz_codec.mojo -o build/fuzz-codec && ./build/fuzz-codec" }
-fuzz-payloads = { cmd = "mkdir -p build && mojo build -D ASSERT=all -I src $DEP_INC fuzz/fuzz_payloads.mojo -o build/fuzz-payloads && ./build/fuzz-payloads" }
-fuzz-head = { cmd = "mkdir -p build && mojo build -D ASSERT=all -I src $DEP_INC fuzz/fuzz_head.mojo -o build/fuzz-head && ./build/fuzz-head" }
-fuzz-scale = { cmd = "mkdir -p build && mojo build -D ASSERT=all -I src $DEP_INC fuzz/fuzz_scale.mojo -o build/fuzz-scale && ./build/fuzz-scale" }
+fuzz-frames = { cmd = "scripts/mojo-build.sh -D ASSERT=all -I src $DEP_INC fuzz/fuzz_frames.mojo -o build/fuzz-frames && ./build/fuzz-frames" }
+fuzz-codec = { cmd = "scripts/mojo-build.sh -D ASSERT=all -I src $DEP_INC fuzz/fuzz_codec.mojo -o build/fuzz-codec && ./build/fuzz-codec" }
+fuzz-payloads = { cmd = "scripts/mojo-build.sh -D ASSERT=all -I src $DEP_INC fuzz/fuzz_payloads.mojo -o build/fuzz-payloads && ./build/fuzz-payloads" }
+fuzz-head = { cmd = "scripts/mojo-build.sh -D ASSERT=all -I src $DEP_INC fuzz/fuzz_head.mojo -o build/fuzz-head && ./build/fuzz-head" }
+fuzz-scale = { cmd = "scripts/mojo-build.sh -D ASSERT=all -I src $DEP_INC fuzz/fuzz_scale.mojo -o build/fuzz-scale && ./build/fuzz-scale" }
 fuzz = { depends-on = ["fuzz-frames", "fuzz-codec", "fuzz-payloads", "fuzz-head", "fuzz-scale"] }
 
 [environments]

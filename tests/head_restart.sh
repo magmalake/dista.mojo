@@ -13,7 +13,7 @@ rm -rf "$DISTA_CHECKPOINT_URI"
 # tests/restart_driver.mojo), so the head always dies mid-run.
 export RESTART_GATE=$PWD/build/restart-gate
 rm -f "$RESTART_GATE"
-mojo build -I src ${DEP_INC:--I src} tests/restart_driver.mojo -o build/restart-driver
+scripts/mojo-build.sh -I src ${DEP_INC:--I src} tests/restart_driver.mojo -o build/restart-driver
 
 pids=()
 cleanup() { kill "${pids[@]}" 2>/dev/null || true; }

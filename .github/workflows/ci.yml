@@ -143,6 +143,10 @@ jobs:
           path: dista.mojo/.pixi/envs/data/share/max/cache
           key: mojo-${{ runner.os }}-data-${{ hashFiles('dista.mojo/pixi.lock') }}-${{ github.run_id }}
           restore-keys: mojo-${{ runner.os }}-data-${{ hashFiles('dista.mojo/pixi.lock') }}-
+      # Both tests' binaries compiled at once; the steps below copy them
+      # (scripts/mojo-build.sh).
+      - name: Build the tests
+        run: pixi run -e data build-data-tests
       - name: Tasks over Parquet row groups
         run: pixi run -e data test-parquet
       - name: A distributed Iceberg scan equals a local one

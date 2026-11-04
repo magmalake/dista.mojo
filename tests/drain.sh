@@ -14,9 +14,9 @@
 # twice and no restart.
 set -euo pipefail
 mkdir -p build
-mojo build -I src ${DEP_INC:--I src} tests/drain_driver.mojo -o build/drain-driver
-mojo build -I src ${DEP_INC:--I src} tests/drain_actor.mojo -o build/drain-actor
-mojo build -I src ${DEP_INC:--I src} cli/main.mojo -o build/dista
+scripts/mojo-build.sh -I src ${DEP_INC:--I src} tests/drain_driver.mojo -o build/drain-driver
+scripts/mojo-build.sh -I src ${DEP_INC:--I src} tests/drain_actor.mojo -o build/drain-actor
+scripts/mojo-build.sh -I src ${DEP_INC:--I src} cli/main.mojo -o build/dista
 
 pids=()
 cleanup() { kill -9 "${pids[@]}" 2>/dev/null || true; }

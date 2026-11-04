@@ -5,7 +5,7 @@
 # placement about half do.
 set -euo pipefail
 mkdir -p build
-mojo build -I src ${DEP_INC:--I src} tests/locality_driver.mojo -o build/locality-driver
+scripts/mojo-build.sh -I src ${DEP_INC:--I src} tests/locality_driver.mojo -o build/locality-driver
 
 pids=()
 cleanup() { kill "${pids[@]}" 2>/dev/null || true; }
