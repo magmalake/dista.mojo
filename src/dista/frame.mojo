@@ -15,7 +15,7 @@ Every frame is a 4-byte little-endian length, then that many bytes:
 | 2 result | worker to head, head to driver | the encoded result |
 | 3 error | worker to head, head to driver | a UTF-8 message |
 | 4 hello | driver, worker or observer to head | role byte (`ROLE_*`), the registry hash u64 (an observer's is ignored); a worker adds its object server's address |
-| 5 welcome | head to driver | the driver's number, u64 |
+| 5 welcome | head to driver | the driver's number, u64, then the head's epoch, u64 |
 | 6 task-after | driver to head | flags byte (`GATHER`, `WITH_VALUE`), count u64, then that many object IDs; with `WITH_VALUE`, a length u64 and the encoded value |
 | 7 stored | worker to head | the result's size, u64: it stayed on the worker |
 | 8 located | head to driver | the address of the worker holding the result |
@@ -42,13 +42,21 @@ Every frame is a 4-byte little-endian length, then that many bytes:
 | 29 drain | worker to head | none: the worker was told to stop; it takes no more work, and leaves once the head says stop |
 | 30 adopt | head to worker | a draining worker's location of the object: fetch it and keep it |
 | 31 adopted | worker to head | 1 and the object's new location, or 0 and why not |
+| 32 cancel | driver to head | none: fail this object's task with "cancelled", and drop it if it hasn't run |
 
 An observer (`dista status`, `timeline`, `stop`) says hello without a
 registry and owns no objects. Its timeline frame gets every driver's
 finished tasks, and leaves them for the drivers too.
 
 After a head restart, a driver's hello carries its old number as a u64 after
-the registry hash, so its object IDs stay valid. It then sends, in order of
+the registry hash, so its object IDs stay valid, and then the epoch of the
+head that first numbered it, u64. A head numbers new drivers from a random
+start, so a driver of the head before rarely shares a number with one of
+this head's; if it does, the epoch tells them apart, and the head refuses
+the old one with an error frame rather than give it the new one's objects.
+A driver resuming under a number that is still connected, from the same
+epoch, is the same driver on a new connection: the old one is dropped. It
+then sends, in order of
 submission, each object it still needs: a small result or error back as a
 result or error frame, a result on a worker as claim, and an unfinished task
 as the task or task-after frame it first sent; then resumed. A rejoining
@@ -131,6 +139,10 @@ a draining worker's, and keep it as its own."""
 comptime KIND_ADOPTED: UInt8 = 31
 """Worker to head: 1 and the object's new location, or 0 and why it couldn't
 take it."""
+comptime KIND_CANCEL: UInt8 = 32
+"""Driver to head: this driver won't read `object_id`. A task still queued or
+waiting for inputs never runs; one running finishes, and its result is
+dropped. Either way the object fails with "cancelled"."""
 comptime GATHER: UInt8 = 1
 """Task-after and task-inputs flag: the inputs gather into a `Seq`."""
 comptime WITH_VALUE: UInt8 = 2

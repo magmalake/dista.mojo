@@ -50,7 +50,13 @@ The head keeps nothing on disk. When it restarts, its state comes back from
 its peers: workers rejoin and report the results they hold, and each driver
 reconnects under its old number and restores, claims or resubmits everything
 it still needs (see `frame.mojo`). A reported result no resumed driver
-claimed is freed. A task that was running when the head died may run again.
+claimed is freed, as is one whose driver hasn't come back
+`DISTA_ORPHAN_SECONDS` (default 120) after a worker reported it. Only a
+resuming driver claims a reported result: a new driver never does, and is
+numbered from a random start, so it rarely shares a number with a driver of
+the head before (or names an actor whose old checkpoints are still in
+`DISTA_CHECKPOINT_URI`). A task that was running when the head died may run
+again.
 
 A worker told to stop drains (see `worker.mojo`). The head sends it no more
 tasks and has the other workers adopt every result it holds: each fetches
@@ -91,8 +97,9 @@ the head lists, or builds it if there's none, and the calls the callers
 resend run on that: every call no checkpoint includes, answered or not.
 """
 
-from std.ffi import c_int
+from std.ffi import c_int, external_call
 from std.os import getenv
+from std.time import perf_counter_ns
 
 from dista.codec import get_scalar, put_scalar
 from dista.conn import Conn
@@ -105,6 +112,7 @@ from dista.frame import (
     KIND_ACTOR_RESTORE,
     KIND_ADOPT,
     KIND_ADOPTED,
+    KIND_CANCEL,
     KIND_CHECKPOINT,
     KIND_CHECKPOINTED,
     KIND_CLAIM,
@@ -163,11 +171,28 @@ comptime DRIVER_SHIFT = 40
 """Object IDs carry their driver's number above this bit."""
 comptime MAX_SPANS = 1_000_000
 """Finished task spans the head keeps per driver until it asks for them."""
+comptime MAX_DRIVER: UInt64 = 1 << (64 - DRIVER_SHIFT)
+"""Driver numbers are below this: they fill an object ID's top bits."""
 comptime _ROLE_NONE: UInt8 = 0
 comptime _ROLE_GONE: UInt8 = 255
 comptime _DRAIN_NO: UInt8 = 0
 comptime _DRAIN_YES: UInt8 = 1
 comptime _DRAIN_LET_GO: UInt8 = 2
+
+
+def _mix(var x: UInt64) -> UInt64:
+    """splitmix64's finalizer: spreads the bits of `x`."""
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EB
+    return x ^ (x >> 31)
+
+
+def head_epoch() -> UInt64:
+    """A random, nonzero number naming one head's lifetime: the wall clock,
+    the process ID and the monotonic clock, mixed."""
+    var pid = UInt64(Int(external_call["getpid", c_int]()))
+    var e = _mix(wall_ns() ^ _mix(pid ^ (UInt64(perf_counter_ns()) << 20)))
+    return e if e != 0 else 1
 
 
 def owner_of(object_id: UInt64) -> UInt64:
@@ -182,7 +207,7 @@ struct _Span(Copyable, Movable):
     var object_id: UInt64
     var task_id: UInt64
     var worker: Int
-    """The connection that ran it, or -1."""
+    """The worker that ran it, by its entry in the head's `_book`, or -1."""
     var submitted: UInt64
     var queued: UInt64
     var dispatched: UInt64
@@ -289,7 +314,18 @@ struct _Waiter(Copyable, Movable):
     var calls: Int
 
 
+comptime _COMPACT_AFTER = 64
+"""Tasks handed out of a queue before it may compact."""
+
+
 struct _Queue(Copyable, Movable, Sized):
+    """Tasks ready to run, oldest first, from `head` on.
+
+    A task handed out is moved, not copied, and leaves an empty `_Task` in
+    its slot. Once those make up half the list, the tasks still queued move
+    down to its start, so a queue that never empties, as under backpressure,
+    holds only what's queued, not every task it ever had."""
+
     var tasks: List[_Task]
     var head: Int
     """The next task to hand out."""
@@ -300,6 +336,38 @@ struct _Queue(Copyable, Movable, Sized):
 
     def __len__(self) -> Int:
         return len(self.tasks) - self.head
+
+    def take(mut self, k: Int) -> _Task:
+        """Hands out the task at `k`, one of those from `head` on: the one at
+        `head` takes its place."""
+        if k != self.head:
+            self.tasks.swap_elements(self.head, k)
+        var t = _Task(0, 0, List[UInt8]())
+        swap(t, self.tasks[self.head])
+        self.head += 1
+        if self.head == len(self.tasks):
+            self.tasks.clear()
+            self.head = 0
+        elif self.head >= _COMPACT_AFTER and self.head * 2 >= len(self.tasks):
+            self._compact()
+        return t^
+
+    def _compact(mut self):
+        """Moves the queued tasks to the start of a list of their own."""
+        var rest = List[_Task](capacity=len(self.tasks) - self.head)
+        for k in range(self.head, len(self.tasks)):
+            var t = _Task(0, 0, List[UInt8]())
+            swap(t, self.tasks[k])
+            rest.append(t^)
+        self.tasks = rest^
+        self.head = 0
+
+    def take_all(mut self) -> List[_Task]:
+        """Every queued task, oldest first, leaving the queue empty."""
+        self._compact()
+        var out = self.tasks^
+        self.tasks = List[_Task]()
+        return out^
 
 
 def _lost_result(obj: UInt64) -> String:
@@ -348,6 +416,23 @@ struct Head(Movable):
     """For a worker, the objects it is computing, oldest first."""
     var _driver_conn: Dict[UInt64, Int]
     var _next_driver: UInt64
+    """The next driver number to try. It starts at a random place, so a head
+    that restarts doesn't hand a new driver the number of a driver of the
+    head before it, whose results workers may still hold."""
+    var _epoch: UInt64
+    """This head's random epoch, sent in each welcome. A driver resuming
+    carries the epoch of the head that numbered it, so a head can tell a
+    driver it numbered from another one with the same number."""
+    var _fresh: Dict[UInt64, Bool]
+    """Drivers this head numbered, rather than took back resuming: none of
+    a previous head's results are theirs."""
+    var _orphan_owners: Dict[UInt64, UInt64]
+    """Drivers whose results rejoining workers reported as orphans, to when
+    the last such report came: freed if the driver hasn't come back
+    `DISTA_ORPHAN_SECONDS` later."""
+    var _orphan_grace: UInt64
+    """`DISTA_ORPHAN_SECONDS`, in nanoseconds (default 120 s: twice the 60 s
+    a driver keeps trying to reach a restarted head)."""
     var _drivers_seen: Bool
     var _queues: Dict[UInt64, _Queue]
     """Tasks ready to run, by the registry hash of the program that
@@ -360,7 +445,16 @@ struct Head(Movable):
     var _many: Dict[UInt64, Int]
     """A running `TaskMany`'s first result, and how many it has: its worker
     going away fails them all."""
-    var _waiting: List[_Task]
+    var _waiting: Dict[UInt64, _Task]
+    """Tasks waiting for their inputs, by object, oldest first."""
+    var _waiters: Dict[UInt64, List[UInt64]]
+    """For an input that hasn't settled, the waiting tasks that take it, once
+    per time each takes it."""
+    var _unsettled: Dict[UInt64, Int]
+    """For a waiting task, how many of its inputs haven't settled."""
+    var _recheck: List[UInt64]
+    """Waiting tasks whose inputs have all settled, or one failed, since the
+    loop last looked: the only ones `_release_waiting` looks at."""
     var _results: Dict[UInt64, List[UInt8]]
     var _errors: Dict[UInt64, String]
     var _worker_addr: List[List[UInt8]]
@@ -373,11 +467,31 @@ struct Head(Movable):
     """
     var _where: Dict[UInt64, List[UInt8]]
     """Those results' encoded locations, as the worker reported them."""
+    var _held_on: List[Int]
+    """For a worker, the bytes of the results `_location` places on it."""
+    var _free_slots: List[Int]
+    """Connections dropped, whose slots the next connections take: a
+    long-lived head polled every second doesn't scan every connection it
+    ever had."""
+    var _book: List[List[UInt8]]
+    """Every worker's address since the head started, as frames carry it:
+    what a span names its worker by, since a slot outlives its worker."""
+    var _book_of: List[Int]
+    """For a worker, its entry in `_book`; -1 for any other connection."""
     var _refs: Dict[UInt64, Int]
     """Every live object's reference count."""
     var _held: Dict[UInt64, Bool]
     """Objects whose driver hasn't released them; each counts once in `_refs`.
+    Changed only through `_mark_held` and `_unhold`, which keep `_held_by`.
     """
+    var _held_by: Dict[UInt64, Int]
+    """How many objects each driver holds, by number: what `dista status`
+    shows, since a driver that never releases grows the head."""
+    var _warn_held: Int
+    """`DISTA_WARN_HELD`: the head logs a driver holding this many objects,
+    and again at each doubling; 0, never."""
+    var _warned_at: Dict[UInt64, Int]
+    """For each driver it has warned about, the count that warns next."""
     var _deps_of: Dict[UInt64, List[UInt64]]
     """A waiting task's inputs, each holding a reference until it settles."""
     var _dead: Dict[UInt64, Bool]
@@ -458,6 +572,10 @@ struct Head(Movable):
     its tasks wait; 0, no limit."""
     var _pauses: Int
     """Times the head stopped reading drivers, for the metrics."""
+    var _cancelled: Dict[UInt64, Bool]
+    """Objects a driver cancelled while their task was queued, or that wasn't
+    a task: a queued one is dropped when it reaches the front of its queue.
+    """
 
     def __init__(
         out self,
@@ -486,7 +604,13 @@ struct Head(Movable):
         self._roles = List[UInt8]()
         self._inflight = List[List[UInt64]]()
         self._driver_conn = Dict[UInt64, Int]()
-        self._next_driver = 1
+        self._epoch = head_epoch()
+        self._next_driver = (self._epoch >> 7) % (MAX_DRIVER - 1) + 1
+        self._fresh = Dict[UInt64, Bool]()
+        self._orphan_owners = Dict[UInt64, UInt64]()
+        self._orphan_grace = (
+            UInt64(_env_int("DISTA_ORPHAN_SECONDS", 120)) * 1_000_000_000
+        )
         self._drivers_seen = False
         self._queues = Dict[UInt64, _Queue]()
         self._hashes = List[UInt64]()
@@ -500,15 +624,25 @@ struct Head(Movable):
             self._max_retries = Int(getenv("DISTA_TASK_RETRIES", "3"))
         except:
             pass
-        self._waiting = List[_Task]()
+        self._waiting = Dict[UInt64, _Task]()
+        self._waiters = Dict[UInt64, List[UInt64]]()
+        self._unsettled = Dict[UInt64, Int]()
+        self._recheck = List[UInt64]()
         self._results = Dict[UInt64, List[UInt8]]()
         self._errors = Dict[UInt64, String]()
         self._worker_addr = List[List[UInt8]]()
         self._node = List[String]()
         self._location = Dict[UInt64, Int]()
         self._where = Dict[UInt64, List[UInt8]]()
+        self._held_on = List[Int]()
+        self._free_slots = List[Int]()
+        self._book = List[List[UInt8]]()
+        self._book_of = List[Int]()
         self._refs = Dict[UInt64, Int]()
         self._held = Dict[UInt64, Bool]()
+        self._held_by = Dict[UInt64, Int]()
+        self._warn_held = _env_int("DISTA_WARN_HELD", 100_000)
+        self._warned_at = Dict[UInt64, Int]()
         self._deps_of = Dict[UInt64, List[UInt64]]()
         self._dead = Dict[UInt64, Bool]()
         self._orphans = Dict[UInt64, Bool]()
@@ -549,10 +683,12 @@ struct Head(Movable):
         self._paused = False
         self._max_driver_buffer = _env_int("DISTA_MAX_DRIVER_BUFFER", 1 << 28)
         self._pauses = 0
+        self._cancelled = Dict[UInt64, Bool]()
 
     def run(mut self) raises:
         """Serves until the last driver leaves, in local mode; else forever."""
         while True:
+            self._expire_orphans()
             self._release_waiting()
             self._dispatch()
             self._note_busy()
@@ -588,7 +724,10 @@ struct Head(Movable):
                     ev |= POLLOUT
                 events.append(ev)
                 which.append(i)
-            var revents = poll(fds, events, -1)
+            # While orphans wait for their drivers, wake to expire them.
+            var revents = poll(
+                fds, events, 1000 if len(self._orphan_owners) > 0 else -1
+            )
             if revents[0] & POLLIN:
                 self._accept()
             for k in range(1, len(fds)):
@@ -713,6 +852,19 @@ struct Head(Movable):
             "dista_objects",
             "Objects the head counts references to.",
             len(self._refs),
+        )
+        var most = 0
+        for entry in self._held_by.items():
+            most = max(most, entry.value)
+        write_metric(
+            out,
+            "gauge",
+            "dista_driver_held_objects_max",
+            (
+                "The most objects one driver holds: results it hasn't"
+                " released, kept at the head and on the workers."
+            ),
+            most,
         )
         write_metric(
             out,
@@ -904,6 +1056,7 @@ struct Head(Movable):
                 "  registry ",
                 hex(self._driver_hash.get(entry.key, 0)),
             )
+            out += String("  holds ", self._held_by.get(entry.key, 0))
             if entry.value in self._clients:
                 out += "  (a task's client)"
             out += "\n"
@@ -1003,18 +1156,32 @@ struct Head(Movable):
 
     def _held_bytes(self, i: Int) -> Int:
         """Bytes of the results that stayed on worker `i`."""
-        var n = 0
-        for entry in self._location.items():
-            if entry.value != i:
-                continue
+        return self._held_on[i]
+
+    def _put_location(mut self, obj: UInt64, i: Int, loc: Span[UInt8, _]):
+        """Records that `obj`'s result is on worker `i`, at `loc`; it moves
+        there if it was elsewhere."""
+        _ = self._pop_location(obj)
+        self._location[obj] = i
+        self._where[obj] = List[UInt8](loc)
+        try:
+            var pos = 0
+            self._held_on[i] += Location.decode(loc, pos).size
+        except:
+            pass
+        self._settled(obj)
+
+    def _pop_location(mut self, obj: UInt64) -> Int:
+        """Forgets where `obj`'s result is; the worker it was on, or -1."""
+        var i = self._location.pop(obj, -1)
+        var loc = self._where.pop(obj, List[UInt8]())
+        if i >= 0:
             try:
                 var pos = 0
-                n += Location.decode(
-                    self._where.get(entry.key, List[UInt8]()), pos
-                ).size
+                self._held_on[i] -= Location.decode(loc, pos).size
             except:
                 pass
-        return n
+        return i
 
     def _idle_workers(self) -> Int:
         var now = wall_ns()
@@ -1051,8 +1218,23 @@ struct Head(Movable):
             self._pipeline,
             ',"checkpoints":',
             "true" if getenv("DISTA_CHECKPOINT_URI") else "false",
-            ',"workers":[',
+            ',"driver_objects":[',
         )
+        # What each driver holds: one that never releases grows the head.
+        var sep = ""
+        for entry in self._driver_conn.items():
+            out += String(
+                sep,
+                '{"driver":',
+                entry.key,
+                ',"held":',
+                self._held_by.get(entry.key, 0),
+                ',"client":',
+                "true" if entry.value in self._clients else "false",
+                "}",
+            )
+            sep = ","
+        out += '],"workers":['
         var first = True
         for i in range(len(self._roles)):
             if self._roles[i] != ROLE_WORKER:
@@ -1086,8 +1268,25 @@ struct Head(Movable):
 
     def _add_conn(mut self, var conn: Conn) -> Int:
         """A new connection, with an entry in every per-connection list; its
-        index. The fuzzer adds its connections here too."""
+        index, a dropped connection's if there is one. The fuzzer adds its
+        connections here too."""
+        if len(self._free_slots) > 0:
+            var i = self._free_slots.pop()
+            self._conns[i] = conn^
+            self._roles[i] = _ROLE_NONE
+            self._inflight[i] = List[UInt64]()
+            self._worker_addr[i] = List[UInt8]()
+            self._node[i] = String()
+            self._hosting[i] = 0
+            self._hashes[i] = 0
+            self._draining[i] = _DRAIN_NO
+            self._busy_at[i] = wall_ns()
+            self._held_on[i] = 0
+            self._book_of[i] = -1
+            return i
         self._conns.append(conn^)
+        self._held_on.append(0)
+        self._book_of.append(-1)
         self._roles.append(_ROLE_NONE)
         self._inflight.append(List[UInt64]())
         self._worker_addr.append(List[UInt8]())
@@ -1172,15 +1371,14 @@ struct Head(Movable):
                 self._deps_of[f.object_id] = deps.copy()
                 self._open_span(f.object_id, f.task_id)
                 self._waiting_bytes += len(value)
-                self._waiting.append(
-                    _Task(
-                        f.object_id,
-                        f.task_id,
-                        value^,
-                        deps=deps^,
-                        gather=gather,
-                        many=many,
-                    )
+                self._wait_for(f.object_id, deps)
+                self._waiting[f.object_id] = _Task(
+                    f.object_id,
+                    f.task_id,
+                    value^,
+                    deps=deps^,
+                    gather=gather,
+                    many=many,
                 )
             elif f.kind == KIND_TASK_MANY:
                 self._task_many(f^)
@@ -1190,10 +1388,12 @@ struct Head(Movable):
                 if self._known(obj):
                     return
                 self._hold(obj)
+                var failed = f.kind == KIND_ERROR
                 if f.kind == KIND_RESULT:
                     self._results[obj] = f^.take_payload()
                 else:
                     self._errors[obj] = message(f.payload)
+                self._settled(obj, failed)
             elif f.kind == KIND_CLAIM:
                 var obj = f.object_id
                 if self._known(obj):
@@ -1211,6 +1411,7 @@ struct Head(Movable):
                 var d = owner_of(f.object_id)
                 self._resumed[d] = True
                 _ = self._resuming.pop(d, False)
+                _ = self._orphan_owners.pop(d, 0)
                 var unclaimed = List[UInt64]()
                 for entry in self._orphans.items():
                     if owner_of(entry.key) == d:
@@ -1220,7 +1421,7 @@ struct Head(Movable):
                     if obj not in self._refs:
                         self._free(obj)
             elif f.kind == KIND_RELEASE:
-                if self._held.pop(f.object_id, False):
+                if self._unhold(f.object_id):
                     self._dec(f.object_id)
             elif f.kind == KIND_ACTOR_CREATE:
                 var a = f.object_id
@@ -1245,6 +1446,8 @@ struct Head(Movable):
                 self._call(f^)
             elif f.kind == KIND_ACTOR_KILL:
                 self._kill(f.object_id)
+            elif f.kind == KIND_CANCEL:
+                self._cancel(f.object_id)
             elif f.kind == KIND_CHECKPOINT:
                 self._ask_checkpoint(f^)
             elif f.kind == KIND_TIMELINE:
@@ -1316,6 +1519,7 @@ struct Head(Movable):
                 return
             elif f.kind == KIND_RESULT:
                 self._results[obj] = f.payload.copy()
+                self._settled(obj)
                 self._deliver(obj, f.kind, f.payload)
             elif f.kind == KIND_STORED:
                 if obj in self._location:
@@ -1324,12 +1528,12 @@ struct Head(Movable):
                     if self._location.get(obj, -1) != i:
                         self._conns[i].send(KIND_FREE, obj, 0, List[UInt8]())
                 else:
-                    self._location[obj] = i
-                    self._where[obj] = f.payload.copy()
+                    self._put_location(obj, i, f.payload)
                     self._learn_node(i, f.payload)
                     self._deliver(obj, KIND_LOCATED, f.payload)
             else:
                 self._errors[obj] = message(f.payload)
+                self._settled(obj, failed=True)
                 self._deliver(obj, f.kind, f.payload)
                 if obj in self._actors and self._hosting[i] == obj:
                     # Its constructor failed: the worker hosts nothing.
@@ -1494,11 +1698,12 @@ struct Head(Movable):
         self._maybe_checkpoint(a)
 
     def _answer_checkpoint(mut self, obj: UInt64, calls: Int):
-        if self._dead.pop(obj, False):
-            return
+        if self._dead.pop(obj, False) or obj in self._errors:
+            return  # released, or cancelled
         var body = List[UInt8]()
         put_scalar[DType.int](body, Scalar[DType.int](calls))
         self._results[obj] = body.copy()
+        self._settled(obj)
         self._deliver(obj, KIND_RESULT, body)
 
     def _checkpointed(mut self, i: Int, var f: Frame) raises:
@@ -1567,7 +1772,7 @@ struct Head(Movable):
         if t.object_id in self._spans:
             try:
                 ref sp = self._spans[t.object_id]
-                sp.worker = i
+                sp.worker = self._book_of[i]
                 sp.dispatched = wall_ns()
             except:
                 pass
@@ -1661,12 +1866,16 @@ struct Head(Movable):
                         self._drop(i)
             for ref t in act.pending:
                 self._fail(t.object_id, String("the actor was killed"))
-        if self._held.pop(a, False):
+        if self._unhold(a):
             self._dec(a)
 
     def _adopt(mut self, obj: UInt64) -> Bool:
         """A resubmitted task whose result a rejoining worker already reported:
         settle it with that result instead of running it again."""
+        if owner_of(obj) not in self._resuming:
+            # Only the driver that made it, resuming, can claim a result
+            # from before the restart; a new one never does.
+            return False
         if not self._orphans.pop(obj, False):
             return False
         self._deliver(obj, KIND_LOCATED, self._where.get(obj, List[UInt8]()))
@@ -1687,8 +1896,13 @@ struct Head(Movable):
                 if self._location.get(obj, -1) != i:
                     self._conns[i].send(KIND_FREE, obj, 0, List[UInt8]())
                 continue
-            self._location[obj] = i
-            self._where[obj] = loc.copy()
+            if owner_of(obj) in self._fresh:
+                # Its driver's number is one this head handed out: the result
+                # is from a driver of an earlier head with the same number,
+                # or one this head already counted lost. Nobody claims it.
+                self._conns[i].send(KIND_FREE, obj, 0, List[UInt8]())
+                continue
+            self._put_location(obj, i, loc)
             self._learn_node(i, loc)
             if obj in self._refs:
                 # Claimed already: tell the driver where it is again.
@@ -1697,6 +1911,7 @@ struct Head(Movable):
                 self._free(obj)
             else:
                 self._orphans[obj] = True
+                self._orphan_owners[owner_of(obj)] = wall_ns()
 
     def _hello(mut self, i: Int, var f: Frame) raises:
         if f.kind != KIND_HELLO or len(f.payload) < 9:
@@ -1717,20 +1932,53 @@ struct Head(Movable):
             self._conns[i].send(KIND_ERROR, 0, 0, msg.as_bytes())
             self._roles[i] = _ROLE_GONE
             self._conns[i].stream.close()
+            self._conns[i].release_buffers()
+            self._free_slots.append(i)
             return
         if f.payload[0] == ROLE_DRIVER or f.payload[0] == ROLE_CLIENT:
-            var n = self._next_driver
-            if len(f.payload) == 17:
-                # A driver resuming after a head restart keeps its number.
+            var n: UInt64
+            if len(f.payload) == 17 or len(f.payload) == 25:
+                # A driver resuming after a head restart keeps its number,
+                # and says which head gave it (an older driver doesn't).
                 var p = 9
                 n = get_scalar[DType.uint64](f.payload, p)
+                var epoch = UInt64(0)
+                if len(f.payload) == 25:
+                    epoch = get_scalar[DType.uint64](f.payload, p)
+                if n == 0 or n >= MAX_DRIVER:
+                    raise Error("a resuming driver's number is out of range")
+                var why = String()
+                if n in self._fresh and epoch != 0 and epoch != self._epoch:
+                    why = String(
+                        "driver number ",
+                        n,
+                        (
+                            " belongs to another driver of this head; this one"
+                            " was numbered by an earlier head, whose results"
+                            " are gone: run the job again"
+                        ),
+                    )
+                elif n in self._driver_conn and epoch == 0:
+                    why = String("driver ", n, " is already connected")
+                if why:
+                    self._conns[i].send(KIND_ERROR, 0, 0, why.as_bytes())
+                    self._roles[i] = _ROLE_GONE
+                    self._conns[i].stream.close()
+                    return
                 if n in self._driver_conn:
-                    raise Error("driver ", n, " is already connected")
-                if n >= self._next_driver:
-                    self._next_driver = n + 1
+                    # The same driver, back before this head noticed its old
+                    # connection go: that one is stale.
+                    var old = self._driver_conn.get(n, -1)
+                    print(
+                        "dista head: driver",
+                        n,
+                        "reconnected; dropping its old connection",
+                    )
+                    self._drop(old)
                 self._resuming[n] = True
             else:
-                self._next_driver += 1
+                n = self._new_driver_number()
+                self._fresh[n] = True
             self._roles[i] = ROLE_DRIVER
             self._driver_conn[n] = i
             self._driver_hash[n] = hash
@@ -1740,14 +1988,67 @@ struct Head(Movable):
                 self._drivers_seen = True
             var body = List[UInt8]()
             put_scalar[DType.uint64](body, n)
+            put_scalar[DType.uint64](body, self._epoch)
             self._conns[i].send(KIND_WELCOME, 0, 0, body)
         elif f.payload[0] == ROLE_WORKER:
             if len(f.payload) != 9 + ADDR_SIZE:
                 raise Error("a worker's hello must carry its address")
             self._roles[i] = ROLE_WORKER
             self._worker_addr[i] = List[UInt8](f.payload[9:])
+            self._book_of[i] = len(self._book)
+            self._book.append(self._worker_addr[i].copy())
         else:
             raise Error("unknown role ", Int(f.payload[0]))
+
+    def _new_driver_number(mut self) raises -> UInt64:
+        """The next free driver number, from where the last one left off,
+        wrapping below `MAX_DRIVER`: never one a driver here has, had, or
+        may come back with."""
+        for _ in range(Int(MAX_DRIVER)):
+            var n = self._next_driver
+            self._next_driver = n + 1 if n + 1 < MAX_DRIVER else 1
+            if (
+                n in self._driver_conn
+                or n in self._fresh
+                or n in self._resuming
+                or n in self._resumed
+                or n in self._orphan_owners
+            ):
+                continue
+            return n
+        raise Error("no driver numbers left")
+
+    def _expire_orphans(mut self):
+        """Frees the orphans of drivers that haven't come back
+        `DISTA_ORPHAN_SECONDS` after a worker last reported their results:
+        such a driver has given up, and nothing else may claim them."""
+        if len(self._orphan_owners) == 0:
+            return
+        var now = wall_ns()
+        var gone = Dict[UInt64, Bool]()
+        for entry in self._orphan_owners.items():
+            var d = entry.key
+            if d in self._driver_conn or d in self._resuming:
+                continue
+            if now >= entry.value + self._orphan_grace:
+                gone[d] = True
+        if len(gone) == 0:
+            return
+        var unclaimed = List[UInt64]()
+        for entry in self._orphans.items():
+            if owner_of(entry.key) in gone:
+                unclaimed.append(entry.key)
+        for entry in gone.items():
+            _ = self._orphan_owners.pop(entry.key, 0)
+            print(
+                "dista head: driver",
+                entry.key,
+                "didn't come back for its results; freeing them",
+            )
+        for obj in unclaimed:
+            _ = self._orphans.pop(obj, False)
+            if obj not in self._refs:
+                self._free(obj)
 
     def _deliver(
         mut self, object_id: UInt64, kind: UInt8, payload: Span[UInt8, _]
@@ -1774,6 +2075,7 @@ struct Head(Movable):
     def _fail(mut self, object_id: UInt64, var msg: String):
         if not self._dead.pop(object_id, False):
             self._errors[object_id] = msg.copy()
+            self._settled(object_id, failed=True)
             self._deliver(object_id, KIND_ERROR, msg.as_bytes())
         self._settle(object_id)
 
@@ -1790,14 +2092,49 @@ struct Head(Movable):
         if object_id not in self._refs:
             return False
         if not self._held.get(object_id, False):
-            self._held[object_id] = True
+            self._mark_held(object_id)
             self._refs[object_id] = self._refs.get(object_id, 0) + 1
         return True
 
     def _hold(mut self, object_id: UInt64):
         """A new object, held by its driver."""
         self._refs[object_id] = 1
+        self._mark_held(object_id)
+
+    def _mark_held(mut self, object_id: UInt64):
+        """`object_id`'s driver holds it: counted for that driver, with a
+        warning in the log once it holds `DISTA_WARN_HELD` objects."""
+        if object_id in self._held:
+            return
         self._held[object_id] = True
+        var d = owner_of(object_id)
+        var n = self._held_by.get(d, 0) + 1
+        self._held_by[d] = n
+        if self._warn_held > 0 and n >= self._warned_at.get(d, self._warn_held):
+            self._warned_at[d] = n * 2
+            print(
+                "dista head: driver",
+                d,
+                "holds",
+                n,
+                (
+                    "objects; results stay at the head and on the workers"
+                    " until released: read them with take, or release them"
+                    " after get"
+                ),
+            )
+
+    def _unhold(mut self, object_id: UInt64) -> Bool:
+        """Its driver lets go of `object_id`: whether it held it."""
+        if not self._held.pop(object_id, False):
+            return False
+        var d = owner_of(object_id)
+        var n = self._held_by.get(d, 0) - 1
+        if n > 0:
+            self._held_by[d] = n
+        else:
+            _ = self._held_by.pop(d, 0)
+        return True
 
     def _settle(mut self, object_id: UInt64):
         """`object_id`'s task is done: it no longer holds its inputs."""
@@ -1886,8 +2223,8 @@ struct Head(Movable):
                 sp.ended,
             ]:
                 put_scalar[DType.uint64](body, v)
-            if sp.worker >= 0 and sp.worker < len(self._worker_addr):
-                body.extend(self._worker_addr[sp.worker].copy())
+            if sp.worker >= 0 and sp.worker < len(self._book):
+                body.extend(Span(self._book[sp.worker]))
             else:
                 body.extend(List[UInt8](length=ADDR_SIZE, fill=0))
         self._conns[i].send(KIND_TIMELINE, 0, 0, body)
@@ -1912,10 +2249,10 @@ struct Head(Movable):
     def _free(mut self, object_id: UInt64):
         """Forgets a settled object, and has its worker delete it."""
         _ = self._stuck.pop(object_id, False)
+        _ = self._cancelled.pop(object_id, False)
         _ = self._results.pop(object_id, List[UInt8]())
         _ = self._errors.pop(object_id, String())
-        _ = self._where.pop(object_id, List[UInt8]())
-        var i = self._location.pop(object_id, -1)
+        var i = self._pop_location(object_id)
         if i >= 0 and self._roles[i] == ROLE_WORKER:
             try:
                 self._conns[i].send(KIND_FREE, object_id, 0, List[UInt8]())
@@ -1930,6 +2267,9 @@ struct Head(Movable):
             return
         self._roles[i] = _ROLE_GONE
         self._conns[i].stream.close()
+        # A driver that left may have had results waiting to be sent to it.
+        self._conns[i].release_buffers()
+        self._free_slots.append(i)
         if role == ROLE_DRIVER:
             _ = self._clients.pop(i, False)
             var gone = UInt64(0)
@@ -1938,6 +2278,9 @@ struct Head(Movable):
                     gone = entry.key
             if gone != 0:
                 _ = self._driver_conn.pop(gone, -1)
+                # Its tasks that haven't run never will: nobody would read
+                # them. Those running finish, and their results are dropped.
+                self._purge(gone)
                 self._forget_spans(gone)
                 # A driver that's gone holds nothing.
                 var mine = List[UInt64]()
@@ -1954,8 +2297,9 @@ struct Head(Movable):
                     except:
                         pass
                 for obj in mine:
-                    if self._held.pop(obj, False):
+                    if self._unhold(obj):
                         self._dec(obj)
+                _ = self._warned_at.pop(gone, 0)
         elif role == ROLE_WORKER:
             self._workers_lost += 1
             if self._draining[i] != _DRAIN_NO:
@@ -2006,8 +2350,7 @@ struct Head(Movable):
                 if entry.value == i:
                     held.append(entry.key)
             for obj in held:
-                _ = self._location.pop(obj, -1)
-                _ = self._where.pop(obj, List[UInt8]())
+                _ = self._pop_location(obj)
                 if self._orphans.pop(obj, False):
                     continue
                 self._fail(obj, _lost_result(obj))
@@ -2019,6 +2362,12 @@ struct Head(Movable):
             for obj in lost:
                 if obj in replays:
                     continue
+                if (
+                    obj in self._errors
+                    or obj in self._results
+                    or obj in self._location
+                ):
+                    continue  # answered already: cancelled while it ran
                 var why = self._why_not_retry(obj)
                 if why == "":
                     try:
@@ -2036,6 +2385,82 @@ struct Head(Movable):
                     if k > 0 and self._answered(part):
                         continue
                     self._fail(part, why.copy())
+
+    def _cancel(mut self, obj: UInt64):
+        """A driver's `cancel`: `obj` fails with "cancelled". Its task, if it
+        hasn't run, never does; if it's running, its result is dropped when
+        it comes. An actor call still runs, since the calls after it expect
+        the actor's state to have seen it. A settled object is left alone.
+        """
+        if self._answered(obj):
+            return
+        if obj in self._running:
+            self._fail_all(obj, String("cancelled"))
+            return
+        if obj in self._waiting:
+            try:
+                var t = self._waiting.pop(obj)
+                self._waiting_bytes -= len(t.args)
+            except:
+                pass
+            _ = self._unsettled.pop(obj, 0)
+            self._fail_all(obj, String("cancelled"))
+            return
+        # Queued, most likely: `_dispatch` drops it when it reaches the front
+        # of its queue. If it's no task in a queue, the mark goes with the
+        # object.
+        self._cancelled[obj] = True
+        self._fail_all(obj, String("cancelled"))
+
+    def _purge(mut self, d: UInt64):
+        """Drops departed driver `d`'s tasks that are queued or waiting for
+        inputs. They go entirely, so the same driver resuming with this head
+        submits them afresh."""
+        var dropped = List[UInt64]()
+        var hashes = List[UInt64]()
+        for entry in self._queues.items():
+            hashes.append(entry.key)
+        for h in hashes:
+            try:
+                ref q = self._queues[h]
+                var kept = List[_Task]()
+                while len(q.tasks) > q.head:
+                    var t = q.tasks.pop()
+                    if owner_of(t.object_id) == d:
+                        self._queued_bytes -= len(t.args)
+                        dropped.append(t.object_id)
+                    else:
+                        kept.append(t^)
+                kept.reverse()
+                q.tasks = kept^
+                q.head = 0
+            except:
+                pass
+        var gone = List[UInt64]()
+        for entry in self._waiting.items():
+            if owner_of(entry.key) == d:
+                gone.append(entry.key)
+        for obj in gone:
+            try:
+                var t = self._waiting.pop(obj)
+                self._waiting_bytes -= len(t.args)
+            except:
+                continue
+            _ = self._unsettled.pop(obj, 0)
+            dropped.append(obj)
+        for obj in dropped:
+            var parts = self._many.pop(obj, 1)
+            _ = self._tries.pop(obj, 0)
+            _ = self._spans.pop(obj, _Span(0, 0, -1, 0, 0, 0, 0, 0, 0, 0))
+            var deps = self._deps_of.pop(obj, List[UInt64]())
+            for dep in deps:
+                self._dec(dep)
+            for k in range(parts):
+                var part = obj + UInt64(k)
+                _ = self._unhold(part)
+                _ = self._refs.pop(part, 0)
+                _ = self._dead.pop(part, False)
+                self._free(part)
 
     def _move_actor(mut self, a: UInt64):
         """Starts moving actor `a` off its draining worker: holds its new
@@ -2239,8 +2664,7 @@ struct Head(Movable):
             return
         # The old copy stays until its worker leaves: a task may have been
         # sent its location.
-        self._location[obj] = j
-        self._where[obj] = loc.copy()
+        self._put_location(obj, j, loc)
         self._learn_node(j, loc)
         self._moved += 1
         self._deliver(obj, KIND_LOCATED, loc)
@@ -2250,13 +2674,19 @@ struct Head(Movable):
         nothing will run them, and a driver waiting on one would wait for
         ever."""
         var queued = List[_Task]()
-        for entry in self._queues.items():
-            ref q = entry.value
-            for k in range(q.head, len(q.tasks)):
-                queued.append(q.tasks[k].copy())
+        var hashes = List[UInt64]()
+        for h in self._queues.keys():
+            hashes.append(h)
+        for h in hashes:
+            try:
+                queued.extend(self._queues[h].take_all())
+            except:
+                pass
         self._queues = Dict[UInt64, _Queue]()
         self._queued_bytes = 0
         for ref t in queued:
+            if self._cancelled.pop(t.object_id, False):
+                continue  # failed already
             var parts = self._many.get(t.object_id, 1)
             for k in range(parts):
                 self._fail(
@@ -2302,61 +2732,101 @@ struct Head(Movable):
                 self._roles[i] = _ROLE_GONE
                 self._conns[i].stream.close()
 
+    def _wait_for(mut self, obj: UInt64, deps: List[UInt64]):
+        """Indexes waiting task `obj` by the inputs it waits for. With none
+        unsettled, it's looked at on the next pass."""
+        var n = 0
+        for d in deps:
+            if not self._is_settled(d):
+                n += 1
+                if d not in self._waiters:
+                    self._waiters[d] = List[UInt64]()
+                try:
+                    self._waiters[d].append(obj)
+                except:
+                    pass
+        self._unsettled[obj] = n
+        if n == 0:
+            self._recheck.append(obj)
+
+    def _is_settled(self, d: UInt64) -> Bool:
+        return d in self._errors or d in self._location or d in self._results
+
+    def _settled(mut self, obj: UInt64, failed: Bool = False):
+        """`obj` has its answer: the waiting tasks that take it have one input
+        fewer to wait for, and fail at once if it did."""
+        var waiting = self._waiters.pop(obj, List[UInt64]())
+        for w in waiting:
+            var n = self._unsettled.get(w, 0) - 1
+            if n < 0:
+                continue  # released already, or failed by another input
+            self._unsettled[w] = n
+            if n == 0 or failed:
+                self._recheck.append(w)
+
     def _release_waiting(mut self):
-        if len(self._waiting) == 0:
+        """Queues the waiting tasks whose inputs have all settled, and fails
+        those with an input that failed. Only the tasks `_settled` named are
+        looked at, oldest first."""
+        if len(self._recheck) == 0:
             return
-        var still = List[_Task]()
-        for i in range(len(self._waiting)):
-            ref t = self._waiting[i]
+        var ids = self._recheck^
+        self._recheck = List[UInt64]()
+        sort(ids)
+        var last = UInt64(0)
+        for id in ids:
+            if id == last or id not in self._waiting:
+                continue
+            last = id
             var failed = String()
             var settled = True
             var remote = False
-            for d in t.deps:
-                if d in self._errors:
-                    failed = self._errors.get(d, String())
-                elif d in self._location:
-                    remote = True
-                elif d not in self._results:
-                    settled = False
+            try:
+                ref t = self._waiting[id]
+                for d in t.deps:
+                    if d in self._errors:
+                        failed = self._errors.get(d, String())
+                    elif d in self._location:
+                        remote = True
+                    elif d not in self._results:
+                        settled = False
+            except:
+                continue
+            if not failed and not settled:
+                continue  # one input failed and another settled since
+            var t: _Task
+            try:
+                t = self._waiting.pop(id)
+            except:
+                continue
+            _ = self._unsettled.pop(id, 0)
+            self._waiting_bytes -= len(t.args)
             if failed:
-                self._fail_all(t.object_id, String("input failed: ", failed))
-            elif not settled:
-                still.append(t.copy())
+                self._fail_all(id, String("input failed: ", failed))
             elif not remote:
                 # A `TaskMany` runs on its number of results, then the input.
                 var args = List[UInt8]()
                 if t.many > 0:
                     put_scalar[DType.uint64](args, UInt64(t.many))
-                args.extend(t.args.copy())
+                args.extend(Span(t.args))
                 if t.gather:
                     put_scalar[DType.int64](args, Int64(len(t.deps)))
                 for d in t.deps:
-                    args.extend(self._results.get(d, List[UInt8]()))
-                var id = t.object_id
+                    try:
+                        args.extend(Span(self._results[d]))
+                    except:
+                        pass
                 var kind = KIND_TASK_MANY if t.many > 0 else KIND_TASK
                 self._enqueue(_Task(id, t.task_id, args^, kind=kind))
                 self._stamp_queued(id)
             else:
                 # Some inputs live on workers: the worker that runs this task
                 # is told where to fetch them as it's sent the task.
-                var id = t.object_id
-                self._enqueue(
-                    _Task(
-                        id,
-                        t.task_id,
-                        t.args.copy(),
-                        deps=t.deps.copy(),
-                        gather=t.gather,
-                        kind=KIND_TASK_INPUTS,
-                        node=self._preferred_node(t.deps),
-                        many=t.many,
-                    )
-                )
+                var node = self._preferred_node(t.deps)
+                t.kind = KIND_TASK_INPUTS
+                t.node = node^
+                self._enqueue(t^)
                 self._stamp_queued(id)
-        self._waiting = still^
-        self._waiting_bytes = 0
-        for ref t in self._waiting:
-            self._waiting_bytes += len(t.args)
 
     def _inputs_spec(self, t: _Task) -> List[UInt8]:
         """A task-inputs payload for `t`: where each input that lives on a
@@ -2377,14 +2847,17 @@ struct Head(Movable):
                 put_scalar[DType.uint64](spec, d)
                 spec.extend(self._where.get(d, List[UInt8]()))
             else:
-                var r = self._results.get(d, List[UInt8]())
                 spec.append(0)
                 put_scalar[DType.uint64](spec, d)
-                put_scalar[DType.uint64](spec, UInt64(len(r)))
-                spec.extend(r^)
+                try:
+                    ref r = self._results[d]
+                    put_scalar[DType.uint64](spec, UInt64(len(r)))
+                    spec.extend(Span(r))
+                except:
+                    put_scalar[DType.uint64](spec, 0)
         if len(t.args) > 0:
             put_scalar[DType.uint64](spec, UInt64(len(t.args)))
-            spec.extend(t.args.copy())
+            spec.extend(Span(t.args))
         return spec^
 
     def _input_failed(self, t: _Task) -> String:
@@ -2469,6 +2942,8 @@ struct Head(Movable):
         var fallback = -1
         var end = min(q.head + LOOKAHEAD, len(q.tasks))
         for k in range(q.head, end):
+            if q.tasks[k].object_id in self._cancelled:
+                continue  # dropped when it reaches the front
             if self._on_draining(q.tasks[k]):
                 continue
             if self._driver_behind(q.tasks[k].object_id):
@@ -2538,26 +3013,33 @@ struct Head(Movable):
                 var t: _Task
                 try:
                     ref q = self._queues[h]
+                    while (
+                        len(q) > 0
+                        and q.tasks[q.head].object_id in self._cancelled
+                    ):
+                        _ = self._cancelled.pop(
+                            q.tasks[q.head].object_id, False
+                        )
+                        self._queued_bytes -= len(q.tasks[q.head].args)
+                        q.tasks[q.head].args = List[UInt8]()
+                        q.head += 1
+                    if q.head == len(q.tasks):
+                        q.tasks.clear()
+                        q.head = 0
                     if len(q) == 0:
                         continue
                     var k = self._pick(q, i, depth)
                     if k < 0:
                         continue
-                    if k != q.head:
-                        q.tasks.swap_elements(q.head, k)
-                    t = q.tasks[q.head].copy()
+                    t = q.take(k)
                     self._queued_bytes -= len(t.args)
-                    q.head += 1
-                    if q.head == len(q.tasks):
-                        q.tasks.clear()
-                        q.head = 0
                 except:
                     continue
                 self._inflight[i].append(t.object_id)
                 if t.object_id in self._spans:
                     try:
                         ref sp = self._spans[t.object_id]
-                        sp.worker = i
+                        sp.worker = self._book_of[i]
                         sp.dispatched = wall_ns()
                     except:
                         pass
@@ -2568,17 +3050,22 @@ struct Head(Movable):
                         t.object_id, String("input failed: ", failed)
                     )
                     continue
-                self._tries[t.object_id] = self._tries.get(t.object_id, 0) + 1
-                var body = (
-                    self._inputs_spec(t) if t.kind
-                    == KIND_TASK_INPUTS else t.args.copy()
-                )
-                var sent = t.copy()
-                self._running[t.object_id] = t^
+                var obj = t.object_id
+                self._tries[obj] = self._tries.get(obj, 0) + 1
+                # Sent from the task itself, which then moves into `_running`:
+                # its arguments aren't copied.
+                var lost = False
                 try:
-                    self._conns[i].send(
-                        sent.kind, sent.object_id, sent.task_id, body
-                    )
+                    if t.kind == KIND_TASK_INPUTS:
+                        self._conns[i].send(
+                            t.kind, obj, t.task_id, self._inputs_spec(t)
+                        )
+                    else:
+                        self._conns[i].send(t.kind, obj, t.task_id, t.args)
                 except e:
                     print("dista head: lost worker:", e)
+                    lost = True
+                # Running before the drop, which sends it to another worker.
+                self._running[obj] = t^
+                if lost:
                     self._drop(i)

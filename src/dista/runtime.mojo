@@ -6,7 +6,7 @@ comptime Square = Task[Int, Int, square]
 def main() raises:
     var rt = Runtime[Square](workers=4)
     var r = rt.remote[Square](7)
-    print(rt.get(r))  # 49
+    print(rt.take(r))  # 49: get, then release
 ```
 
 `Runtime(...)` reads the environment to decide what this process is:
@@ -416,6 +416,31 @@ struct Runtime[*Ts: TaskLike](Movable):
     def get[R: Movable](mut self, r: ObjectRef[R]) raises -> R:
         """Waits for `r`'s task and returns its result, or raises its error."""
         return self._c.get(r)
+
+    def take[R: Movable & Deinitable](mut self, r: ObjectRef[R]) raises -> R:
+        """Waits for `r`'s task, returns its result and releases `r`: what
+        to read a result with unless it's read again. See `Client.take`."""
+        return self._c.take(r)
+
+    def take[
+        R: Copyable & Deinitable
+    ](mut self, refs: List[ObjectRef[R]]) raises -> List[R]:
+        """Takes every ref in `refs`, in order."""
+        return self._c.take(refs)
+
+    def get[
+        R: Movable
+    ](mut self, r: ObjectRef[R], timeout: Float64) raises -> R:
+        """Waits up to `timeout` seconds for `r`: see `Client.get`."""
+        return self._c.get(r, timeout)
+
+    def cancel[R: AnyType](mut self, r: ObjectRef[R]) raises:
+        """Gives up on `r`: see `Client.cancel`."""
+        self._c.cancel(r)
+
+    def cancel[R: AnyType](mut self, refs: List[ObjectRef[R]]) raises:
+        """Cancels every ref in `refs`."""
+        self._c.cancel(refs)
 
     def release[R: AnyType](mut self, r: ObjectRef[R]) raises:
         """Says this driver is done with `r`: see `Client.release`."""

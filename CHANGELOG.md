@@ -15,6 +15,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   poll it at 100% CPU, or die of the reset itself
   ([#89](https://github.com/magmalake/dista.mojo/issues/89)).
   `tests/peer_loss.sh` kills a worker while two others fetch from it.
+### Added
+
+- **`rt.take(ref)`**: `get`, then `release`, for a result read once. A
+  small result is decoded from the bytes it drops rather than a copy;
+  `rt.take(refs)` takes a list in order. `get` and `release` are unchanged
+  ([#98](https://github.com/magmalake/dista.mojo/issues/98)).
+- **What each driver holds.** `dista status` prints the objects each driver
+  holds, `--json` adds `driver_objects` (driver, held, client), `/metrics`
+  adds `dista_driver_held_objects_max`, and the head logs a driver holding
+  `DISTA_WARN_HELD` objects (default 100,000; 0, never), and again at each
+  doubling.
+
+### Changed
+
+- The README, `examples/mapreduce.mojo` and the docstrings read results with
+  `take`: the README's loop of `get`s kept every result in the driver and the
+  head until the program ended.
+### Added
+
+- **`rt.cancel(ref)`** (and a list overload): a task that hasn't run never
+  does, and a running one's result is dropped; `get` raises `cancelled`, as
+  do tasks waiting on it. An actor call is answered `cancelled` but still
+  runs. A new frame, `KIND_CANCEL` (32), carries it.
+- **`rt.get(ref, timeout=seconds)`** raises an error starting with `timed
+  out` once the timeout passes; the ref stays valid. `get(ref)` is
+  unchanged.
+
+### Fixed
+
+- A driver that disconnects no longer leaves its queued and waiting tasks
+  to run on the workers: the head drops them (#97).
+- **Driver numbers no longer restart at 1 when the head does** (#91). A head
+  numbers new drivers from a random start and sends an epoch in its welcome;
+  only a driver resuming under its old number claims results the workers
+  report, so a new driver can't be handed another job's results. A resuming
+  driver whose number this head gave someone else is refused with a reason,
+  and its `Client` raises instead of retrying for ever; one that comes back
+  before the head noticed its old connection drop replaces it. Results no
+  driver comes back for are freed after `DISTA_ORPHAN_SECONDS` (default
+  120).
+- **The head's ready queue holds only what's queued.** It cleared its list
+  only once every task in it had been handed out, so under backpressure,
+  with the queue full for a whole job, every task dispatched stayed in
+  memory with its arguments, uncounted by `dista_queued_bytes`. A task
+  handed out now moves into the running set, and the queue compacts once
+  half its list is spent. Dispatch no longer copies a task's arguments
+  twice. `bench/fanout.mojo` gains a backpressure run: the head's peak
+  memory there went from 176 MB to about 95 MB.
+- **Connects time out, and a worker's peer connects don't block it.** A
+  worker connects to the peers it fetches from inside its event loop, and
+  keeps running tasks and serving fetches meanwhile. After
+  `DISTA_PEER_CONNECT_TIMEOUT` seconds (new, default 5) it fails the tasks
+  waiting on that peer, as unreachable. Before, a black-holed address
+  stalled the whole worker for the kernel's two minutes. A driver's fetch
+  waits the same time, `dista status` and the other observers wait
+  `DISTA_CONNECT_TIMEOUT`, and each try of `connect_head` waits only for
+  what is left of that budget
+  ([#94](https://github.com/magmalake/dista.mojo/issues/94)).
+  `tests/peer_connect.sh` fills a stopped worker's backlog and fetches from
+  it.
+### Changed
+
+- **The head loop's cost follows its events.** Waiting tasks are indexed by
+  their inputs, so an iteration looks only at the tasks whose inputs just
+  settled instead of checking and copying every waiting task: 384 reducers
+  gathering 2,000 map outputs finish in 0.07 s instead of 1.1 s
+  (`bench/fanout.mojo`, which gains this run). A closed connection's slot
+  and buffers are reused and freed, so a long-lived head polled by
+  `dista status` no longer scans every connection it ever had. Each
+  worker's held bytes are counted as results come and go, not recomputed
+  for every `dista status --json`.
 
 ## [0.2.1] - 2026-11-03
 

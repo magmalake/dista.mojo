@@ -14,7 +14,7 @@ comptime Square = Task[Int, Int, square]
 def main() raises:
     var rt = Runtime[Square](workers=4)
     var r = rt.remote[Square](7)
-    print(rt.get(r))  # 49
+    print(rt.take(r))  # 49: get, then release
 ```
 
 An actor keeps state between calls on a worker of its own:

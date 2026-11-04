@@ -17,12 +17,15 @@ from dista.frame import (
 )
 from dista.socket import (
     Listener,
+    POLLOUT,
     Stream,
     exit_now,
     fork,
+    poll,
     send_some,
     wait_child,
 )
+from std.time import perf_counter_ns
 
 
 def bytes_of(s: String) -> List[UInt8]:
@@ -124,6 +127,55 @@ def test_a_full_socket_doesnt_block_a_send() raises:
     var got = List[UInt8](length=len(buf), fill=0)
     assert_equal(c.read_into(got.unsafe_ptr(), len(got)), len(got))
     assert_equal(got[0], 1)
+
+
+def test_connect_to_a_silent_address_times_out() raises:
+    """A listener whose backlog is full drops new SYNs, as a vanished node or
+    a firewall does: a connect to it would wait the kernel's two minutes.
+    With a timeout it raises once that passes. A connect that waits for the
+    kernel hangs this test."""
+    var l = Listener(backlog=1)
+    var held = List[Stream]()
+    var timed_out = False
+    var took = 0
+    for _ in range(64):
+        var t0 = perf_counter_ns()
+        try:
+            held.append(Stream.connect(l.port, timeout_ms=200))
+        except e:
+            took = Int(perf_counter_ns() - t0) // 1_000_000
+            assert_true("timed out" in String(e), String(e))
+            timed_out = True
+            break
+    assert_true(timed_out, "the backlog never filled")
+    assert_true(took >= 150 and took < 2000, String("took ", took, " ms"))
+
+
+def loopback() -> Array[UInt8, 4]:
+    var ip = Array[UInt8, 4](fill=0)
+    ip[0] = 127
+    ip[3] = 1
+    return ip^
+
+
+def test_start_connect_completes_in_the_background() raises:
+    var l = Listener()
+    var c = Stream.start_connect(loopback(), l.port)
+    _ = poll([c.fd], [POLLOUT], 2000)
+    c.finish_connect()
+    var s = l.accept()
+    write_frame(c, KIND_RESULT, 1, 0, bytes_of("hi"))
+    assert_equal(read_frame(s).value().object_id, 1)
+
+
+def test_start_connect_to_a_closed_port_fails() raises:
+    var l = Listener()
+    var port = l.port
+    l.close()
+    var c = Stream.start_connect(loopback(), port)
+    _ = poll([c.fd], [POLLOUT], 2000)
+    with assert_raises(contains="connect failed"):
+        c.finish_connect()
 
 
 def test_fork_and_exit_status() raises:

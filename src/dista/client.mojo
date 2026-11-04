@@ -23,6 +23,7 @@ from dista.frame import (
     KIND_ACTOR_CALL,
     KIND_ACTOR_CREATE,
     KIND_ACTOR_KILL,
+    KIND_CANCEL,
     KIND_CHECKPOINT,
     KIND_CLAIM,
     KIND_COVERED,
@@ -259,7 +260,9 @@ struct Observer(Movable):
         """Connects to the head at `addr`, `host:port`, once: an observer
         reports a head that isn't there rather than wait for one."""
         var hp = parse_host_port(addr)
-        self._head = Stream.connect(hp[0], hp[1])
+        self._head = Stream.connect(
+            hp[0], hp[1], timeout_ms=_connect_timeout_s() * 1000
+        )
         _ = _hello(self._head, ROLE_OBSERVER, 0)
 
     def _ask(
@@ -399,6 +402,27 @@ def parse_host_port(addr: String) raises -> Tuple[String, Int]:
     return (String(parts[0]), Int(parts[1]))
 
 
+def _connect_timeout_s() -> Int:
+    """`DISTA_CONNECT_TIMEOUT`, in seconds: default 60."""
+    try:
+        return max(Int(getenv("DISTA_CONNECT_TIMEOUT", "60")), 0)
+    except:
+        return 60
+
+
+def peer_connect_timeout_ms() -> Int:
+    """`DISTA_PEER_CONNECT_TIMEOUT`, in milliseconds: how long a worker or a
+    driver waits for a connect to the worker holding a result. Seconds, a
+    fraction allowed; default 5. A closed port fails at once; this bounds an
+    address that never answers (a vanished node, a firewall dropping SYNs),
+    which the kernel would otherwise retry for about two minutes."""
+    try:
+        var secs = Float64(getenv("DISTA_PEER_CONNECT_TIMEOUT", "5"))
+        return max(Int(secs * 1000.0), 1)
+    except:
+        return 5000
+
+
 def connect_head(addr: String) raises -> Stream:
     """Connects to the head at `host:port`, retrying while it isn't up yet.
 
@@ -411,12 +435,15 @@ def connect_head(addr: String) raises -> Stream:
     added that much to every recovery.
     """
     var hp = parse_host_port(addr)
-    var limit = Int(getenv("DISTA_CONNECT_TIMEOUT", "60"))
+    var limit = _connect_timeout_s()
     var deadline = Int(perf_counter_ns()) + limit * 1_000_000_000
     var wait = 0.01
     while True:
+        # Each try waits only as long as is left: a head address that drops
+        # SYNs would otherwise hold one try for the kernel's two minutes.
+        var left = max((deadline - Int(perf_counter_ns())) // 1_000_000, 100)
         try:
-            return Stream.connect(hp[0], hp[1])
+            return Stream.connect(hp[0], hp[1], timeout_ms=left)
         except e:
             if Int(perf_counter_ns()) >= deadline:
                 raise e^
@@ -432,6 +459,14 @@ def _hello_payload(role: UInt8, registry_hash: UInt64) -> List[UInt8]:
 
 def _hello(s: Stream, role: UInt8, registry_hash: UInt64) raises -> UInt64:
     """Introduces a driver to the head and returns its driver number."""
+    return _welcome(s, role, registry_hash)[0]
+
+
+def _welcome(
+    s: Stream, role: UInt8, registry_hash: UInt64
+) raises -> Tuple[UInt64, UInt64]:
+    """Introduces a driver to the head and returns its driver number and the
+    head's epoch (0 from a head that sends none)."""
     write_frame(s, KIND_HELLO, 0, 0, _hello_payload(role, registry_hash))
     var f = read_frame(s)
     if not f:
@@ -445,7 +480,11 @@ def _hello(s: Stream, role: UInt8, registry_hash: UInt64) raises -> UInt64:
     if frame.kind != KIND_WELCOME:
         raise Error("expected welcome, got frame kind ", Int(frame.kind))
     var pos = 0
-    return get_scalar[DType.uint64](frame.payload, pos)
+    var n = get_scalar[DType.uint64](frame.payload, pos)
+    var epoch = UInt64(0)
+    if len(frame.payload) >= 16:
+        epoch = get_scalar[DType.uint64](frame.payload, pos)
+    return (n, epoch)
 
 
 struct Client(Movable):
@@ -453,6 +492,11 @@ struct Client(Movable):
 
     var _head: Stream
     var _driver: UInt64
+    var _epoch: UInt64
+    """The epoch of the head that numbered this driver, which a restarted
+    head checks the number against."""
+    var _refusal: String
+    """Why a restarted head refused this driver back, once one has."""
     var _counter: UInt64
     var _hash: UInt64
     var _role: UInt8
@@ -507,7 +551,10 @@ struct Client(Movable):
             registry_hash: The registry every peer must share.
             role: `ROLE_DRIVER`, or `ROLE_CLIENT` for one inside a worker.
         """
-        self._driver = _hello(head, role, registry_hash)
+        var w = _welcome(head, role, registry_hash)
+        self._driver = w[0]
+        self._epoch = w[1]
+        self._refusal = String()
         self._head = head^
         self._hash = registry_hash
         self._role = role
@@ -879,14 +926,25 @@ struct Client(Movable):
                 self._replay()
                 return
             except e:
+                if self._refusal:
+                    # Trying again gets the same answer.
+                    raise Error(
+                        "the restarted head refused this driver: ",
+                        self._refusal,
+                    )
                 print("dista driver: lost the head again resuming (", e, ")")
 
     def _replay(mut self) raises:
         """Says hello under this driver's number and sends back its state."""
         var hello = _hello_payload(self._role, self._hash)
         put_scalar[DType.uint64](hello, self._driver)
+        if self._epoch != 0:
+            put_scalar[DType.uint64](hello, self._epoch)
         write_frame(self._head, KIND_HELLO, 0, 0, hello)
         var f = read_frame(self._head)
+        if f and f.value().kind == KIND_ERROR:
+            self._refusal = message(f.value().payload)
+            raise Error(self._refusal)
         if not f or f.value().kind != KIND_WELCOME:
             raise Error("the restarted head didn't welcome this driver back")
         # Oldest first, so every task's inputs are back before it is, and
@@ -1025,6 +1083,80 @@ struct Client(Movable):
                 return self._stored[R](r.id)
         return decode[R](self._results[r.id], pos)
 
+    def take[R: Movable & Deinitable](mut self, r: ObjectRef[R]) raises -> R:
+        """Waits for `r`'s task, returns its result and releases `r`: `get`
+        then `release`, for a result read once, which is most of them.
+
+        A result `get` returned stays here, at the head and on its worker
+        until it's released, so a driver that only gets grows without bound.
+        `take` lets go as it reads, and a small result is decoded from the
+        bytes it drops rather than from a copy. A task given `r` as input
+        still gets it. It raises `r`'s error, released all the same.
+        """
+        if r.id in self._released:
+            raise Error(r, " was released")
+        while not self._settled(r.id):
+            self._read_one()
+        if r.id in self._results and self._dependents.get(r.id, 0) == 0:
+            # Nothing pending needs these bytes again: decode from them.
+            var bytes = self._results.pop(r.id)
+            self.release(r)
+            var pos = 0
+            return decode[R](bytes, pos)
+        try:
+            var value = self.get(r)
+            self.release(r)
+            return value^
+        except e:
+            self.release(r)
+            raise e^
+
+    def take[
+        R: Copyable & Deinitable
+    ](mut self, refs: List[ObjectRef[R]]) raises -> List[R]:
+        """Takes every ref in `refs`, in order: their results, each released
+        as it's read. The first error raises, and the refs after it stay held.
+        """
+        var out = List[R](capacity=len(refs))
+        for r in refs:
+            out.append(self.take(r))
+        return out^
+
+    def get[
+        R: Movable
+    ](mut self, r: ObjectRef[R], timeout: Float64) raises -> R:
+        """Waits up to `timeout` seconds for `r`'s task and returns its
+        result, or raises its error. Past the timeout it raises an error that
+        starts with "timed out"; `r` stays valid, to wait on again or cancel.
+        """
+        if r.id in self._released:
+            raise Error(r, " was released")
+        var deadline = Int(perf_counter_ns()) + Int(max(timeout, 0.0) * 1e9)
+        while not self._settled(r.id):
+            var left = deadline - Int(perf_counter_ns())
+            if left <= 0:
+                raise Error("timed out after ", timeout, " s waiting for ", r)
+            if poll_readable([self._head.fd], left // 1_000_000 + 1)[0]:
+                self._read_one()
+        return self.get(r)
+
+    def cancel[R: AnyType](mut self, r: ObjectRef[R]) raises:
+        """Gives up on `r`: if its task hasn't run, it never does; if it's
+        running, it finishes on its worker and the result is dropped. `get`
+        raises "cancelled" from then on, and so does any task waiting on
+        `r`. A result that's already here is kept, and `get` returns it. An
+        actor call still runs, since later calls expect its effect, but its
+        answer is "cancelled". `release` it as any other ref.
+        """
+        if r.id in self._released or self._settled(r.id):
+            return
+        self._send(KIND_CANCEL, r.id, List[UInt8]())
+
+    def cancel[R: AnyType](mut self, refs: List[ObjectRef[R]]) raises:
+        """Cancels every ref in `refs`."""
+        for r in refs:
+            self.cancel(r)
+
     def _stored[R: Movable](mut self, id: UInt64) raises -> R:
         """Decodes a result that lives on a worker, from where it was last
         said to be."""
@@ -1144,7 +1276,11 @@ struct Client(Movable):
         """Copies a result from the worker holding it, over a socket."""
         var key = addr_key(loc.ip, loc.port)
         if key not in self._fetcher_index:
-            self._fetchers.append(Stream.connect(loc.ip, loc.port))
+            self._fetchers.append(
+                Stream.connect(
+                    loc.ip, loc.port, timeout_ms=peer_connect_timeout_ms()
+                )
+            )
             self._fetcher_index[key] = len(self._fetchers) - 1
         var i = self._fetcher_index.get(key, -1)
         write_frame(self._fetchers[i], KIND_FETCH, id, 0, List[UInt8]())
@@ -1223,10 +1359,7 @@ struct CtxTask[
 
     ```mojo
     def bump(mut c: Client, h: ActorHandle[CounterActor]) raises -> Int:
-        var r = c.call[Add](h, 1)
-        var n = c.get(r)
-        c.release(r)
-        return n
+        return c.take(c.call[Add](h, 1))
 
     comptime Bump = CtxTask[ActorHandle[CounterActor], Int, bump]
     ```

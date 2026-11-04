@@ -18,9 +18,14 @@ test-free = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_fre
 test-actors = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_actors.mojo -o build/test-actors && ./build/test-actors" }
 test-arity = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_arity.mojo -o build/test-arity && ./build/test-arity" }
 test-shuffle = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_shuffle.mojo -o build/test-shuffle && ./build/test-shuffle" }
+test-take = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_take.mojo -o build/test-take && ./build/test-take" }
 test-admission = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_admission.mojo -o build/test-admission && ./build/test-admission" }
+test-head-queue = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_head_queue.mojo -o build/test-head-queue && ./build/test-head-queue" }
+test-head-loop = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_head_loop.mojo -o build/test-head-loop && ./build/test-head-loop" }
 test-spill = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_spill.mojo -o build/test-spill && ./build/test-spill" }
 test-timeline = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_timeline.mojo -o build/test-timeline && ./build/test-timeline" }
+test-cancel = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_cancel.mojo -o build/test-cancel && ./build/test-cancel" }
+test-head-drivers = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_head_drivers.mojo -o build/test-head-drivers && ./build/test-head-drivers" }
 test-scale = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_scale.mojo -o build/test-scale && ./build/test-scale" }
 test-cluster = { cmd = "tests/cluster.sh" }
 test-restart = { cmd = "tests/head_restart.sh" }
@@ -29,11 +34,12 @@ test-compile-fail = { cmd = "tests/compile_fail.sh" }
 test-metrics = { cmd = "tests/metrics.sh" }
 test-drain = { cmd = "tests/drain.sh" }
 test-peer-loss = { cmd = "tests/peer_loss.sh" }
+test-peer-connect = { cmd = "tests/peer_connect.sh" }
 test-autoscale = { cmd = "tests/autoscale.sh" }
 test-cli = { cmd = "tests/cli.sh" }
 test-chaos = { cmd = "CHAOS_FAST=1 tests/chaos.sh" }
 test-kind = { cmd = "tests/kind.sh" }
-test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-timeline", "test-scale", "test-actors", "test-arity", "test-shuffle", "test-spill", "test-admission", "test-cluster", "test-restart", "test-locality", "test-compile-fail", "test-metrics", "test-drain", "test-peer-loss", "test-autoscale", "test-cli", "test-chaos"] }
+test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-take", "test-timeline", "test-scale", "test-head-drivers", "test-actors", "test-arity", "test-shuffle", "test-spill", "test-admission", "test-head-loop", "test-head-queue", "test-cancel", "test-cluster", "test-restart", "test-locality", "test-compile-fail", "test-metrics", "test-drain", "test-peer-loss", "test-peer-connect", "test-autoscale", "test-cli", "test-chaos"] }
 cli = { cmd = "mkdir -p build && mojo build -I src $DEP_INC cli/main.mojo -o build/dista" }
 bench = { cmd = "mkdir -p build && mojo build -I src $DEP_INC bench/fanout.mojo -o build/bench-fanout && ./build/bench-fanout" }
 

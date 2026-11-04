@@ -17,7 +17,7 @@ def main() raises:
         refs.append(rt.remote[Square](i))
     var total = 0
     for r in refs:
-        total += rt.get(r)
+        total += rt.take(r)  # get and release: read once, then freed
     print(total)  # 332833500
 ```
 
@@ -33,7 +33,9 @@ What works today:
 - **Up to three arguments:** `Task2` and `Task3` take two and three, as `rt.remote[T](a, b)` and `rt.remote[T](a, b, c)` ([tests/test_arity.mojo](tests/test_arity.mojo)); more travel as a struct.
 - **Arguments and results:** scalars, `String`, plain structs of those, `Seq[T]` lists, types that implement `Codec`, and arrow-mlake `RecordBatch`es, which travel as Arrow IPC streams.
 - **Results feeding tasks:** a task can take another task's `ObjectRef`, or gather a list of them into a `Seq`, as in [examples/mapreduce.mojo](examples/mapreduce.mojo).
-- **Errors:** a task that raises re-raises in `get`. A worker that dies has its tasks run again elsewhere, up to `DISTA_TASK_RETRIES` times; the results it held are lost, and a task that needs one fails, naming it.
+- **Freeing results:** a result stays in the driver, at the head and on its worker until its ref is released. `rt.take(r)` reads it and releases it, the way to read a result used once; `rt.get(r)` keeps it, for reading again, until `rt.release(r)`. `dista status` shows how many objects each driver holds, and the head logs a driver holding more than `DISTA_WARN_HELD` (default 100,000) ([tests/test_take.mojo](tests/test_take.mojo)).
+- **Giving up on work:** `rt.cancel(ref)` drops a task that hasn't run and discards the result of one that's running; `get` then raises `cancelled`. `rt.get(ref, timeout=s)` raises an error starting `timed out` after `s` seconds, leaving the ref valid. A driver that disconnects takes its queued and waiting tasks with it ([tests/test_cancel.mojo](tests/test_cancel.mojo)).
+- **Errors:** a task that raises re-raises in `get` and `take`. A worker that dies has its tasks run again elsewhere, up to `DISTA_TASK_RETRIES` times; the results it held are lost, and a task that needs one fails, naming it.
 - **Draining:** a worker sent SIGTERM, as Kubernetes stops a pod, finishes its tasks while the others adopt its results and its actor, restored from a checkpoint, then leaves: nothing fails or runs again ([tests/drain.sh](tests/drain.sh)). `DISTA_DRAIN_SECONDS` (default 25) bounds it.
 - **Large results stay on the worker that made them.** On the same host other processes map them from shared memory; across hosts they fetch them directly from that worker. Small ones come back through the head.
 - **Spilling:** past `DISTA_STORE_BYTES` of results, or when the store is full, a worker writes the rest to `DISTA_SPILL_DIR` on disk, and readers map or fetch them as before ([tests/test_spill.mojo](tests/test_spill.mojo)).
