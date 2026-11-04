@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-03
+
+### Changed
+
+- Built against objectstore-mojo 0.4.1, whose shim is found without
+  `CONDA_PREFIX` and raises an Error instead of aborting when missing. The
+  stable, nightly and data environments (and the CI checkouts) pin the same
+  release revisions of objectstore, zstd, lz4, brotli, sqlite and postgres.
+
 ## [0.2.0] - 2026-11-03
 
 Autoscaling: the head reports its demand, a policy decides, and whatever
