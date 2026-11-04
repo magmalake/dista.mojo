@@ -4,15 +4,22 @@ on:
   push:
     branches: [main]
   pull_request:
+  # macOS runs here, nightly and by hand (Actions > CI > Run workflow), not on
+  # PRs or main: its jobs aren't required, and they held runners from the
+  # org's small macOS pool that every repo's PRs share.
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
 
 jobs:
   test:
     name: ${{ matrix.env == 'default' && 'stable' || matrix.env }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
         env: [default, nightly]
     defaults:
       run:
@@ -51,15 +58,17 @@ jobs:
           pixi-version: v0.78.0
           environments: ${{ matrix.env }}
           manifest-path: dista.mojo/pixi.toml
-          # Only main writes the environment cache. Every PR writing ~1 GB per
-          # environment kept the repository over GitHub's 10 GB cap, which
-          # evicted main's entries: the only ones every PR can read.
-          cache-write: ${{ github.event_name == 'push' }}
+          # Only main and the nightly write the environment cache. Every PR
+          # writing ~1 GB per environment kept the repository over GitHub's
+          # 10 GB cap, which evicted main's entries: the only ones every PR can
+          # read.
+          cache-write: ${{ github.event_name != 'pull_request' }}
 
       # Mojo's compile cache (share/max/cache in the environment) starts
       # empty in every job. Restored from main's last run, it makes builds of
       # code main has built already 4-6x faster. It's content-addressed, so a
-      # stale entry is never used. Saved by main only, like the environment.
+      # stale entry is never used. Saved by main and the nightly, like the
+      # environment.
       - uses: actions/cache/restore@v4
         with:
           path: dista.mojo/.pixi/envs/${{ matrix.env }}/share/max/cache
@@ -75,10 +84,10 @@ jobs:
 
       # Entries a week old go before saving, so the cache can't grow without
       # bound; one still in use is rebuilt once.
-      - if: always() && github.event_name == 'push'
-        name: Prune Mojo's compile cache (main only)
+      - if: always() && github.event_name != 'pull_request'
+        name: Prune Mojo's compile cache
         run: find .pixi/envs/${{ matrix.env }}/share/max/cache -type f -mtime +7 -delete || true
-      - if: always() && github.event_name == 'push'
+      - if: always() && github.event_name != 'pull_request'
         uses: actions/cache/save@v4
         with:
           path: dista.mojo/.pixi/envs/${{ matrix.env }}/share/max/cache
@@ -90,6 +99,7 @@ jobs:
   # lets it share a binary with the standard library's file seek. See the
   # data environment in pixi.toml.
   data:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -137,7 +147,7 @@ jobs:
           pixi-version: v0.78.0
           environments: data
           manifest-path: dista.mojo/pixi.toml
-          cache-write: ${{ github.event_name == 'push' }}
+          cache-write: ${{ github.event_name != 'pull_request' }}
       - uses: actions/cache/restore@v4
         with:
           path: dista.mojo/.pixi/envs/data/share/max/cache
@@ -151,10 +161,10 @@ jobs:
         run: pixi run -e data test-parquet
       - name: A distributed Iceberg scan equals a local one
         run: pixi run -e data test-iceberg
-      - if: always() && github.event_name == 'push'
-        name: Prune Mojo's compile cache (main only)
+      - if: always() && github.event_name != 'pull_request'
+        name: Prune Mojo's compile cache
         run: find .pixi/envs/data/share/max/cache -type f -mtime +7 -delete || true
-      - if: always() && github.event_name == 'push'
+      - if: always() && github.event_name != 'pull_request'
         uses: actions/cache/save@v4
         with:
           path: dista.mojo/.pixi/envs/data/share/max/cache
@@ -163,6 +173,7 @@ jobs:
   # The image builds the program with pixi itself, so this job needs only
   # docker, kubectl (both on the runner) and kind.
   kind:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -175,6 +186,7 @@ jobs:
   # Every fuzz harness under fuzz/, for a short session each, with all bounds
   # checks on. Longer sessions are a FUZZ_RUNS away locally.
   fuzz:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -182,7 +194,7 @@ jobs:
         with:
           pixi-version: v0.78.0
           environments: fuzz
-          cache-write: ${{ github.event_name == 'push' }}
+          cache-write: ${{ github.event_name != 'pull_request' }}
       - uses: actions/cache/restore@v4
         with:
           path: .pixi/envs/fuzz/share/max/cache
@@ -195,16 +207,17 @@ jobs:
         run: |
           for f in build/fuzz-*-last.bin; do echo "$f"; xxd "$f" | head -20; done
           ls -R build/fuzz-crashes || true
-      - if: always() && github.event_name == 'push'
-        name: Prune Mojo's compile cache (main only)
+      - if: always() && github.event_name != 'pull_request'
+        name: Prune Mojo's compile cache
         run: find .pixi/envs/fuzz/share/max/cache -type f -mtime +7 -delete || true
-      - if: always() && github.event_name == 'push'
+      - if: always() && github.event_name != 'pull_request'
         uses: actions/cache/save@v4
         with:
           path: .pixi/envs/fuzz/share/max/cache
           key: mojo-${{ runner.os }}-fuzz-${{ hashFiles('pixi.lock') }}-${{ github.run_id }}
 
   format:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -212,6 +225,6 @@ jobs:
         with:
           pixi-version: v0.78.0
           environments: fmt
-          cache-write: ${{ github.event_name == 'push' }}
+          cache-write: ${{ github.event_name != 'pull_request' }}
       - name: Format check
         run: pixi run -e fmt format-check
