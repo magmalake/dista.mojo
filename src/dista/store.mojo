@@ -165,6 +165,15 @@ def store_limit() -> Int:
         return 0
 
 
+def map_shared(path: String, size: Int) raises -> SharedMapping:
+    """The shared mapping at `path`, checked to hold `size` bytes: read
+    where it lies, without copying it."""
+    var m = SharedMapping(path)
+    if size > m.size():
+        raise Error("shared object ", path, " is shorter than ", size, " bytes")
+    return m^
+
+
 def read_shared(path: String, size: Int) raises -> List[UInt8]:
     """The first `size` bytes of the shared mapping at `path`."""
     var m = SharedMapping(path)

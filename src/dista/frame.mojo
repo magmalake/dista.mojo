@@ -244,7 +244,7 @@ def append_parts(
 ) raises:
     """Appends `data`, object `object_id`, as part frames of at most `part`
     bytes each."""
-    var size = min(max(part, 1), MAX_PAYLOAD - _PART_HEADER)
+    var size = part_payload_size(part)
     var total = len(data)
     out.reserve(len(out) + total + (total // size + 1) * (4 + HEADER + 16))
     var offset = 0
@@ -260,6 +260,38 @@ def append_parts(
         offset += n
         if offset >= total:
             return
+
+
+def append_header(
+    mut out: List[UInt8],
+    kind: UInt8,
+    object_id: UInt64,
+    task_id: UInt64,
+    size: Int,
+) raises:
+    """Appends a frame's length and header, for a payload of `size` bytes
+    that the caller appends after it: a payload sent from where it lies."""
+    check_payload(size)
+    put_scalar[DType.uint32](out, UInt32(HEADER + size))
+    out.append(kind)
+    put_scalar[DType.uint64](out, object_id)
+    put_scalar[DType.uint64](out, task_id)
+
+
+def append_part_header(
+    mut out: List[UInt8], object_id: UInt64, total: Int, offset: Int, n: Int
+) raises:
+    """Appends a part frame's length, header and part fields, for the `n`
+    bytes of an object of `total` at `offset`, which the caller appends."""
+    append_header(out, KIND_PART, object_id, 0, _PART_HEADER + n)
+    put_scalar[DType.uint64](out, UInt64(total))
+    put_scalar[DType.uint64](out, UInt64(offset))
+
+
+def part_payload_size(part: Int) -> Int:
+    """The bytes of an object one part frame carries, for a fetch asking for
+    parts of `part`: what `append_parts` cuts it into."""
+    return min(max(part, 1), MAX_PAYLOAD - _PART_HEADER)
 
 
 def fetch_payload(part: Int = PART_SIZE) -> List[UInt8]:
@@ -364,10 +396,19 @@ def read_frame(s: Stream) raises -> Optional[Frame]:
     if s.read_into(head.unsafe_ptr(), 4) == 0:
         return None
     var n = frame_length(Span(head))
-    var body = List[UInt8](length=n, fill=0)
-    if s.read_into(body.unsafe_ptr(), n) == 0:
+    # The header, then the payload straight into a buffer of its own: no
+    # second copy of it.
+    var header = Array[UInt8, HEADER](fill=0)
+    if s.read_into(header.unsafe_ptr(), HEADER) == 0:
         raise Error("connection closed mid-frame")
-    return parse_body(body)
+    var payload = List[UInt8](capacity=n - HEADER)
+    payload.resize(unsafe_uninit_length=n - HEADER)
+    if n > HEADER and s.read_into(payload.unsafe_ptr(), n - HEADER) == 0:
+        raise Error("connection closed mid-frame")
+    var pos = 1
+    var object_id = get_scalar[DType.uint64](Span(header), pos)
+    var task_id = get_scalar[DType.uint64](Span(header), pos)
+    return Frame(header[0], object_id, task_id, payload^)
 
 
 def encode_addr(ip: Array[UInt8, 4], port: Int) -> List[UInt8]:
