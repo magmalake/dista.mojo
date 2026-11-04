@@ -51,6 +51,20 @@ jobs:
           pixi-version: v0.78.0
           environments: ${{ matrix.env }}
           manifest-path: dista.mojo/pixi.toml
+          # Only main writes the environment cache. Every PR writing ~1 GB per
+          # environment kept the repository over GitHub's 10 GB cap, which
+          # evicted main's entries: the only ones every PR can read.
+          cache-write: ${{ github.event_name == 'push' }}
+
+      # Mojo's compile cache (share/max/cache in the environment) starts
+      # empty in every job. Restored from main's last run, it makes builds of
+      # code main has built already 4-6x faster. It's content-addressed, so a
+      # stale entry is never used. Saved by main only, like the environment.
+      - uses: actions/cache/restore@v4
+        with:
+          path: dista.mojo/.pixi/envs/${{ matrix.env }}/share/max/cache
+          key: mojo-${{ runner.os }}-${{ matrix.env }}-${{ hashFiles('dista.mojo/pixi.lock') }}-${{ github.run_id }}
+          restore-keys: mojo-${{ runner.os }}-${{ matrix.env }}-${{ hashFiles('dista.mojo/pixi.lock') }}-
 
       # The frame and runtime tests fork real processes and talk over
       # loopback TCP. Linux is the leg that checks the socket layer's
@@ -58,6 +72,17 @@ jobs:
       # MSG_NOSIGNAL all differ from macOS.
       - name: Tests
         run: pixi run -e ${{ matrix.env }} test
+
+      # Entries a week old go before saving, so the cache can't grow without
+      # bound; one still in use is rebuilt once.
+      - if: always() && github.event_name == 'push'
+        name: Prune Mojo's compile cache (main only)
+        run: find .pixi/envs/${{ matrix.env }}/share/max/cache -type f -mtime +7 -delete || true
+      - if: always() && github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: dista.mojo/.pixi/envs/${{ matrix.env }}/share/max/cache
+          key: mojo-${{ runner.os }}-${{ matrix.env }}-${{ hashFiles('dista.mojo/pixi.lock') }}-${{ github.run_id }}
 
   # Tasks over Parquet and Iceberg. parquet.mojo, iceberg.mojo and their
   # siblings compile from source, at the revisions iceberg-mojo 0.8.2 was
@@ -112,10 +137,24 @@ jobs:
           pixi-version: v0.78.0
           environments: data
           manifest-path: dista.mojo/pixi.toml
+          cache-write: ${{ github.event_name == 'push' }}
+      - uses: actions/cache/restore@v4
+        with:
+          path: dista.mojo/.pixi/envs/data/share/max/cache
+          key: mojo-${{ runner.os }}-data-${{ hashFiles('dista.mojo/pixi.lock') }}-${{ github.run_id }}
+          restore-keys: mojo-${{ runner.os }}-data-${{ hashFiles('dista.mojo/pixi.lock') }}-
       - name: Tasks over Parquet row groups
         run: pixi run -e data test-parquet
       - name: A distributed Iceberg scan equals a local one
         run: pixi run -e data test-iceberg
+      - if: always() && github.event_name == 'push'
+        name: Prune Mojo's compile cache (main only)
+        run: find .pixi/envs/data/share/max/cache -type f -mtime +7 -delete || true
+      - if: always() && github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: dista.mojo/.pixi/envs/data/share/max/cache
+          key: mojo-${{ runner.os }}-data-${{ hashFiles('dista.mojo/pixi.lock') }}-${{ github.run_id }}
 
   # The image builds the program with pixi itself, so this job needs only
   # docker, kubectl (both on the runner) and kind.
@@ -139,6 +178,12 @@ jobs:
         with:
           pixi-version: v0.78.0
           environments: fuzz
+          cache-write: ${{ github.event_name == 'push' }}
+      - uses: actions/cache/restore@v4
+        with:
+          path: .pixi/envs/fuzz/share/max/cache
+          key: mojo-${{ runner.os }}-fuzz-${{ hashFiles('pixi.lock') }}-${{ github.run_id }}
+          restore-keys: mojo-${{ runner.os }}-fuzz-${{ hashFiles('pixi.lock') }}-
       - name: Fuzz
         run: FUZZ_RUNS=20000 pixi run -e fuzz fuzz
       - if: failure()
@@ -146,6 +191,14 @@ jobs:
         run: |
           for f in build/fuzz-*-last.bin; do echo "$f"; xxd "$f" | head -20; done
           ls -R build/fuzz-crashes || true
+      - if: always() && github.event_name == 'push'
+        name: Prune Mojo's compile cache (main only)
+        run: find .pixi/envs/fuzz/share/max/cache -type f -mtime +7 -delete || true
+      - if: always() && github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: .pixi/envs/fuzz/share/max/cache
+          key: mojo-${{ runner.os }}-fuzz-${{ hashFiles('pixi.lock') }}-${{ github.run_id }}
 
   format:
     runs-on: ubuntu-latest
@@ -155,5 +208,6 @@ jobs:
         with:
           pixi-version: v0.78.0
           environments: fmt
+          cache-write: ${{ github.event_name == 'push' }}
       - name: Format check
         run: pixi run -e fmt format-check
