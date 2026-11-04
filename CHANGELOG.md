@@ -50,6 +50,19 @@ S3 multipart fix.
 
 ### Changed
 
+- **Large results are copied once per hop, and served a window at a time.**
+  A frame's payload is read straight into a buffer of its own, and the
+  driver keeps it as the result instead of copying it. A worker serving a
+  fetch sends from its node-store file's mapping, or from memory, 1 MiB at a
+  time, instead of copying the whole result into each fetcher's buffer, so
+  N fetchers of one result no longer cost N copies. A task's inputs are
+  copied once into its arguments, as it starts; a lone fetched input
+  becomes them without a copy. `/metrics` adds
+  `dista_worker_bytes_copied_total` and `dista_worker_fetch_buffer_bytes`.
+  `bench/fetch.mojo` (`pixi run bench-fetch`): 12 readers of a 256 MB
+  result over sockets take about half as long, and the largest worker's
+  peak memory drops by a third
+  ([#95](https://github.com/magmalake/dista.mojo/issues/95)).
 - The README, `examples/mapreduce.mojo` and the docstrings read results with
   `take`: the README's loop of `get`s kept every result in the driver and the
   head until the program ended.
