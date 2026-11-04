@@ -83,7 +83,7 @@ from dista.checkpoint import (
     read_checkpoint,
     write_checkpoint,
 )
-from dista.client import TaskContext
+from dista.client import TaskContext, peer_connect_timeout_ms
 from dista.metrics import (
     Histogram,
     answer_scrape,
@@ -316,6 +316,8 @@ struct Worker[
     var _objects: Dict[UInt64, List[UInt8]]
     """Results stored here, and inputs fetched from peers."""
     var _lost: Dict[UInt64, String]
+    var _connect_ms: Int
+    """`DISTA_PEER_CONNECT_TIMEOUT`: how long a connect to a peer may take."""
     var _requested: Dict[UInt64, String]
     """Objects being fetched from peers, each with the peer's `ip:port`: if
     that peer goes away, they're lost."""
@@ -412,6 +414,7 @@ struct Worker[
         self._objects = Dict[UInt64, List[UInt8]]()
         self._lost = Dict[UInt64, String]()
         self._requested = Dict[UInt64, String]()
+        self._connect_ms = peer_connect_timeout_ms()
         self._parked = List[_Parked]()
         self._ready = List[_Ready]()
         self._ip = ip.copy()
@@ -503,6 +506,9 @@ struct Worker[
                 timeout = 0
             elif self._draining:
                 timeout = 100  # to notice the deadline, or the linger's end
+            var wait = self._connect_wait_ms()
+            if wait >= 0 and (timeout < 0 or wait < timeout):
+                timeout = wait
             self._poll_once(timeout_ms=timeout)
             if self._draining:
                 var now = wall_ns()
@@ -581,9 +587,11 @@ struct Worker[
                         if not f:
                             break
                         self._from_peer(f.take())
-                except:
-                    # A reset from a peer that died, or a frame it garbled.
+                except e:
+                    # A reset from a peer that died, a connect that failed,
+                    # or a frame it garbled.
                     self._peers[i].closed = True
+                    self._peers[i].why = String(e)
             k += 1
         if self._metrics:
             if rev[k] & POLLIN:
@@ -597,6 +605,15 @@ struct Worker[
                 self._start_drain()
         for j in range(len(dead) - 1, -1, -1):
             _ = self._serving.pop(dead[j])
+        # A connect that hasn't finished by its deadline has failed.
+        var now = wall_ns()
+        for j in range(len(self._peers)):
+            ref c = self._peers[j]
+            if c.connecting and c.deadline != 0 and now >= c.deadline:
+                c.closed = True
+                c.why = String(
+                    "connect timed out after ", self._connect_ms, " ms"
+                )
         # A peer that hung up stays readable at end of stream: polled again,
         # it would return at once, forever. Drop it, and what it owed is lost.
         for j in range(len(self._peers) - 1, -1, -1):
@@ -609,8 +626,28 @@ struct Worker[
     def _events(c: Conn) -> Int16:
         return (POLLIN | POLLOUT) if c.wants_write() else POLLIN
 
+    def _connect_wait_ms(self) -> Int:
+        """How long until the first pending peer connect's deadline, in ms;
+        -1 if none is pending."""
+        var first = UInt64(0)
+        for i in range(len(self._peers)):
+            ref c = self._peers[i]
+            if c.connecting and c.deadline != 0:
+                if first == 0 or c.deadline < first:
+                    first = c.deadline
+        if first == 0:
+            return -1
+        var now = wall_ns()
+        if now >= first:
+            return 0
+        return Int((first - now) // 1_000_000) + 1
+
     @staticmethod
     def _pump(mut c: Conn, revents: Int16) raises:
+        if c.connecting:
+            # Writable, or failed: the connect is done, one way or the
+            # other. Queued fetches go out below.
+            c.finish_connect()
         if revents & POLLOUT:
             c.flush()
         if revents & (POLLIN | POLLERR | POLLHUP):
@@ -701,8 +738,17 @@ struct Worker[
                 )
             return
         if key not in self._peer_index:
+            # Connected from the event loop: a peer that never answers
+            # (a vanished node, dropped SYNs) costs this worker nothing until
+            # the deadline, when what's asked of it is lost.
             try:
-                self._peers.append(Conn(Stream.connect(ip, port)))
+                var c = Conn(Stream.start_connect(ip, port))
+                c.connecting = True
+                if self._connect_ms > 0:
+                    c.deadline = (
+                        wall_ns() + UInt64(self._connect_ms) * 1_000_000
+                    )
+                self._peers.append(c^)
             except e:
                 self._lost[obj] = String(
                     "cannot reach the worker holding it: ", e
@@ -729,7 +775,12 @@ struct Worker[
         for entry in self._requested.items():
             if entry.value == key:
                 owed.append(entry.key)
+        ref c = self._peers[i]
         var why = String("the worker holding it (", key, ") went away")
+        if c.connecting:
+            why = String(
+                "cannot reach the worker holding it (", key, "): ", c.why
+            )
         for obj in owed:
             _ = self._requested.pop(obj, String())
             self._lost[obj] = why

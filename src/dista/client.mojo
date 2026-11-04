@@ -260,7 +260,9 @@ struct Observer(Movable):
         """Connects to the head at `addr`, `host:port`, once: an observer
         reports a head that isn't there rather than wait for one."""
         var hp = parse_host_port(addr)
-        self._head = Stream.connect(hp[0], hp[1])
+        self._head = Stream.connect(
+            hp[0], hp[1], timeout_ms=_connect_timeout_s() * 1000
+        )
         _ = _hello(self._head, ROLE_OBSERVER, 0)
 
     def _ask(
@@ -400,6 +402,27 @@ def parse_host_port(addr: String) raises -> Tuple[String, Int]:
     return (String(parts[0]), Int(parts[1]))
 
 
+def _connect_timeout_s() -> Int:
+    """`DISTA_CONNECT_TIMEOUT`, in seconds: default 60."""
+    try:
+        return max(Int(getenv("DISTA_CONNECT_TIMEOUT", "60")), 0)
+    except:
+        return 60
+
+
+def peer_connect_timeout_ms() -> Int:
+    """`DISTA_PEER_CONNECT_TIMEOUT`, in milliseconds: how long a worker or a
+    driver waits for a connect to the worker holding a result. Seconds, a
+    fraction allowed; default 5. A closed port fails at once; this bounds an
+    address that never answers (a vanished node, a firewall dropping SYNs),
+    which the kernel would otherwise retry for about two minutes."""
+    try:
+        var secs = Float64(getenv("DISTA_PEER_CONNECT_TIMEOUT", "5"))
+        return max(Int(secs * 1000.0), 1)
+    except:
+        return 5000
+
+
 def connect_head(addr: String) raises -> Stream:
     """Connects to the head at `host:port`, retrying while it isn't up yet.
 
@@ -412,12 +435,15 @@ def connect_head(addr: String) raises -> Stream:
     added that much to every recovery.
     """
     var hp = parse_host_port(addr)
-    var limit = Int(getenv("DISTA_CONNECT_TIMEOUT", "60"))
+    var limit = _connect_timeout_s()
     var deadline = Int(perf_counter_ns()) + limit * 1_000_000_000
     var wait = 0.01
     while True:
+        # Each try waits only as long as is left: a head address that drops
+        # SYNs would otherwise hold one try for the kernel's two minutes.
+        var left = max((deadline - Int(perf_counter_ns())) // 1_000_000, 100)
         try:
-            return Stream.connect(hp[0], hp[1])
+            return Stream.connect(hp[0], hp[1], timeout_ms=left)
         except e:
             if Int(perf_counter_ns()) >= deadline:
                 raise e^
@@ -1250,7 +1276,11 @@ struct Client(Movable):
         """Copies a result from the worker holding it, over a socket."""
         var key = addr_key(loc.ip, loc.port)
         if key not in self._fetcher_index:
-            self._fetchers.append(Stream.connect(loc.ip, loc.port))
+            self._fetchers.append(
+                Stream.connect(
+                    loc.ip, loc.port, timeout_ms=peer_connect_timeout_ms()
+                )
+            )
             self._fetcher_index[key] = len(self._fetchers) - 1
         var i = self._fetcher_index.get(key, -1)
         write_frame(self._fetchers[i], KIND_FETCH, id, 0, List[UInt8]())

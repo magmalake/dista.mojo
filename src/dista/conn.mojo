@@ -24,6 +24,13 @@ struct Conn(Movable):
     var _out_pos: Int
     var closed: Bool
     """The peer hung up, or the connection failed."""
+    var connecting: Bool
+    """Started with `Stream.start_connect` and not yet connected: output
+    queues until it is."""
+    var deadline: UInt64
+    """While connecting: when to give up, in `wall_ns`; 0 for never."""
+    var why: String
+    """Why the connection failed, if it's known."""
 
     def __init__(out self, var stream: Stream) raises:
         self.stream = stream^
@@ -32,6 +39,9 @@ struct Conn(Movable):
         self._out = List[UInt8]()
         self._out_pos = 0
         self.closed = False
+        self.connecting = False
+        self.deadline = 0
+        self.why = String()
 
     def fd(self) -> c_int:
         return self.stream.fd
@@ -85,7 +95,14 @@ struct Conn(Movable):
     ) raises:
         """Queues a frame and sends as much as the socket takes now."""
         append_frame(self._out, kind, object_id, task_id, payload)
-        self.flush()
+        if not self.connecting:
+            self.flush()
+
+    def finish_connect(mut self) raises:
+        """The socket polled writable while connecting: connected, or raises
+        why not."""
+        self.stream.finish_connect()
+        self.connecting = False
 
     def flush(mut self) raises:
         """Sends queued output until the socket would block."""
@@ -102,7 +119,7 @@ struct Conn(Movable):
         self._out_pos = 0
 
     def wants_write(self) -> Bool:
-        return self._out_pos < len(self._out)
+        return self.connecting or self._out_pos < len(self._out)
 
     def unsent(self) -> Int:
         """Bytes queued to send that the peer hasn't taken yet."""
