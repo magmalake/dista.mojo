@@ -12,6 +12,7 @@ for each.
 
 from std.ffi import c_int, c_size_t, c_ssize_t, c_uint, external_call, get_errno
 from std.memory import Pointer, stack_allocation
+from std.os import getenv
 from std.sys.info import CompilationTarget, platform_map
 
 comptime _pm = platform_map[T=Int, ...]
@@ -29,6 +30,15 @@ comptime MSG_NOSIGNAL: c_int = c_int(
 comptime EINTR: c_int = 4
 comptime IPPROTO_TCP: c_int = 6
 comptime TCP_NODELAY: c_int = 1
+comptime SO_KEEPALIVE: c_int = c_int(_pm["SO_KEEPALIVE", linux=9, macos=8]())
+comptime TCP_KEEPIDLE: c_int = c_int(
+    _pm["TCP_KEEPIDLE", linux=4, macos=0x10]()  # TCP_KEEPALIVE on macOS
+)
+comptime TCP_KEEPINTVL: c_int = c_int(
+    _pm["TCP_KEEPINTVL", linux=5, macos=0x101]()
+)
+comptime TCP_KEEPCNT: c_int = c_int(_pm["TCP_KEEPCNT", linux=6, macos=0x102]())
+comptime KEEPALIVE_PROBES = 3
 comptime SOCKADDR_IN_SIZE = 16
 comptime EAGAIN: c_int = c_int(_pm["EAGAIN", linux=11, macos=35]())
 comptime EINPROGRESS: c_int = c_int(_pm["EINPROGRESS", linux=115, macos=36]())
@@ -198,7 +208,65 @@ def _new_socket() raises -> c_int:
             one.unsafe_bitcast[NoneType](),
             c_uint(4),
         )
+    set_keepalive(fd)
     return fd
+
+
+def keepalive_seconds() -> Int:
+    """`DISTA_KEEPALIVE_SECONDS`: how long a connection may be silent before
+    the kernel probes it; 0 turns keepalive off. Default 10."""
+    try:
+        return max(Int(getenv("DISTA_KEEPALIVE_SECONDS", "10")), 0)
+    except:
+        return 10
+
+
+def _setopt(fd: c_int, level: c_int, name: c_int, value: Int):
+    var v = stack_allocation[1, c_int]()
+    v[] = c_int(value)
+    _ = external_call["setsockopt", c_int](
+        fd, level, name, v.unsafe_bitcast[NoneType](), c_uint(4)
+    )
+
+
+def set_keepalive(fd: c_int):
+    """Has the kernel notice a peer that went silent without closing: a host
+    that froze, lost its network or was hard-stopped, which no TCP close
+    reports. After `keepalive_seconds()` of silence it probes every half of
+    that, and after `KEEPALIVE_PROBES` unanswered probes the socket fails,
+    about 25 s by default; `poll` then reports it as an error, and dista
+    drops it as it does a closed one.
+
+    Probes go only while nothing sent is unacknowledged; with data in flight
+    the kernel's retransmission limit applies instead (about 15 minutes on
+    Linux). `TCP_USER_TIMEOUT` would shorten that, but it also fails a
+    connection whose peer is alive and only not reading, as a driver busy
+    between `get`s, or one the head holds back for admission, is.
+    `DISTA_TASK_TIMEOUT` bounds a task however its worker stalls."""
+    var idle = keepalive_seconds()
+    if idle == 0:
+        return
+    var every = max(idle // 2, 1)
+    _setopt(fd, SOL_SOCKET, SO_KEEPALIVE, 1)
+    _setopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, idle)
+    _setopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, every)
+    _setopt(fd, IPPROTO_TCP, TCP_KEEPCNT, KEEPALIVE_PROBES)
+
+
+def get_int_option(fd: c_int, level: c_int, name: c_int) -> Int:
+    """A socket option's int value, or -1 if it can't be read."""
+    var v = stack_allocation[1, c_int]()
+    v[] = 0
+    var len = stack_allocation[1, c_uint]()
+    len[] = c_uint(4)
+    if (
+        external_call["getsockopt", c_int](
+            fd, level, name, v.unsafe_bitcast[NoneType](), len
+        )
+        != 0
+    ):
+        return -1
+    return Int(v[])
 
 
 def _refuse_self(fd: c_int) raises:
@@ -516,6 +584,9 @@ struct Listener(Movable):
         while True:
             var fd = external_call["accept", c_int](self.fd, Int(0), Int(0))
             if fd >= 0:
+                # Accepted sockets don't reliably inherit the listener's
+                # keepalive settings.
+                set_keepalive(fd)
                 return Stream(fd)
             if get_errno().value != EINTR:
                 _fail("accept")

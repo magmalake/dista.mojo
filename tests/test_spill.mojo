@@ -23,6 +23,16 @@ def length(s: String) -> Int:
 comptime Blob = Task[Int, String, blob]
 comptime Length = Task[String, Int, length]
 
+comptime HUGE = (1 << 30) + (1 << 20)
+"""Just past the 1 GiB a frame holds."""
+
+
+def huge(fill: Int) -> String:
+    return String(fill % 10) * HUGE
+
+
+comptime Huge = Task[Int, String, huge]
+
 
 def _spilled() raises -> Int:
     """How many results sit in the spill directory."""
@@ -62,6 +72,27 @@ def test_results_past_the_limit_spill_and_read_the_same() raises:
     rt.release(refs)
     _ = rt.get(rt.remote[Length](rt.remote[Blob](0)))  # the frees land first
     assert_equal(_spilled(), 0)
+
+
+def test_a_result_larger_than_a_frame_crosses_hosts_in_parts() raises:
+    """With the node store off, a result goes over a socket even on one host,
+    as it does between hosts. One past a frame's 1 GiB arrives in parts, for
+    a task on another worker and for the driver; the receiver used to refuse
+    it as a bad frame length, which hung the task."""
+    _ = setenv("DISTA_SHM", "0")
+    var rt = Runtime[Huge, Length](workers=2, pipeline=1)
+    _ = unsetenv("DISTA_SHM")
+    var r = rt.remote[Huge](7)
+    assert_true(rt.location(r) != "", "the result came back inline")
+    # Two readers at once: with one task in flight each, one runs on the
+    # worker that doesn't hold it.
+    var a = rt.remote[Length](r)
+    var b = rt.remote[Length](r)
+    assert_equal(rt.get(a), HUGE)
+    assert_equal(rt.get(b), HUGE)
+    var s = rt.get(r)
+    assert_equal(s.byte_length(), HUGE)
+    assert_equal(s.as_bytes()[HUGE - 1], UInt8(ord("7")))
 
 
 def main() raises:

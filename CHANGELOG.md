@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tests/peer_loss.sh` kills a worker while two others fetch from it.
 ### Added
 
+- **Silent peers are noticed.** Every socket has TCP keepalive: a worker,
+  head or driver whose host froze or dropped off the network fails its
+  connections after about 25 s (`DISTA_KEEPALIVE_SECONDS`, default 10 s of
+  silence, then 3 probes; 0 turns it off). The head then drops the worker
+  and runs its tasks again, and a worker rejoins `DISTA_HEAD`, a
+  replacement head included. **`DISTA_TASK_TIMEOUT`** (seconds; unset, no
+  limit) fails a task still running that long after it was sent, and
+  `/metrics` counts them in `dista_tasks_timed_out_total`
+  ([#90](https://github.com/magmalake/dista.mojo/issues/90)).
 - **`rt.take(ref)`**: `get`, then `release`, for a result read once. A
   small result is decoded from the bytes it drops rather than a copy;
   `rt.take(refs)` takes a list in order. `get` and `release` are unchanged
@@ -75,6 +84,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#94](https://github.com/magmalake/dista.mojo/issues/94)).
   `tests/peer_connect.sh` fills a stopped worker's backlog and fetches from
   it.
+- **Results larger than 1 GiB cross hosts.** A fetched result over 64 MiB
+  now comes in part frames (new kind 33), which the fetcher assembles into
+  one buffer. Before, a result between 1 and 4 GiB was refused as a `bad
+  frame length`, and past 4 GiB its u32 length wrapped and garbled the
+  connection. A fetch says it takes parts, so an older fetcher still gets
+  one result frame, or a clear error if the result doesn't fit. Writing any
+  frame too large for the receiver raises at the sender: a task argument
+  past 1 GiB fails at `remote`
+  ([#93](https://github.com/magmalake/dista.mojo/issues/93)).
 ### Changed
 
 - **The head loop's cost follows its events.** Waiting tasks are indexed by
