@@ -77,9 +77,12 @@ from dista.frame import (
     MAX_PAYLOAD,
     Frame,
     Parts,
+    append_header,
+    append_part_header,
     encode_addr,
     fetch_part,
     fetch_payload,
+    part_payload_size,
 )
 from dista.checkpoint import (
     checkpoint_location,
@@ -97,12 +100,14 @@ from dista.metrics import (
     write_outcomes,
 )
 from dista.head import owner_of
+from memory_region import SharedMapping
 from dista.signals import take_wakes, wake_on_sigterm
 from dista.task import StatePtr, split_parts
 from dista.store import (
     Location,
     node_name,
     worker_token,
+    map_shared,
     read_shared,
     remove_file,
     spill_dir,
@@ -125,6 +130,11 @@ from dista.socket import (
 
 comptime INLINE_LIMIT = 64 * 1024
 """Results up to this size travel through the head; larger ones stay put."""
+comptime SERVE_WINDOW = 1 << 20
+"""Bytes of a result queued to a fetcher's socket at a time: past this, the
+rest waits in its file or in memory, not in the connection's buffer."""
+comptime SERVE_CHUNK = 256 * 1024
+"""Bytes of a result added to a fetcher's buffer at once."""
 comptime LINGER_NS: UInt64 = 1_000_000_000
 """How long a drained worker keeps serving fetches after the head says stop:
 a task sent before its inputs moved may still fetch them from here."""
@@ -224,22 +234,70 @@ def parse_task_inputs(payload: Span[UInt8, _]) raises -> TaskInputs:
     return TaskInputs(many, gather, inputs^, value^)
 
 
-struct _Input(Copyable, Movable):
-    """One input of a parked task: bytes already here, or an object to fetch."""
+struct _Input(Movable):
+    """One input of a parked task: bytes already here, a node-store file
+    mapped where it lies, or an object to fetch."""
 
     var object_id: UInt64
     var have: Bool
     var bytes: List[UInt8]
+    var mapped: Optional[SharedMapping]
+    """A result in the node store, read from the mapping as the task's
+    arguments are built: never copied in whole before that."""
+    var size: Int
+    """The mapped result's size: the file may be padded."""
 
     def __init__(
-        out self, object_id: UInt64, have: Bool, var bytes: List[UInt8]
+        out self,
+        object_id: UInt64,
+        have: Bool,
+        var bytes: List[UInt8],
+        var mapped: Optional[SharedMapping] = None,
+        size: Int = 0,
     ):
         self.object_id = object_id
         self.have = have
         self.bytes = bytes^
+        self.mapped = mapped^
+        self.size = size
+
+    def here(self) -> Bool:
+        """Whether its bytes are in the task or mapped."""
+        return self.have or Bool(self.mapped)
 
 
-struct _Parked(Copyable, Movable):
+struct _Outgoing(Movable):
+    """A result being sent to a fetcher, a window at a time: from a mapping
+    of its node-store file, or from this worker's memory."""
+
+    var object_id: UInt64
+    var size: Int
+    var frame: Int
+    """The object's bytes per frame: all of them in one result frame, or a
+    part frame's."""
+    var parts: Bool
+    var offset: Int
+    """The bytes sent so far."""
+    var mapped: Optional[SharedMapping]
+    """Its file, mapped; None for one in memory. A mapping outlives the
+    file's removal, so a result freed meanwhile still finishes sending."""
+
+    def __init__(
+        out self,
+        object_id: UInt64,
+        size: Int,
+        part: Int,
+        var mapped: Optional[SharedMapping],
+    ):
+        self.object_id = object_id
+        self.size = size
+        self.parts = part > 0 and size > part
+        self.frame = part_payload_size(part) if self.parts else size
+        self.offset = 0
+        self.mapped = mapped^
+
+
+struct _Parked(Movable):
     var object_id: UInt64
     var task_id: UInt64
     var gather: Bool
@@ -285,6 +343,10 @@ struct _Ready(Movable):
     """When the task reached this worker, before any of its inputs did."""
     var kind: UInt8
     """`KIND_TASK`, or the actor frame this is: create, call or kill."""
+    var inputs: Optional[_Parked]
+    """A task-inputs task whose inputs are all here: its arguments are built
+    from them as it runs, not before, so the tasks queued here don't each
+    hold a copy of their inputs while they wait."""
 
     def __init__(
         out self,
@@ -293,12 +355,14 @@ struct _Ready(Movable):
         var args: List[UInt8],
         arrived: UInt64 = 0,
         kind: UInt8 = KIND_TASK,
+        var inputs: Optional[_Parked] = None,
     ):
         self.object_id = object_id
         self.task_id = task_id
         self.args = args^
         self.arrived = arrived if arrived != 0 else wall_ns()
         self.kind = kind
+        self.inputs = inputs^
 
 
 struct Worker[
@@ -315,6 +379,12 @@ struct Worker[
     """This worker's own address, `ip:port`."""
     var _serving: List[Conn]
     """Connections from drivers and workers that fetch from here."""
+    var _sends: List[List[_Outgoing]]
+    """For each of those, the results it fetched still being sent, in
+    order."""
+    var _copied: Int
+    """Bytes of results this worker copied in memory: into fetchers'
+    buffers, into tasks' arguments, and adopted."""
     var _peers: List[Conn]
     """Connections to workers this one fetches from."""
     var _peer_index: Dict[String, Int]
@@ -416,6 +486,8 @@ struct Worker[
         )
         self._listener = listener^
         self._serving = List[Conn]()
+        self._sends = List[List[_Outgoing]]()
+        self._copied = 0
         self._peers = List[Conn]()
         self._peer_index = Dict[String, Int]()
         self._objects = Dict[UInt64, List[UInt8]]()
@@ -582,6 +654,7 @@ struct Worker[
                         if not f:
                             break
                         self._serve_fetch(i, f.take())
+                    self._refill(i)
                 except:
                     self._serving[i].closed = True
             if self._serving[i].closed:
@@ -614,6 +687,7 @@ struct Worker[
                 self._start_drain()
         for j in range(len(dead) - 1, -1, -1):
             _ = self._serving.pop(dead[j])
+            _ = self._sends.pop(dead[j])
         # A connect that hasn't finished by its deadline has failed.
         var now = wall_ns()
         for j in range(len(self._peers)):
@@ -630,6 +704,7 @@ struct Worker[
                 self._lose_peer(j)
         if rev[1] & POLLIN:
             self._serving.append(Conn(self._listener.accept()))
+            self._sends.append(List[_Outgoing]())
 
     @staticmethod
     def _events(c: Conn) -> Int16:
@@ -688,9 +763,19 @@ struct Worker[
                 else:
                     var loc = inp.location.value().copy()
                     if loc.is_local() and obj not in self._objects:
+                        # Mapped now, read when the task's arguments are
+                        # built: copied once, not twice.
                         try:
-                            self._objects[obj] = read_shared(loc.path, loc.size)
-                            self._fetched[obj] = True
+                            inputs.append(
+                                _Input(
+                                    obj,
+                                    False,
+                                    List[UInt8](),
+                                    map_shared(loc.path, loc.size),
+                                    loc.size,
+                                )
+                            )
+                            continue
                         except e:
                             self._lost[obj] = String(e)
                     else:
@@ -892,52 +977,89 @@ struct Worker[
         self._to_head(KIND_ADOPTED, obj, body)
 
     def _serve_fetch(mut self, i: Int, var f: Frame) raises:
+        """Starts sending a fetched result: a window at a time from where it
+        lies (see `_refill`), not copied whole into the connection."""
         if f.kind != KIND_FETCH:
             raise Error("expected a fetch, got frame kind ", Int(f.kind))
         var part = fetch_part(f.payload)
-        if f.object_id in self._objects:
-            Self._send_object(
-                self._serving[i], f.object_id, self._objects[f.object_id], part
-            )
-        elif f.object_id in self._files:
-            ref loc = self._files[f.object_id]
-            var data = read_shared(loc.path, loc.size)
-            Self._send_object(self._serving[i], f.object_id, data, part)
-        else:
-            var msg = String("object ", f.object_id, " is not on this worker")
-            self._serving[i].send(KIND_ERROR, f.object_id, 0, msg.as_bytes())
-
-    @staticmethod
-    def _send_object(
-        mut c: Conn, obj: UInt64, data: Span[UInt8, _], part: Int
-    ) raises:
-        """Answers a fetch: one result frame, or parts of at most `part`
-        bytes if it's larger; an empty fetch (`part` 0) takes no parts."""
-        if part > 0 and len(data) > part:
-            c.send_parts(obj, data, part)
-        elif len(data) > MAX_PAYLOAD:
+        var obj = f.object_id
+        var size = -1
+        var mapped: Optional[SharedMapping] = None
+        if obj in self._objects:
+            size = len(self._objects[obj])
+        elif obj in self._files:
+            ref loc = self._files[obj]
+            try:
+                mapped = map_shared(loc.path, loc.size)
+                size = loc.size
+            except e:
+                var msg = String("object ", obj, " can't be read here: ", e)
+                self._serving[i].send(KIND_ERROR, obj, 0, msg.as_bytes())
+                return
+        if size < 0:
+            var msg = String("object ", obj, " is not on this worker")
+            self._serving[i].send(KIND_ERROR, obj, 0, msg.as_bytes())
+        elif not (part > 0 and size > part) and size > MAX_PAYLOAD:
             var msg = String(
                 "object ",
                 obj,
                 " is ",
-                len(data),
+                size,
                 " bytes, too large for one frame, and its fetcher doesn't",
                 " take parts",
             )
-            c.send(KIND_ERROR, obj, 0, msg.as_bytes())
+            self._serving[i].send(KIND_ERROR, obj, 0, msg.as_bytes())
         else:
-            c.send(KIND_RESULT, obj, 0, data)
+            self._sends[i].append(_Outgoing(obj, size, part, mapped^))
+        self._refill(i)
 
-    def _unpark(mut self):
+    def _refill(mut self, i: Int) raises:
+        """Tops fetcher `i`'s buffer up to `SERVE_WINDOW` from the results
+        it's owed, in order, and sends what its socket takes. N fetchers of
+        one result hold N windows, not N copies of it."""
+        ref c = self._serving[i]
+        ref owed = self._sends[i]
+        while len(owed) > 0 and c.unsent() < SERVE_WINDOW:
+            ref o = owed[0]
+            var obj = o.object_id
+            var in_frame = o.offset % o.frame if o.frame > 0 else 0
+            if in_frame == 0:
+                var header = List[UInt8](capacity=64)
+                var n = min(o.frame, o.size - o.offset)
+                if o.parts:
+                    append_part_header(header, obj, o.size, o.offset, n)
+                else:
+                    append_header(header, KIND_RESULT, obj, 0, o.size)
+                c.queue(header)
+            var end = min(o.offset - in_frame + o.frame, o.size)
+            var n = min(SERVE_CHUNK, end - o.offset)
+            if o.mapped:
+                c.queue(o.mapped.value().bytes()[o.offset : o.offset + n])
+            elif obj in self._objects:
+                c.queue(Span(self._objects[obj])[o.offset : o.offset + n])
+            else:
+                # Freed mid-send: the frame can't be finished. The fetcher
+                # sees the connection close, and the result as lost.
+                c.closed = True
+                return
+            o.offset += n
+            self._copied += n
+            if o.offset >= o.size:
+                _ = owed.pop(0)
+            c.flush()
+
+    def _unpark(mut self) raises:
         if len(self._parked) == 0:
             return
-        var still = List[_Parked]()
-        for i in range(len(self._parked)):
-            ref p = self._parked[i]
+        var parked = self._parked^
+        self._parked = List[_Parked]()
+        for i in range(len(parked)):
+            ref p = parked[i]
             var failed = String()
             var complete = True
-            for ref inp in p.inputs:
-                if inp.have:
+            for _k in range(len(p.inputs)):
+                ref inp = p.inputs[_k]
+                if inp.here():
                     continue
                 if inp.object_id in self._lost:
                     failed = self._lost.get(inp.object_id, String())
@@ -950,55 +1072,110 @@ struct Worker[
                     self._report_error(
                         first + UInt64(k), String("input lost: ", failed)
                     )
-            elif not complete:
-                still.append(p.copy())
-            else:
-                # A `TaskMany` runs on its number of results, then the input.
-                var args = List[UInt8]()
-                if p.many > 0:
-                    put_scalar[DType.uint64](args, UInt64(p.many))
-                args.extend(p.value.copy())
-                if p.gather:
-                    put_scalar[DType.int64](args, Int64(len(p.inputs)))
-                if self._debug:
-                    print("dista worker: task", p.object_id, "inputs:", end="")
-                    for ref inp in p.inputs:
-                        var n = len(inp.bytes) if inp.have else len(
-                            self._objects.get(inp.object_id, List[UInt8]())
-                        )
-                        print(
-                            " ",
-                            inp.object_id,
-                            "inline" if inp.have else "fetched",
-                            n,
-                            end="",
-                        )
-                    print()
-                for ref inp in p.inputs:
-                    if inp.have:
-                        args.extend(inp.bytes.copy())
-                    else:
-                        args.extend(
-                            self._objects.get(inp.object_id, List[UInt8]())
-                        )
-                var kind = KIND_TASK_MANY if p.many > 0 else KIND_TASK
-                self._ready.append(
-                    _Ready(p.object_id, p.task_id, args^, p.arrived, kind=kind)
-                )
-        self._parked = still^
-        # Fetched copies nothing parked still waits on have done their job.
+                continue
+            if not complete:
+                var keep = _Parked(0, 0, False, List[_Input](), List[UInt8]())
+                swap(keep, p)
+                self._parked.append(keep^)
+                continue
+            var kind = KIND_TASK_MANY if p.many > 0 else KIND_TASK
+            var whole = _Parked(0, 0, False, List[_Input](), List[UInt8]())
+            swap(whole, p)
+            var obj = whole.object_id
+            var task = whole.task_id
+            var arrived = whole.arrived
+            self._ready.append(
+                _Ready(obj, task, List[UInt8](), arrived, kind, whole^)
+            )
+        self._drop_fetched()
+
+    def _drop_fetched(mut self):
+        """Drops the fetched copies no task here still needs."""
         var done = List[UInt64]()
         for entry in self._fetched.items():
-            var wanted = False
-            for ref p in self._parked:
-                for ref inp in p.inputs:
-                    if inp.object_id == entry.key:
-                        wanted = True
-            if not wanted:
+            if not self._wanted(entry.key):
                 done.append(entry.key)
         for obj in done:
             _ = self._fetched.pop(obj, False)
             _ = self._objects.pop(obj, List[UInt8]())
+
+    def _assemble(mut self, var p: _Parked) raises -> List[UInt8]:
+        """A task-inputs task's arguments, from its inputs: each copied once,
+        from where it lies, or the one input fetched for it alone moved."""
+        if self._debug:
+            print("dista worker: task", p.object_id, "inputs:", end="")
+            for _k in range(len(p.inputs)):
+                ref inp = p.inputs[_k]
+                var n = len(inp.bytes)
+                var how = "inline"
+                if inp.mapped:
+                    n = inp.size
+                    how = "mapped"
+                elif not inp.have:
+                    n = len(self._objects[inp.object_id])
+                    how = "fetched"
+                print(" ", inp.object_id, how, n, end="")
+            print()
+        var args = List[UInt8]()
+        var obj = p.inputs[0].object_id if len(p.inputs) == 1 else 0
+        if (
+            p.many == 0
+            and not p.gather
+            and len(p.value) == 0
+            and len(p.inputs) == 1
+            and not p.inputs[0].here()
+            and obj in self._fetched
+            and not self._wanted(obj)
+        ):
+            # The task's one input, fetched for it alone: its arguments.
+            _ = self._fetched.pop(obj, False)
+            return self._objects.pop(obj)
+        var size = len(p.value) + 16
+        for _k in range(len(p.inputs)):
+            ref inp = p.inputs[_k]
+            if inp.have:
+                size += len(inp.bytes)
+            elif inp.mapped:
+                size += inp.size
+            else:
+                size += len(self._objects[inp.object_id])
+        args.reserve(size)
+        # A `TaskMany` runs on its number of results, then the input.
+        if p.many > 0:
+            put_scalar[DType.uint64](args, UInt64(p.many))
+        args.extend(Span(p.value))
+        if p.gather:
+            put_scalar[DType.int64](args, Int64(len(p.inputs)))
+        for _k in range(len(p.inputs)):
+            ref inp = p.inputs[_k]
+            if inp.have:
+                args.extend(Span(inp.bytes))
+            elif inp.mapped:
+                args.extend(inp.mapped.value().bytes()[: inp.size])
+                self._copied += inp.size
+            else:
+                ref data = self._objects[inp.object_id]
+                args.extend(Span(data))
+                self._copied += len(data)
+        p.inputs.clear()  # its mappings, unmapped
+        self._drop_fetched()
+        return args^
+
+    def _wanted(self, obj: UInt64) -> Bool:
+        """Whether a task parked or queued here takes `obj`."""
+        for _q in range(len(self._parked)):
+            ref p = self._parked[_q]
+            for _k in range(len(p.inputs)):
+                if p.inputs[_k].object_id == obj:
+                    return True
+        for _q in range(len(self._ready)):
+            if not self._ready[_q].inputs:
+                continue
+            ref p = self._ready[_q].inputs.value()
+            for _k in range(len(p.inputs)):
+                if p.inputs[_k].object_id == obj:
+                    return True
+        return False
 
     def _page(self) -> String:
         """This worker's `/metrics` page."""
@@ -1051,6 +1228,26 @@ struct Worker[
                 " full."
             ),
             self._spilled,
+        )
+        var buffered = 0
+        for i in range(len(self._serving)):
+            buffered += self._serving[i].unsent()
+        write_metric(
+            out,
+            "counter",
+            "dista_worker_bytes_copied_total",
+            (
+                "Bytes of results this worker copied in memory: into fetchers'"
+                " buffers, into tasks' arguments, and adopted."
+            ),
+            self._copied,
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_worker_fetch_buffer_bytes",
+            "Bytes queued to fetchers that their sockets haven't taken.",
+            buffered,
         )
         write_metric(
             out,
@@ -1306,6 +1503,17 @@ struct Worker[
 
     def _run_one(mut self) raises:
         var t = self._ready.pop(0)
+        if t.inputs:
+            var p = t.inputs.take()
+            var parts = max(p.many, 1)
+            try:
+                t.args = self._assemble(p^)
+            except e:
+                for k in range(parts):
+                    self._report_error(
+                        t.object_id + UInt64(k), String("input lost: ", e)
+                    )
+                return
         if t.kind == KIND_TASK_MANY:
             self._run_many(t^)
             return
