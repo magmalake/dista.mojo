@@ -124,7 +124,7 @@ Since phase 2's PR 3, scheduling lives in one place: a head process. Every progr
 | 2 result | worker to head, head to driver | the encoded result |
 | 3 error | worker to head, head to driver | a UTF-8 message |
 | 4 hello | driver or worker to head | role byte, then the registry hash, u64 |
-| 5 welcome | head to driver | the driver's number, u64 |
+| 5 welcome | head to driver | the driver's number, u64, then the head's epoch, u64 |
 | 6 task-after | driver to head | gather byte, count u64, then that many object IDs |
 | 7 stored | worker to head | the result's location: it stayed on the worker |
 | 8 located | head to driver | the result's location |
@@ -219,6 +219,7 @@ Today the head is one process holding everything: the queue, where each result l
 **Version 0 makes the head's state rebuildable instead of durable.** Nothing it holds is written to disk. When Kubernetes restarts it:
 - **Workers rebuild the directory.** Each worker reconnects (they already retry for `DISTA_CONNECT_TIMEOUT`) and reports the results it holds and, once actors exist, the actor it hosts with its last call number. The head rebuilds the directory from those reports.
 - **The driver rebuilds the queue.** It reconnects and resubmits every task it hasn't got a result for. Tasks with a result on a worker aren't run again.
+- **Driver numbers don't repeat across heads.** A head numbers new drivers from a random point in the 24 bits an object ID gives them, and says its epoch, a random u64, in each welcome. Only a driver resuming under its old number claims what the workers reported; a new driver never does, so it can't be handed another job's results even when its number matches (#91). A resuming driver says the epoch of the head that numbered it, so a head can refuse an old driver whose number it gave a new one, and replace the stale connection of a driver that came back before its hang-up was noticed. Results no driver comes back for are freed after `DISTA_ORPHAN_SECONDS` (default 120).
 - **Running tasks may run twice.** A task that was running when the head died can be resubmitted and run again, so tasks have to be safe to repeat, which they are for a pure function.
 
 That covers a head restart, not a head that's lost for good with the driver. Replicating the head is later work.

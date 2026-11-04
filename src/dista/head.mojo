@@ -50,7 +50,13 @@ The head keeps nothing on disk. When it restarts, its state comes back from
 its peers: workers rejoin and report the results they hold, and each driver
 reconnects under its old number and restores, claims or resubmits everything
 it still needs (see `frame.mojo`). A reported result no resumed driver
-claimed is freed. A task that was running when the head died may run again.
+claimed is freed, as is one whose driver hasn't come back
+`DISTA_ORPHAN_SECONDS` (default 120) after a worker reported it. Only a
+resuming driver claims a reported result: a new driver never does, and is
+numbered from a random start, so it rarely shares a number with a driver of
+the head before (or names an actor whose old checkpoints are still in
+`DISTA_CHECKPOINT_URI`). A task that was running when the head died may run
+again.
 
 A worker told to stop drains (see `worker.mojo`). The head sends it no more
 tasks and has the other workers adopt every result it holds: each fetches
@@ -91,8 +97,9 @@ the head lists, or builds it if there's none, and the calls the callers
 resend run on that: every call no checkpoint includes, answered or not.
 """
 
-from std.ffi import c_int
+from std.ffi import c_int, external_call
 from std.os import getenv
+from std.time import perf_counter_ns
 
 from dista.codec import get_scalar, put_scalar
 from dista.conn import Conn
@@ -164,11 +171,28 @@ comptime DRIVER_SHIFT = 40
 """Object IDs carry their driver's number above this bit."""
 comptime MAX_SPANS = 1_000_000
 """Finished task spans the head keeps per driver until it asks for them."""
+comptime MAX_DRIVER: UInt64 = 1 << (64 - DRIVER_SHIFT)
+"""Driver numbers are below this: they fill an object ID's top bits."""
 comptime _ROLE_NONE: UInt8 = 0
 comptime _ROLE_GONE: UInt8 = 255
 comptime _DRAIN_NO: UInt8 = 0
 comptime _DRAIN_YES: UInt8 = 1
 comptime _DRAIN_LET_GO: UInt8 = 2
+
+
+def _mix(var x: UInt64) -> UInt64:
+    """splitmix64's finalizer: spreads the bits of `x`."""
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EB
+    return x ^ (x >> 31)
+
+
+def head_epoch() -> UInt64:
+    """A random, nonzero number naming one head's lifetime: the wall clock,
+    the process ID and the monotonic clock, mixed."""
+    var pid = UInt64(Int(external_call["getpid", c_int]()))
+    var e = _mix(wall_ns() ^ _mix(pid ^ (UInt64(perf_counter_ns()) << 20)))
+    return e if e != 0 else 1
 
 
 def owner_of(object_id: UInt64) -> UInt64:
@@ -349,6 +373,23 @@ struct Head(Movable):
     """For a worker, the objects it is computing, oldest first."""
     var _driver_conn: Dict[UInt64, Int]
     var _next_driver: UInt64
+    """The next driver number to try. It starts at a random place, so a head
+    that restarts doesn't hand a new driver the number of a driver of the
+    head before it, whose results workers may still hold."""
+    var _epoch: UInt64
+    """This head's random epoch, sent in each welcome. A driver resuming
+    carries the epoch of the head that numbered it, so a head can tell a
+    driver it numbered from another one with the same number."""
+    var _fresh: Dict[UInt64, Bool]
+    """Drivers this head numbered, rather than took back resuming: none of
+    a previous head's results are theirs."""
+    var _orphan_owners: Dict[UInt64, UInt64]
+    """Drivers whose results rejoining workers reported as orphans, to when
+    the last such report came: freed if the driver hasn't come back
+    `DISTA_ORPHAN_SECONDS` later."""
+    var _orphan_grace: UInt64
+    """`DISTA_ORPHAN_SECONDS`, in nanoseconds (default 120 s: twice the 60 s
+    a driver keeps trying to reach a restarted head)."""
     var _drivers_seen: Bool
     var _queues: Dict[UInt64, _Queue]
     """Tasks ready to run, by the registry hash of the program that
@@ -500,7 +541,13 @@ struct Head(Movable):
         self._roles = List[UInt8]()
         self._inflight = List[List[UInt64]]()
         self._driver_conn = Dict[UInt64, Int]()
-        self._next_driver = 1
+        self._epoch = head_epoch()
+        self._next_driver = (self._epoch >> 7) % (MAX_DRIVER - 1) + 1
+        self._fresh = Dict[UInt64, Bool]()
+        self._orphan_owners = Dict[UInt64, UInt64]()
+        self._orphan_grace = (
+            UInt64(_env_int("DISTA_ORPHAN_SECONDS", 120)) * 1_000_000_000
+        )
         self._drivers_seen = False
         self._queues = Dict[UInt64, _Queue]()
         self._hashes = List[UInt64]()
@@ -571,6 +618,7 @@ struct Head(Movable):
     def run(mut self) raises:
         """Serves until the last driver leaves, in local mode; else forever."""
         while True:
+            self._expire_orphans()
             self._release_waiting()
             self._dispatch()
             self._note_busy()
@@ -606,7 +654,10 @@ struct Head(Movable):
                     ev |= POLLOUT
                 events.append(ev)
                 which.append(i)
-            var revents = poll(fds, events, -1)
+            # While orphans wait for their drivers, wake to expire them.
+            var revents = poll(
+                fds, events, 1000 if len(self._orphan_owners) > 0 else -1
+            )
             if revents[0] & POLLIN:
                 self._accept()
             for k in range(1, len(fds)):
@@ -1258,6 +1309,7 @@ struct Head(Movable):
                 var d = owner_of(f.object_id)
                 self._resumed[d] = True
                 _ = self._resuming.pop(d, False)
+                _ = self._orphan_owners.pop(d, 0)
                 var unclaimed = List[UInt64]()
                 for entry in self._orphans.items():
                     if owner_of(entry.key) == d:
@@ -1716,6 +1768,10 @@ struct Head(Movable):
     def _adopt(mut self, obj: UInt64) -> Bool:
         """A resubmitted task whose result a rejoining worker already reported:
         settle it with that result instead of running it again."""
+        if owner_of(obj) not in self._resuming:
+            # Only the driver that made it, resuming, can claim a result
+            # from before the restart; a new one never does.
+            return False
         if not self._orphans.pop(obj, False):
             return False
         self._deliver(obj, KIND_LOCATED, self._where.get(obj, List[UInt8]()))
@@ -1736,6 +1792,12 @@ struct Head(Movable):
                 if self._location.get(obj, -1) != i:
                     self._conns[i].send(KIND_FREE, obj, 0, List[UInt8]())
                 continue
+            if owner_of(obj) in self._fresh:
+                # Its driver's number is one this head handed out: the result
+                # is from a driver of an earlier head with the same number,
+                # or one this head already counted lost. Nobody claims it.
+                self._conns[i].send(KIND_FREE, obj, 0, List[UInt8]())
+                continue
             self._location[obj] = i
             self._where[obj] = loc.copy()
             self._learn_node(i, loc)
@@ -1746,6 +1808,7 @@ struct Head(Movable):
                 self._free(obj)
             else:
                 self._orphans[obj] = True
+                self._orphan_owners[owner_of(obj)] = wall_ns()
 
     def _hello(mut self, i: Int, var f: Frame) raises:
         if f.kind != KIND_HELLO or len(f.payload) < 9:
@@ -1768,18 +1831,49 @@ struct Head(Movable):
             self._conns[i].stream.close()
             return
         if f.payload[0] == ROLE_DRIVER or f.payload[0] == ROLE_CLIENT:
-            var n = self._next_driver
-            if len(f.payload) == 17:
-                # A driver resuming after a head restart keeps its number.
+            var n: UInt64
+            if len(f.payload) == 17 or len(f.payload) == 25:
+                # A driver resuming after a head restart keeps its number,
+                # and says which head gave it (an older driver doesn't).
                 var p = 9
                 n = get_scalar[DType.uint64](f.payload, p)
+                var epoch = UInt64(0)
+                if len(f.payload) == 25:
+                    epoch = get_scalar[DType.uint64](f.payload, p)
+                if n == 0 or n >= MAX_DRIVER:
+                    raise Error("a resuming driver's number is out of range")
+                var why = String()
+                if n in self._fresh and epoch != 0 and epoch != self._epoch:
+                    why = String(
+                        "driver number ",
+                        n,
+                        (
+                            " belongs to another driver of this head; this one"
+                            " was numbered by an earlier head, whose results"
+                            " are gone: run the job again"
+                        ),
+                    )
+                elif n in self._driver_conn and epoch == 0:
+                    why = String("driver ", n, " is already connected")
+                if why:
+                    self._conns[i].send(KIND_ERROR, 0, 0, why.as_bytes())
+                    self._roles[i] = _ROLE_GONE
+                    self._conns[i].stream.close()
+                    return
                 if n in self._driver_conn:
-                    raise Error("driver ", n, " is already connected")
-                if n >= self._next_driver:
-                    self._next_driver = n + 1
+                    # The same driver, back before this head noticed its old
+                    # connection go: that one is stale.
+                    var old = self._driver_conn.get(n, -1)
+                    print(
+                        "dista head: driver",
+                        n,
+                        "reconnected; dropping its old connection",
+                    )
+                    self._drop(old)
                 self._resuming[n] = True
             else:
-                self._next_driver += 1
+                n = self._new_driver_number()
+                self._fresh[n] = True
             self._roles[i] = ROLE_DRIVER
             self._driver_conn[n] = i
             self._driver_hash[n] = hash
@@ -1789,6 +1883,7 @@ struct Head(Movable):
                 self._drivers_seen = True
             var body = List[UInt8]()
             put_scalar[DType.uint64](body, n)
+            put_scalar[DType.uint64](body, self._epoch)
             self._conns[i].send(KIND_WELCOME, 0, 0, body)
         elif f.payload[0] == ROLE_WORKER:
             if len(f.payload) != 9 + ADDR_SIZE:
@@ -1797,6 +1892,56 @@ struct Head(Movable):
             self._worker_addr[i] = List[UInt8](f.payload[9:])
         else:
             raise Error("unknown role ", Int(f.payload[0]))
+
+    def _new_driver_number(mut self) raises -> UInt64:
+        """The next free driver number, from where the last one left off,
+        wrapping below `MAX_DRIVER`: never one a driver here has, had, or
+        may come back with."""
+        for _ in range(Int(MAX_DRIVER)):
+            var n = self._next_driver
+            self._next_driver = n + 1 if n + 1 < MAX_DRIVER else 1
+            if (
+                n in self._driver_conn
+                or n in self._fresh
+                or n in self._resuming
+                or n in self._resumed
+                or n in self._orphan_owners
+            ):
+                continue
+            return n
+        raise Error("no driver numbers left")
+
+    def _expire_orphans(mut self):
+        """Frees the orphans of drivers that haven't come back
+        `DISTA_ORPHAN_SECONDS` after a worker last reported their results:
+        such a driver has given up, and nothing else may claim them."""
+        if len(self._orphan_owners) == 0:
+            return
+        var now = wall_ns()
+        var gone = Dict[UInt64, Bool]()
+        for entry in self._orphan_owners.items():
+            var d = entry.key
+            if d in self._driver_conn or d in self._resuming:
+                continue
+            if now >= entry.value + self._orphan_grace:
+                gone[d] = True
+        if len(gone) == 0:
+            return
+        var unclaimed = List[UInt64]()
+        for entry in self._orphans.items():
+            if owner_of(entry.key) in gone:
+                unclaimed.append(entry.key)
+        for entry in gone.items():
+            _ = self._orphan_owners.pop(entry.key, 0)
+            print(
+                "dista head: driver",
+                entry.key,
+                "didn't come back for its results; freeing them",
+            )
+        for obj in unclaimed:
+            _ = self._orphans.pop(obj, False)
+            if obj not in self._refs:
+                self._free(obj)
 
     def _deliver(
         mut self, object_id: UInt64, kind: UInt8, payload: Span[UInt8, _]
