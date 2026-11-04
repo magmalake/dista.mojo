@@ -289,7 +289,18 @@ struct _Waiter(Copyable, Movable):
     var calls: Int
 
 
+comptime _COMPACT_AFTER = 64
+"""Tasks handed out of a queue before it may compact."""
+
+
 struct _Queue(Copyable, Movable, Sized):
+    """Tasks ready to run, oldest first, from `head` on.
+
+    A task handed out is moved, not copied, and leaves an empty `_Task` in
+    its slot. Once those make up half the list, the tasks still queued move
+    down to its start, so a queue that never empties, as under backpressure,
+    holds only what's queued, not every task it ever had."""
+
     var tasks: List[_Task]
     var head: Int
     """The next task to hand out."""
@@ -300,6 +311,38 @@ struct _Queue(Copyable, Movable, Sized):
 
     def __len__(self) -> Int:
         return len(self.tasks) - self.head
+
+    def take(mut self, k: Int) -> _Task:
+        """Hands out the task at `k`, one of those from `head` on: the one at
+        `head` takes its place."""
+        if k != self.head:
+            self.tasks.swap_elements(self.head, k)
+        var t = _Task(0, 0, List[UInt8]())
+        swap(t, self.tasks[self.head])
+        self.head += 1
+        if self.head == len(self.tasks):
+            self.tasks.clear()
+            self.head = 0
+        elif self.head >= _COMPACT_AFTER and self.head * 2 >= len(self.tasks):
+            self._compact()
+        return t^
+
+    def _compact(mut self):
+        """Moves the queued tasks to the start of a list of their own."""
+        var rest = List[_Task](capacity=len(self.tasks) - self.head)
+        for k in range(self.head, len(self.tasks)):
+            var t = _Task(0, 0, List[UInt8]())
+            swap(t, self.tasks[k])
+            rest.append(t^)
+        self.tasks = rest^
+        self.head = 0
+
+    def take_all(mut self) -> List[_Task]:
+        """Every queued task, oldest first, leaving the queue empty."""
+        self._compact()
+        var out = self.tasks^
+        self.tasks = List[_Task]()
+        return out^
 
 
 def _lost_result(obj: UInt64) -> String:
@@ -2250,10 +2293,14 @@ struct Head(Movable):
         nothing will run them, and a driver waiting on one would wait for
         ever."""
         var queued = List[_Task]()
-        for entry in self._queues.items():
-            ref q = entry.value
-            for k in range(q.head, len(q.tasks)):
-                queued.append(q.tasks[k].copy())
+        var hashes = List[UInt64]()
+        for h in self._queues.keys():
+            hashes.append(h)
+        for h in hashes:
+            try:
+                queued.extend(self._queues[h].take_all())
+            except:
+                pass
         self._queues = Dict[UInt64, _Queue]()
         self._queued_bytes = 0
         for ref t in queued:
@@ -2377,14 +2424,17 @@ struct Head(Movable):
                 put_scalar[DType.uint64](spec, d)
                 spec.extend(self._where.get(d, List[UInt8]()))
             else:
-                var r = self._results.get(d, List[UInt8]())
                 spec.append(0)
                 put_scalar[DType.uint64](spec, d)
-                put_scalar[DType.uint64](spec, UInt64(len(r)))
-                spec.extend(r^)
+                try:
+                    ref r = self._results[d]
+                    put_scalar[DType.uint64](spec, UInt64(len(r)))
+                    spec.extend(Span(r))
+                except:
+                    put_scalar[DType.uint64](spec, 0)
         if len(t.args) > 0:
             put_scalar[DType.uint64](spec, UInt64(len(t.args)))
-            spec.extend(t.args.copy())
+            spec.extend(Span(t.args))
         return spec^
 
     def _input_failed(self, t: _Task) -> String:
@@ -2543,14 +2593,8 @@ struct Head(Movable):
                     var k = self._pick(q, i, depth)
                     if k < 0:
                         continue
-                    if k != q.head:
-                        q.tasks.swap_elements(q.head, k)
-                    t = q.tasks[q.head].copy()
+                    t = q.take(k)
                     self._queued_bytes -= len(t.args)
-                    q.head += 1
-                    if q.head == len(q.tasks):
-                        q.tasks.clear()
-                        q.head = 0
                 except:
                     continue
                 self._inflight[i].append(t.object_id)
@@ -2568,17 +2612,22 @@ struct Head(Movable):
                         t.object_id, String("input failed: ", failed)
                     )
                     continue
-                self._tries[t.object_id] = self._tries.get(t.object_id, 0) + 1
-                var body = (
-                    self._inputs_spec(t) if t.kind
-                    == KIND_TASK_INPUTS else t.args.copy()
-                )
-                var sent = t.copy()
-                self._running[t.object_id] = t^
+                var obj = t.object_id
+                self._tries[obj] = self._tries.get(obj, 0) + 1
+                # Sent from the task itself, which then moves into `_running`:
+                # its arguments aren't copied.
+                var lost = False
                 try:
-                    self._conns[i].send(
-                        sent.kind, sent.object_id, sent.task_id, body
-                    )
+                    if t.kind == KIND_TASK_INPUTS:
+                        self._conns[i].send(
+                            t.kind, obj, t.task_id, self._inputs_spec(t)
+                        )
+                    else:
+                        self._conns[i].send(t.kind, obj, t.task_id, t.args)
                 except e:
                     print("dista head: lost worker:", e)
+                    lost = True
+                # Running before the drop, which sends it to another worker.
+                self._running[obj] = t^
+                if lost:
                     self._drop(i)
