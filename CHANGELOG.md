@@ -10,8 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.2] - 2026-11-04
 
 The merge trains #106 and #109 (#107 large results in part frames, #108
-keepalive and `DISTA_TASK_TIMEOUT`, and the purge/cancel fixes), and the
-S3 multipart fix.
+keepalive and `DISTA_TASK_TIMEOUT`, and the purge/cancel fixes), #110 (one
+copy per hop on the fetch path), and the S3 multipart fix.
 
 ### Changed
 
