@@ -41,7 +41,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: magmalake/objectstore.mojo
-          ref: 58488efa729351f5894b45a0a92e898171c2e96d
+          ref: 41fac2800882e5a64da09729262dfa22bbd4ad13
           path: objectstore.mojo
 
       - uses: prefix-dev/setup-pixi@v0.10.2
@@ -96,17 +96,17 @@ jobs:
       - uses: actions/checkout@v4
         with: {repository: magmalake/roaring.mojo, ref: a90a7bd30cf1c21403a29059282072e93fbeeee2, path: roaring.mojo}
       - uses: actions/checkout@v4
-        with: {repository: magmalake/objectstore.mojo, ref: 58488efa729351f5894b45a0a92e898171c2e96d, path: objectstore.mojo}
+        with: {repository: magmalake/objectstore.mojo, ref: 41fac2800882e5a64da09729262dfa22bbd4ad13, path: objectstore.mojo}
       - uses: actions/checkout@v4
-        with: {repository: magmalake/zstd.mojo, ref: 53655623ca8585fd5b36b1239842913ec308ae69, path: zstd.mojo}
+        with: {repository: magmalake/zstd.mojo, ref: 76190bb31012cd2d2f6712c4e1724a66474215db, path: zstd.mojo}
       - uses: actions/checkout@v4
-        with: {repository: magmalake/lz4.mojo, ref: 64502eeeabed37515cd479bc421fc2920504cac5, path: lz4.mojo}
+        with: {repository: magmalake/lz4.mojo, ref: 23cd6e54967d7e41573371507228ca5c958ca685, path: lz4.mojo}
       - uses: actions/checkout@v4
-        with: {repository: magmalake/brotli.mojo, ref: aa6d14985baf82ad4b934f14136b95a291b55faf, path: brotli.mojo}
+        with: {repository: magmalake/brotli.mojo, ref: dcbf840d22e3deaf24c587d12d28570a9a882b7f, path: brotli.mojo}
       - uses: actions/checkout@v4
-        with: {repository: magmalake/sqlite.mojo, ref: 53b819cd395b1b0afe8772dfbb43489da6ce939e, path: sqlite.mojo}
+        with: {repository: magmalake/sqlite.mojo, ref: 0d76aa7b672c85580f4d8c5de855772bc972d535, path: sqlite.mojo}
       - uses: actions/checkout@v4
-        with: {repository: magmalake/postgres.mojo, ref: bfe9b94ae97e3e184dc6d118b0684818927a5da8, path: postgres.mojo}
+        with: {repository: magmalake/postgres.mojo, ref: 324b2bb61e2e80327654abecf70fd4b2defbc50d, path: postgres.mojo}
       - uses: prefix-dev/setup-pixi@v0.10.2
         with:
           pixi-version: v0.78.0
