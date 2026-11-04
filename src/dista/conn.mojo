@@ -118,6 +118,13 @@ struct Conn(Movable):
         self._out.clear()
         self._out_pos = 0
 
+    def release_buffers(mut self):
+        """Frees both buffers, of a connection that's closed."""
+        self._in = List[UInt8]()
+        self._in_pos = 0
+        self._out = List[UInt8]()
+        self._out_pos = 0
+
     def wants_write(self) -> Bool:
         return self.connecting or self._out_pos < len(self._out)
 

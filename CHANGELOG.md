@@ -75,6 +75,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#94](https://github.com/magmalake/dista.mojo/issues/94)).
   `tests/peer_connect.sh` fills a stopped worker's backlog and fetches from
   it.
+### Changed
+
+- **The head loop's cost follows its events.** Waiting tasks are indexed by
+  their inputs, so an iteration looks only at the tasks whose inputs just
+  settled instead of checking and copying every waiting task: 384 reducers
+  gathering 2,000 map outputs finish in 0.07 s instead of 1.1 s
+  (`bench/fanout.mojo`, which gains this run). A closed connection's slot
+  and buffers are reused and freed, so a long-lived head polled by
+  `dista status` no longer scans every connection it ever had. Each
+  worker's held bytes are counted as results come and go, not recomputed
+  for every `dista status --json`.
 
 ## [0.2.1] - 2026-11-03
 
