@@ -6,9 +6,9 @@
 # write their tasks, and `dista stop` must end the head and every worker.
 set -euo pipefail
 mkdir -p build
-mojo build -I src ${DEP_INC:--I src} cli/main.mojo -o build/dista
-mojo build -I src ${DEP_INC:--I src} deploy/smoke.mojo -o build/cli-smoke
-mojo build -I src ${DEP_INC:--I src} tests/restart_driver.mojo -o build/cli-restart
+scripts/mojo-build.sh -I src ${DEP_INC:--I src} cli/main.mojo -o build/dista
+scripts/mojo-build.sh -I src ${DEP_INC:--I src} deploy/smoke.mojo -o build/cli-smoke
+scripts/mojo-build.sh -I src ${DEP_INC:--I src} tests/restart_driver.mojo -o build/cli-restart
 export DISTA_CHECKPOINT_URI=$PWD/build/cli-checkpoints
 rm -rf "$DISTA_CHECKPOINT_URI"
 

@@ -5,7 +5,7 @@
 # pod being deleted sends.
 set -euo pipefail
 mkdir -p build
-mojo build -I src ${DEP_INC:--I src} deploy/smoke.mojo -o build/metrics-smoke
+scripts/mojo-build.sh -I src ${DEP_INC:--I src} deploy/smoke.mojo -o build/metrics-smoke
 
 pids=()
 cleanup() { kill -9 "${pids[@]}" 2>/dev/null || true; }
