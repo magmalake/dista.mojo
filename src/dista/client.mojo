@@ -1025,6 +1025,45 @@ struct Client(Movable):
                 return self._stored[R](r.id)
         return decode[R](self._results[r.id], pos)
 
+    def take[R: Movable & Deinitable](mut self, r: ObjectRef[R]) raises -> R:
+        """Waits for `r`'s task, returns its result and releases `r`: `get`
+        then `release`, for a result read once, which is most of them.
+
+        A result `get` returned stays here, at the head and on its worker
+        until it's released, so a driver that only gets grows without bound.
+        `take` lets go as it reads, and a small result is decoded from the
+        bytes it drops rather than from a copy. A task given `r` as input
+        still gets it. It raises `r`'s error, released all the same.
+        """
+        if r.id in self._released:
+            raise Error(r, " was released")
+        while not self._settled(r.id):
+            self._read_one()
+        if r.id in self._results and self._dependents.get(r.id, 0) == 0:
+            # Nothing pending needs these bytes again: decode from them.
+            var bytes = self._results.pop(r.id)
+            self.release(r)
+            var pos = 0
+            return decode[R](bytes, pos)
+        try:
+            var value = self.get(r)
+            self.release(r)
+            return value^
+        except e:
+            self.release(r)
+            raise e^
+
+    def take[
+        R: Copyable & Deinitable
+    ](mut self, refs: List[ObjectRef[R]]) raises -> List[R]:
+        """Takes every ref in `refs`, in order: their results, each released
+        as it's read. The first error raises, and the refs after it stay held.
+        """
+        var out = List[R](capacity=len(refs))
+        for r in refs:
+            out.append(self.take(r))
+        return out^
+
     def _stored[R: Movable](mut self, id: UInt64) raises -> R:
         """Decodes a result that lives on a worker, from where it was last
         said to be."""
@@ -1223,10 +1262,7 @@ struct CtxTask[
 
     ```mojo
     def bump(mut c: Client, h: ActorHandle[CounterActor]) raises -> Int:
-        var r = c.call[Add](h, 1)
-        var n = c.get(r)
-        c.release(r)
-        return n
+        return c.take(c.call[Add](h, 1))
 
     comptime Bump = CtxTask[ActorHandle[CounterActor], Int, bump]
     ```

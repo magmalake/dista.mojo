@@ -377,7 +377,16 @@ struct Head(Movable):
     """Every live object's reference count."""
     var _held: Dict[UInt64, Bool]
     """Objects whose driver hasn't released them; each counts once in `_refs`.
+    Changed only through `_mark_held` and `_unhold`, which keep `_held_by`.
     """
+    var _held_by: Dict[UInt64, Int]
+    """How many objects each driver holds, by number: what `dista status`
+    shows, since a driver that never releases grows the head."""
+    var _warn_held: Int
+    """`DISTA_WARN_HELD`: the head logs a driver holding this many objects,
+    and again at each doubling; 0, never."""
+    var _warned_at: Dict[UInt64, Int]
+    """For each driver it has warned about, the count that warns next."""
     var _deps_of: Dict[UInt64, List[UInt64]]
     """A waiting task's inputs, each holding a reference until it settles."""
     var _dead: Dict[UInt64, Bool]
@@ -509,6 +518,9 @@ struct Head(Movable):
         self._where = Dict[UInt64, List[UInt8]]()
         self._refs = Dict[UInt64, Int]()
         self._held = Dict[UInt64, Bool]()
+        self._held_by = Dict[UInt64, Int]()
+        self._warn_held = _env_int("DISTA_WARN_HELD", 100_000)
+        self._warned_at = Dict[UInt64, Int]()
         self._deps_of = Dict[UInt64, List[UInt64]]()
         self._dead = Dict[UInt64, Bool]()
         self._orphans = Dict[UInt64, Bool]()
@@ -714,6 +726,19 @@ struct Head(Movable):
             "Objects the head counts references to.",
             len(self._refs),
         )
+        var most = 0
+        for entry in self._held_by.items():
+            most = max(most, entry.value)
+        write_metric(
+            out,
+            "gauge",
+            "dista_driver_held_objects_max",
+            (
+                "The most objects one driver holds: results it hasn't"
+                " released, kept at the head and on the workers."
+            ),
+            most,
+        )
         write_metric(
             out,
             "gauge",
@@ -904,6 +929,7 @@ struct Head(Movable):
                 "  registry ",
                 hex(self._driver_hash.get(entry.key, 0)),
             )
+            out += String("  holds ", self._held_by.get(entry.key, 0))
             if entry.value in self._clients:
                 out += "  (a task's client)"
             out += "\n"
@@ -1051,8 +1077,23 @@ struct Head(Movable):
             self._pipeline,
             ',"checkpoints":',
             "true" if getenv("DISTA_CHECKPOINT_URI") else "false",
-            ',"workers":[',
+            ',"driver_objects":[',
         )
+        # What each driver holds: one that never releases grows the head.
+        var sep = ""
+        for entry in self._driver_conn.items():
+            out += String(
+                sep,
+                '{"driver":',
+                entry.key,
+                ',"held":',
+                self._held_by.get(entry.key, 0),
+                ',"client":',
+                "true" if entry.value in self._clients else "false",
+                "}",
+            )
+            sep = ","
+        out += '],"workers":['
         var first = True
         for i in range(len(self._roles)):
             if self._roles[i] != ROLE_WORKER:
@@ -1220,7 +1261,7 @@ struct Head(Movable):
                     if obj not in self._refs:
                         self._free(obj)
             elif f.kind == KIND_RELEASE:
-                if self._held.pop(f.object_id, False):
+                if self._unhold(f.object_id):
                     self._dec(f.object_id)
             elif f.kind == KIND_ACTOR_CREATE:
                 var a = f.object_id
@@ -1661,7 +1702,7 @@ struct Head(Movable):
                         self._drop(i)
             for ref t in act.pending:
                 self._fail(t.object_id, String("the actor was killed"))
-        if self._held.pop(a, False):
+        if self._unhold(a):
             self._dec(a)
 
     def _adopt(mut self, obj: UInt64) -> Bool:
@@ -1790,14 +1831,49 @@ struct Head(Movable):
         if object_id not in self._refs:
             return False
         if not self._held.get(object_id, False):
-            self._held[object_id] = True
+            self._mark_held(object_id)
             self._refs[object_id] = self._refs.get(object_id, 0) + 1
         return True
 
     def _hold(mut self, object_id: UInt64):
         """A new object, held by its driver."""
         self._refs[object_id] = 1
+        self._mark_held(object_id)
+
+    def _mark_held(mut self, object_id: UInt64):
+        """`object_id`'s driver holds it: counted for that driver, with a
+        warning in the log once it holds `DISTA_WARN_HELD` objects."""
+        if object_id in self._held:
+            return
         self._held[object_id] = True
+        var d = owner_of(object_id)
+        var n = self._held_by.get(d, 0) + 1
+        self._held_by[d] = n
+        if self._warn_held > 0 and n >= self._warned_at.get(d, self._warn_held):
+            self._warned_at[d] = n * 2
+            print(
+                "dista head: driver",
+                d,
+                "holds",
+                n,
+                (
+                    "objects; results stay at the head and on the workers"
+                    " until released: read them with take, or release them"
+                    " after get"
+                ),
+            )
+
+    def _unhold(mut self, object_id: UInt64) -> Bool:
+        """Its driver lets go of `object_id`: whether it held it."""
+        if not self._held.pop(object_id, False):
+            return False
+        var d = owner_of(object_id)
+        var n = self._held_by.get(d, 0) - 1
+        if n > 0:
+            self._held_by[d] = n
+        else:
+            _ = self._held_by.pop(d, 0)
+        return True
 
     def _settle(mut self, object_id: UInt64):
         """`object_id`'s task is done: it no longer holds its inputs."""
@@ -1954,8 +2030,9 @@ struct Head(Movable):
                     except:
                         pass
                 for obj in mine:
-                    if self._held.pop(obj, False):
+                    if self._unhold(obj):
                         self._dec(obj)
+                _ = self._warned_at.pop(gone, 0)
         elif role == ROLE_WORKER:
             self._workers_lost += 1
             if self._draining[i] != _DRAIN_NO:

@@ -18,6 +18,7 @@ test-free = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_fre
 test-actors = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_actors.mojo -o build/test-actors && ./build/test-actors" }
 test-arity = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_arity.mojo -o build/test-arity && ./build/test-arity" }
 test-shuffle = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_shuffle.mojo -o build/test-shuffle && ./build/test-shuffle" }
+test-take = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_take.mojo -o build/test-take && ./build/test-take" }
 test-admission = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_admission.mojo -o build/test-admission && ./build/test-admission" }
 test-spill = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_spill.mojo -o build/test-spill && ./build/test-spill" }
 test-timeline = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_timeline.mojo -o build/test-timeline && ./build/test-timeline" }
@@ -32,7 +33,7 @@ test-autoscale = { cmd = "tests/autoscale.sh" }
 test-cli = { cmd = "tests/cli.sh" }
 test-chaos = { cmd = "CHAOS_FAST=1 tests/chaos.sh" }
 test-kind = { cmd = "tests/kind.sh" }
-test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-timeline", "test-scale", "test-actors", "test-arity", "test-shuffle", "test-spill", "test-admission", "test-cluster", "test-restart", "test-locality", "test-compile-fail", "test-metrics", "test-drain", "test-autoscale", "test-cli", "test-chaos"] }
+test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-take", "test-timeline", "test-scale", "test-actors", "test-arity", "test-shuffle", "test-spill", "test-admission", "test-cluster", "test-restart", "test-locality", "test-compile-fail", "test-metrics", "test-drain", "test-autoscale", "test-cli", "test-chaos"] }
 cli = { cmd = "mkdir -p build && mojo build -I src $DEP_INC cli/main.mojo -o build/dista" }
 bench = { cmd = "mkdir -p build && mojo build -I src $DEP_INC bench/fanout.mojo -o build/bench-fanout && ./build/bench-fanout" }
 

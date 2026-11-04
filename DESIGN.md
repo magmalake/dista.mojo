@@ -23,14 +23,14 @@ def main() raises:
         refs.append(rt.remote[Square](i))
     var total = 0
     for r in refs:
-        total += rt.get(r)
+        total += rt.take(r)
 ```
 
 - **Why declare tasks instead of `remote[square](7)`.** Mojo 1.2 can't infer a function's result type from the function value, so `R` must be written somewhere. The declaration is that place. It's also Ray's shape: `@ray.remote` once, `.remote()` at each call. *Verified.*
 - **The function type is `def(A) thin -> R`.** A top-level `def` is a `thin` function; without `thin` the parameter doesn't bind. Argument and result types need `Movable & Deinitable` (1.2 makes destruction explicit for generic types). *Verified.*
 - **Up to three arguments.** `Task[A, R, f]` takes one, `Task2[A, B, R, f]` two and `Task3[A, B, C, R, f]` three, called as `rt.remote[T](a, b)` and `rt.remote[T](a, b, c)`: one type per argument count, as Mojo's standard library does it, encoded one after the other on the wire. More than three travel as a struct, which the codec handles by reflection. A `Task2` called with one argument raises at the call. They take values only, not refs. Once Mojo's variadic type parameters settle, a variadic `Task` replaces them ([#71](https://github.com/magmalake/dista.mojo/issues/71)).
 - **Results as arguments.** `rt.remote[T](ref)` takes an `ObjectRef[T.A]` in place of a `T.A`. `rt.remote[T](refs)` takes a `List[ObjectRef[X]]` when `T` takes a `Seq[X]`. Either way the task waits until every input exists. Its argument is then assembled from the inputs' encoded bytes, without decoding them. If an input failed, the task fails with that error and never runs.
-- **`ObjectRef[R]`** is a typed handle to a result that may not exist yet. `rt.get(ref)` blocks until it does and returns an `R`. Getting the same ref twice decodes it twice; phase 1 keeps every result until the runtime ends.
+- **`ObjectRef[R]`** is a typed handle to a result that may not exist yet. `rt.get(ref)` blocks until it does and returns an `R`. Getting the same ref twice decodes it twice. A result is kept, in the driver, at the head and on its worker, until `rt.release(ref)`; `rt.take(ref)` is `get` then `release`, for the common case of a result read once (see "Freeing results" below).
 - **Errors.** A task that raises sends its message back; `get` re-raises it in the driver, and the worker carries on. Raising and non-raising functions both bind to `def(A) thin raises -> R`, so one `Task` type covers both. *Verified.*
 
 ## Function registry and dispatch
@@ -343,9 +343,17 @@ A driver's `remote` writes a frame and returns, and the head read every connecti
 
 **A driver that doesn't read** what the head sends it, busy elsewhere, would grow the head's output buffer by every result. Past `DISTA_MAX_DRIVER_BUFFER` bytes waiting for it (default 256 MiB), its queued tasks aren't sent to workers until it reads; its queue then fills, and admission stops its submissions. That would deadlock a driver blocked in `remote`, which isn't reading either, so the client reads the head's frames while a write would block: results move into the driver while it waits. Tasks' clients are exempt, as above. `dista_drivers_behind` counts the drivers past the limit. Gate: a driver submits 2,000 tasks with 60 KB results and sleeps 2 s; with room for 4 MB, 1,919 tasks were still waiting, and without the limit none.
 
-Not covered: small results stay at the head until their driver releases them, so a driver that never releases its refs still grows the head's memory. And a driver past its buffer's limit holds the first `LOOKAHEAD` (64) queued tasks of its program, so another driver of the same program waits behind them until it reads.
+Not covered: small results stay at the head until their driver releases them, so a driver that never releases its refs still grows the head's memory (see "Freeing results" below). And a driver past its buffer's limit holds the first `LOOKAHEAD` (64) queued tasks of its program, so another driver of the same program waits behind them until it reads.
 
 Gate: `tests/test_admission.mojo`. With room for 8 tasks, or for 5 MB of arguments, 200 slow tasks with 500 KB arguments (100 MB, far more than the sockets buffer, which on Linux grow to several MB) take 2.1 s to submit to 2 workers, against at least 0.77 s for the workers to run the ones that don't fit; with no limit, a moment. The first version read a driver's socket dry, which on Linux pulled most of 20 MB into the head before the limit could act, and CI caught it. A chain of 100 tasks and a gather over them, with room for 4, still finishes.
+
+### Freeing results: `take` (done)
+
+A result is kept until its driver releases its ref: in the driver, which keeps every result `get` returned; at the head, which keeps every small result it forwarded, since a later task may take it as input; and on the worker holding a large one. A loop that only calls `get`, as a port of a single-machine loop does, grows all three by every result, and the failure comes hours into a long job, at the head, far from its cause ([#98](https://github.com/magmalake/dista.mojo/issues/98)).
+
+- **`rt.take(ref)`** is `get` then `release`: the result, freed everywhere once no submitted task still needs it. A small one is decoded from the bytes it drops, not from a copy. `rt.take(refs)` takes a list in order. The README and the examples read with it; `get` stays for a result read more than once.
+- **Not automatic.** Releasing a ref when it goes out of scope needs an `ObjectRef` that isn't `ImplicitlyCopyable`, so every ref copied into a list, a struct or a task's argument would need an explicit copy or move: a break in every program. Releasing on first read would break the re-read `get` allows. `take` is the explicit, compatible version.
+- **Visible.** The head counts the objects each driver holds. `dista status` prints it per driver, `--json` as `driver_objects`, `/metrics` the largest as `dista_driver_held_objects_max`, and the head logs a driver once it holds `DISTA_WARN_HELD` objects (default 100,000; 0 turns it off) and again each time that doubles, naming `take` and `release`.
 
 ### Kubernetes: dista and orca
 
