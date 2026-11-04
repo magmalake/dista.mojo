@@ -49,8 +49,12 @@ from dista.frame import (
     ROLE_CLIENT,
     ROLE_DRIVER,
     ROLE_OBSERVER,
+    KIND_PART,
     Frame,
+    Parts,
+    check_payload,
     decode_addr,
+    fetch_payload,
     read_frame,
     write_frame,
     append_frame,
@@ -824,6 +828,8 @@ struct Client(Movable):
         var payload: List[UInt8],
         var deps: List[UInt64],
     ) raises:
+        # Refused here, before it's recorded: no frame carries it.
+        check_payload(len(payload))
         for d in deps:
             self._dependents[d] = self._dependents.get(d, 0) + 1
         self._live[id] = True
@@ -1283,16 +1289,24 @@ struct Client(Movable):
             )
             self._fetcher_index[key] = len(self._fetchers) - 1
         var i = self._fetcher_index.get(key, -1)
-        write_frame(self._fetchers[i], KIND_FETCH, id, 0, List[UInt8]())
-        var f = read_frame(self._fetchers[i])
-        if not f:
-            raise Error("the worker holding object ", id, " hung up")
-        ref frame = f.value()
-        if frame.kind == KIND_RESULT:
-            self._socket_bytes += len(frame.payload)
-            self._results[id] = frame.payload.copy()
-        else:
-            raise Error(message(frame.payload))
+        write_frame(self._fetchers[i], KIND_FETCH, id, 0, fetch_payload())
+        var parts = Parts()
+        while True:
+            var f = read_frame(self._fetchers[i])
+            if not f:
+                raise Error("the worker holding object ", id, " hung up")
+            ref frame = f.value()
+            if frame.kind == KIND_RESULT:
+                self._socket_bytes += len(frame.payload)
+                self._results[id] = frame.payload.copy()
+                return
+            if frame.kind != KIND_PART:
+                raise Error(message(frame.payload))
+            # A result too large for one frame comes in parts.
+            if parts.add(frame.payload):
+                self._socket_bytes += parts.size
+                self._results[id] = parts^.take()
+                return
 
 
 def _one_argument[T: TaskLike]() raises:

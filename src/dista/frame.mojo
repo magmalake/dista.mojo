@@ -19,7 +19,7 @@ Every frame is a 4-byte little-endian length, then that many bytes:
 | 6 task-after | driver to head | flags byte (`GATHER`, `WITH_VALUE`), count u64, then that many object IDs; with `WITH_VALUE`, a length u64 and the encoded value |
 | 7 stored | worker to head | the result's size, u64: it stayed on the worker |
 | 8 located | head to driver | the address of the worker holding the result |
-| 9 fetch | driver or worker to a worker | none: send that object back as a result frame |
+| 9 fetch | driver or worker to a worker | none, or the largest part the fetcher takes, u64: send that object back as a result frame, or if it's larger than that part, as part frames |
 | 10 task-inputs | head to worker | flags byte, count u64, then per input a tag byte, its object ID, then for tag 0 a length u64 and the bytes, or for tag 1 its location; with `WITH_VALUE`, a length u64 and the value |
 | 11 release | driver to head | none: the driver is done with this object |
 | 12 free | head to worker | none: delete this object |
@@ -43,6 +43,14 @@ Every frame is a 4-byte little-endian length, then that many bytes:
 | 30 adopt | head to worker | a draining worker's location of the object: fetch it and keep it |
 | 31 adopted | worker to head | 1 and the object's new location, or 0 and why not |
 | 32 cancel | driver to head | none: fail this object's task with "cancelled", and drop it if it hasn't run |
+| 33 part | worker to a driver or worker that fetched | the object's size u64, this part's offset u64, then its bytes; parts come in order, and the object is whole when they reach its size |
+
+A frame holds at most `MAX_FRAME` bytes, so a result larger than that
+crosses hosts in parts. A fetcher says it takes parts by putting the largest
+it wants in the fetch frame. One that sends an empty fetch, as before parts
+existed, gets the whole object in one result frame, or an error frame if it
+doesn't fit. Writing a frame that doesn't fit raises; it used to wrap the
+length past 4 GiB and garble the stream.
 
 An observer (`dista status`, `timeline`, `stop`) says hello without a
 registry and owns no objects. Its timeline frame gets every driver's
@@ -143,6 +151,8 @@ comptime KIND_CANCEL: UInt8 = 32
 """Driver to head: this driver won't read `object_id`. A task still queued or
 waiting for inputs never runs; one running finishes, and its result is
 dropped. Either way the object fails with "cancelled"."""
+comptime KIND_PART: UInt8 = 33
+"""Worker to a fetcher: one part of an object too large for one frame."""
 comptime GATHER: UInt8 = 1
 """Task-after and task-inputs flag: the inputs gather into a `Seq`."""
 comptime WITH_VALUE: UInt8 = 2
@@ -159,6 +169,16 @@ comptime ROLE_OBSERVER: UInt8 = 4
 it as a driver, except that it doesn't keep a local-mode head alive."""
 comptime HEADER = 17
 comptime MAX_FRAME = 1 << 30
+"""The largest frame body a receiver takes: the kind, the IDs and the
+payload."""
+comptime MAX_PAYLOAD = MAX_FRAME - HEADER
+comptime PART_SIZE = 64 << 20
+"""The largest part a fetcher asks for: an object larger than this comes in
+parts of it."""
+comptime _PART_HEADER = 16
+"""A part's payload starts with the object's size and the part's offset."""
+comptime MAX_OBJECT = 1 << 40
+"""A part frame announcing an object larger than this is garbage."""
 
 
 def message(payload: Span[UInt8, _]) -> String:
@@ -190,19 +210,120 @@ struct Frame(Movable):
         return self.payload^
 
 
+def check_payload(n: Int) raises:
+    """Raises unless a frame can carry a payload of `n` bytes."""
+    if n > MAX_PAYLOAD:
+        raise Error(
+            "a frame can't carry ",
+            n,
+            " bytes: the limit is ",
+            MAX_PAYLOAD,
+            " (a result that large crosses hosts in parts; arguments can't)",
+        )
+
+
 def append_frame(
     mut out: List[UInt8],
     kind: UInt8,
     object_id: UInt64,
     task_id: UInt64,
     payload: Span[UInt8, _],
-):
-    """Appends one whole frame to `out`."""
+) raises:
+    """Appends one whole frame to `out`. Raises, appending nothing, if the
+    payload is too large for a frame."""
+    check_payload(len(payload))
     put_scalar[DType.uint32](out, UInt32(HEADER + len(payload)))
     out.append(kind)
     put_scalar[DType.uint64](out, object_id)
     put_scalar[DType.uint64](out, task_id)
     out.extend(payload)
+
+
+def append_parts(
+    mut out: List[UInt8], object_id: UInt64, data: Span[UInt8, _], part: Int
+) raises:
+    """Appends `data`, object `object_id`, as part frames of at most `part`
+    bytes each."""
+    var size = min(max(part, 1), MAX_PAYLOAD - _PART_HEADER)
+    var total = len(data)
+    out.reserve(len(out) + total + (total // size + 1) * (4 + HEADER + 16))
+    var offset = 0
+    while True:
+        var n = min(size, total - offset)
+        put_scalar[DType.uint32](out, UInt32(HEADER + _PART_HEADER + n))
+        out.append(KIND_PART)
+        put_scalar[DType.uint64](out, object_id)
+        put_scalar[DType.uint64](out, 0)
+        put_scalar[DType.uint64](out, UInt64(total))
+        put_scalar[DType.uint64](out, UInt64(offset))
+        out.extend(data[offset : offset + n])
+        offset += n
+        if offset >= total:
+            return
+
+
+def fetch_payload(part: Int = PART_SIZE) -> List[UInt8]:
+    """A fetch frame's payload: the largest part this fetcher takes."""
+    var out = List[UInt8](capacity=8)
+    put_scalar[DType.uint64](out, UInt64(part))
+    return out^
+
+
+def fetch_part(payload: Span[UInt8, _]) raises -> Int:
+    """The largest part a fetch frame asks for; 0 for an empty fetch, which
+    wants the whole object in one frame."""
+    if len(payload) == 0:
+        return 0
+    if len(payload) != 8:
+        raise Error("bad fetch payload of ", len(payload), " bytes")
+    var pos = 0
+    var part = Int(get_scalar[DType.uint64](payload, pos))
+    if part < 1:
+        raise Error("bad fetch part size ", part)
+    return part
+
+
+struct Parts(Movable):
+    """An object arriving in part frames: `add` each, in order."""
+
+    var data: List[UInt8]
+    var size: Int
+
+    def __init__(out self):
+        self.data = List[UInt8]()
+        self.size = -1
+
+    def add(mut self, payload: Span[UInt8, _]) raises -> Bool:
+        """Adds one part frame's payload; whether the object is now whole."""
+        if len(payload) < _PART_HEADER:
+            raise Error("truncated part")
+        var pos = 0
+        var size = Int(get_scalar[DType.uint64](payload, pos))
+        var offset = Int(get_scalar[DType.uint64](payload, pos))
+        if self.size < 0:
+            if size < 0 or size > MAX_OBJECT:
+                raise Error("bad part: object size ", size)
+            self.size = size
+            self.data = List[UInt8](capacity=size)
+        var n = len(payload) - _PART_HEADER
+        if size != self.size or offset != len(self.data) or n > size - offset:
+            raise Error(
+                "bad part: ",
+                n,
+                " bytes at ",
+                offset,
+                " of ",
+                size,
+                ", after ",
+                len(self.data),
+                " of ",
+                self.size,
+            )
+        self.data.extend(payload[_PART_HEADER:])
+        return len(self.data) == self.size
+
+    def take(deinit self) -> List[UInt8]:
+        return self.data^
 
 
 def write_frame(
