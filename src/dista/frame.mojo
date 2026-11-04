@@ -42,6 +42,7 @@ Every frame is a 4-byte little-endian length, then that many bytes:
 | 29 drain | worker to head | none: the worker was told to stop; it takes no more work, and leaves once the head says stop |
 | 30 adopt | head to worker | a draining worker's location of the object: fetch it and keep it |
 | 31 adopted | worker to head | 1 and the object's new location, or 0 and why not |
+| 32 cancel | driver to head | none: fail this object's task with "cancelled", and drop it if it hasn't run |
 
 An observer (`dista status`, `timeline`, `stop`) says hello without a
 registry and owns no objects. Its timeline frame gets every driver's
@@ -131,6 +132,10 @@ a draining worker's, and keep it as its own."""
 comptime KIND_ADOPTED: UInt8 = 31
 """Worker to head: 1 and the object's new location, or 0 and why it couldn't
 take it."""
+comptime KIND_CANCEL: UInt8 = 32
+"""Driver to head: this driver won't read `object_id`. A task still queued or
+waiting for inputs never runs; one running finishes, and its result is
+dropped. Either way the object fails with "cancelled"."""
 comptime GATHER: UInt8 = 1
 """Task-after and task-inputs flag: the inputs gather into a `Seq`."""
 comptime WITH_VALUE: UInt8 = 2

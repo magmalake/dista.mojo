@@ -22,6 +22,7 @@ test-take = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_tak
 test-admission = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_admission.mojo -o build/test-admission && ./build/test-admission" }
 test-spill = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_spill.mojo -o build/test-spill && ./build/test-spill" }
 test-timeline = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_timeline.mojo -o build/test-timeline && ./build/test-timeline" }
+test-cancel = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_cancel.mojo -o build/test-cancel && ./build/test-cancel" }
 test-scale = { cmd = "mkdir -p build && mojo build -I src $DEP_INC tests/test_scale.mojo -o build/test-scale && ./build/test-scale" }
 test-cluster = { cmd = "tests/cluster.sh" }
 test-restart = { cmd = "tests/head_restart.sh" }
@@ -34,7 +35,7 @@ test-autoscale = { cmd = "tests/autoscale.sh" }
 test-cli = { cmd = "tests/cli.sh" }
 test-chaos = { cmd = "CHAOS_FAST=1 tests/chaos.sh" }
 test-kind = { cmd = "tests/kind.sh" }
-test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-take", "test-timeline", "test-scale", "test-actors", "test-arity", "test-shuffle", "test-spill", "test-admission", "test-cluster", "test-restart", "test-locality", "test-compile-fail", "test-metrics", "test-drain", "test-peer-loss", "test-autoscale", "test-cli", "test-chaos"] }
+test = { depends-on = ["test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-take", "test-timeline", "test-scale", "test-actors", "test-arity", "test-shuffle", "test-spill", "test-admission", "test-cancel", "test-cluster", "test-restart", "test-locality", "test-compile-fail", "test-metrics", "test-drain", "test-peer-loss", "test-autoscale", "test-cli", "test-chaos"] }
 cli = { cmd = "mkdir -p build && mojo build -I src $DEP_INC cli/main.mojo -o build/dista" }
 bench = { cmd = "mkdir -p build && mojo build -I src $DEP_INC bench/fanout.mojo -o build/bench-fanout && ./build/bench-fanout" }
 

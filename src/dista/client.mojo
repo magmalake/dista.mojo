@@ -23,6 +23,7 @@ from dista.frame import (
     KIND_ACTOR_CALL,
     KIND_ACTOR_CREATE,
     KIND_ACTOR_KILL,
+    KIND_CANCEL,
     KIND_CHECKPOINT,
     KIND_CLAIM,
     KIND_COVERED,
@@ -1063,6 +1064,41 @@ struct Client(Movable):
         for r in refs:
             out.append(self.take(r))
         return out^
+
+    def get[
+        R: Movable
+    ](mut self, r: ObjectRef[R], timeout: Float64) raises -> R:
+        """Waits up to `timeout` seconds for `r`'s task and returns its
+        result, or raises its error. Past the timeout it raises an error that
+        starts with "timed out"; `r` stays valid, to wait on again or cancel.
+        """
+        if r.id in self._released:
+            raise Error(r, " was released")
+        var deadline = Int(perf_counter_ns()) + Int(max(timeout, 0.0) * 1e9)
+        while not self._settled(r.id):
+            var left = deadline - Int(perf_counter_ns())
+            if left <= 0:
+                raise Error("timed out after ", timeout, " s waiting for ", r)
+            if poll_readable([self._head.fd], left // 1_000_000 + 1)[0]:
+                self._read_one()
+        return self.get(r)
+
+    def cancel[R: AnyType](mut self, r: ObjectRef[R]) raises:
+        """Gives up on `r`: if its task hasn't run, it never does; if it's
+        running, it finishes on its worker and the result is dropped. `get`
+        raises "cancelled" from then on, and so does any task waiting on
+        `r`. A result that's already here is kept, and `get` returns it. An
+        actor call still runs, since later calls expect its effect, but its
+        answer is "cancelled". `release` it as any other ref.
+        """
+        if r.id in self._released or self._settled(r.id):
+            return
+        self._send(KIND_CANCEL, r.id, List[UInt8]())
+
+    def cancel[R: AnyType](mut self, refs: List[ObjectRef[R]]) raises:
+        """Cancels every ref in `refs`."""
+        for r in refs:
+            self.cancel(r)
 
     def _stored[R: Movable](mut self, id: UInt64) raises -> R:
         """Decodes a result that lives on a worker, from where it was last

@@ -32,6 +32,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The README, `examples/mapreduce.mojo` and the docstrings read results with
   `take`: the README's loop of `get`s kept every result in the driver and the
   head until the program ended.
+### Added
+
+- **`rt.cancel(ref)`** (and a list overload): a task that hasn't run never
+  does, and a running one's result is dropped; `get` raises `cancelled`, as
+  do tasks waiting on it. An actor call is answered `cancelled` but still
+  runs. A new frame, `KIND_CANCEL` (32), carries it.
+- **`rt.get(ref, timeout=seconds)`** raises an error starting with `timed
+  out` once the timeout passes; the ref stays valid. `get(ref)` is
+  unchanged.
+
+### Fixed
+
+- A driver that disconnects no longer leaves its queued and waiting tasks
+  to run on the workers: the head drops them (#97).
 
 ## [0.2.1] - 2026-11-03
 
