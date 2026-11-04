@@ -10,8 +10,14 @@ from std.testing import (
 
 from dista.frame import (
     KIND_ERROR,
+    KIND_PART,
     KIND_RESULT,
     KIND_TASK,
+    MAX_PAYLOAD,
+    Parts,
+    append_frame,
+    append_parts,
+    parse_body,
     read_frame,
     write_frame,
 )
@@ -176,6 +182,73 @@ def test_start_connect_to_a_closed_port_fails() raises:
     _ = poll([c.fd], [POLLOUT], 2000)
     with assert_raises(contains="connect failed"):
         c.finish_connect()
+
+
+def test_a_payload_too_large_for_a_frame_raises() raises:
+    """1.5 GiB passes the receiver's 1 GiB limit, and 4.5 GiB wrapped the u32
+    length to garbage. Writing either raises, and appends nothing. The span
+    is never read, so it needs no memory behind it."""
+    var small = List[UInt8](length=16, fill=0)
+    for size in [MAX_PAYLOAD + 1, 3 << 29, 9 << 29]:
+        var huge = Span[UInt8, origin_of(small)](
+            unsafe_ptr=small.unsafe_ptr(), length=size
+        )
+        var out = List[UInt8]()
+        with assert_raises(contains="can't carry"):
+            append_frame(out, KIND_RESULT, 1, 0, huge)
+        assert_equal(len(out), 0)
+    var out = List[UInt8]()
+    append_frame(out, KIND_RESULT, 1, 0, small)
+    assert_equal(len(out), 4 + 17 + 16)
+
+
+def _frames(buf: List[UInt8]) raises -> List[Int]:
+    """The body offsets of the frames in `buf`."""
+    var at = List[Int]()
+    var pos = 0
+    while pos < len(buf):
+        var n = (
+            Int(buf[pos])
+            | Int(buf[pos + 1]) << 8
+            | Int(buf[pos + 2]) << 16
+            | Int(buf[pos + 3]) << 24
+        )
+        at.append(pos)
+        pos += 4 + n
+    assert_equal(pos, len(buf))
+    return at^
+
+
+def test_parts_rebuild_the_object() raises:
+    var data = List[UInt8](capacity=1000)
+    for i in range(1000):
+        data.append(UInt8(i % 251))
+    var out = List[UInt8]()
+    append_parts(out, 9, data, 300)
+    var at = _frames(out)
+    assert_equal(len(at), 4)  # 300, 300, 300, 100
+    var parts = Parts()
+    for k in range(len(at)):
+        var end = at[k + 1] if k + 1 < len(at) else len(out)
+        var f = parse_body(Span(out)[at[k] + 4 : end])
+        assert_equal(f.kind, KIND_PART)
+        assert_equal(f.object_id, 9)
+        assert_equal(parts.add(f.payload), k == len(at) - 1)
+    var whole = parts^.take()
+    assert_equal(len(whole), 1000)
+    for i in range(1000):
+        assert_equal(whole[i], UInt8(i % 251))
+
+
+def test_parts_out_of_order_raise() raises:
+    var data = List[UInt8](length=10, fill=7)
+    var out = List[UInt8]()
+    append_parts(out, 1, data, 4)
+    var at = _frames(out)
+    var parts = Parts()
+    var second = parse_body(Span(out)[at[1] + 4 : at[2]])
+    with assert_raises(contains="bad part"):
+        _ = parts.add(second.payload)
 
 
 def test_fork_and_exit_status() raises:

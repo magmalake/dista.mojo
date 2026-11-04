@@ -10,7 +10,13 @@ writability only while something is queued.
 
 from std.ffi import c_int
 
-from dista.frame import Frame, append_frame, frame_length, parse_body
+from dista.frame import (
+    Frame,
+    append_frame,
+    append_parts,
+    frame_length,
+    parse_body,
+)
 from dista.socket import Stream, recv_some, send_some
 
 comptime _READ_CHUNK = 64 * 1024
@@ -103,6 +109,14 @@ struct Conn(Movable):
         why not."""
         self.stream.finish_connect()
         self.connecting = False
+
+    def send_parts(
+        mut self, object_id: UInt64, data: Span[UInt8, _], part: Int
+    ) raises:
+        """Queues object `object_id` as part frames of at most `part` bytes,
+        and sends as much as the socket takes now."""
+        append_parts(self._out, object_id, data, part)
+        self.flush()
 
     def flush(mut self) raises:
         """Sends queued output until the socket would block."""

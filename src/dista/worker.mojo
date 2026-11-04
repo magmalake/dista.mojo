@@ -62,6 +62,7 @@ from dista.frame import (
     KIND_FREE,
     KIND_HELLO,
     KIND_HOLDING,
+    KIND_PART,
     KIND_RESULT,
     KIND_SPAN,
     KIND_STOP,
@@ -73,8 +74,12 @@ from dista.frame import (
     WITH_VALUE,
     MANY,
     ROLE_WORKER,
+    MAX_PAYLOAD,
     Frame,
+    Parts,
     encode_addr,
+    fetch_part,
+    fetch_payload,
 )
 from dista.checkpoint import (
     checkpoint_location,
@@ -321,6 +326,8 @@ struct Worker[
     var _requested: Dict[UInt64, String]
     """Objects being fetched from peers, each with the peer's `ip:port`: if
     that peer goes away, they're lost."""
+    var _parts: Dict[UInt64, Parts]
+    """Objects arriving from peers in parts, so far."""
     var _parked: List[_Parked]
     var _ready: List[_Ready]
     var _ip: Array[UInt8, 4]
@@ -415,6 +422,7 @@ struct Worker[
         self._lost = Dict[UInt64, String]()
         self._requested = Dict[UInt64, String]()
         self._connect_ms = peer_connect_timeout_ms()
+        self._parts = Dict[UInt64, Parts]()
         self._parked = List[_Parked]()
         self._ready = List[_Ready]()
         self._ip = ip.copy()
@@ -471,6 +479,7 @@ struct Worker[
         self._ready.clear()
         self._parked.clear()
         self._requested.clear()
+        self._parts.clear()
         for entry in self._fetched.items():
             _ = self._objects.pop(entry.key, List[UInt8]())
         self._fetched.clear()
@@ -758,7 +767,7 @@ struct Worker[
         self._requested[obj] = key
         var i = self._peer_index.get(key, -1)
         try:
-            self._peers[i].send(KIND_FETCH, obj, 0, List[UInt8]())
+            self._peers[i].send(KIND_FETCH, obj, 0, fetch_payload())
         except:
             # Gone already: the end of this poll drops it.
             self._peers[i].closed = True
@@ -783,6 +792,11 @@ struct Worker[
             )
         for obj in owed:
             _ = self._requested.pop(obj, String())
+            if obj in self._parts:
+                try:
+                    _ = self._parts.pop(obj)  # the parts that came
+                except:
+                    pass
             self._lost[obj] = why
             if self._adopting.pop(obj, False):
                 self._refuse(obj, why)
@@ -794,6 +808,15 @@ struct Worker[
         self._peer_index = index^
 
     def _from_peer(mut self, var f: Frame) raises:
+        if f.kind == KIND_PART:
+            # Parts of a result too large for one frame: whole at the last.
+            var obj = f.object_id
+            if obj not in self._parts:
+                self._parts[obj] = Parts()
+            if not self._parts[obj].add(f.payload):
+                return
+            var whole = self._parts.pop(obj).take()
+            f = Frame(KIND_RESULT, obj, 0, whole^)
         _ = self._requested.pop(f.object_id, String())
         var obj = f.object_id
         var adopting = self._adopting.pop(obj, False)
@@ -871,17 +894,39 @@ struct Worker[
     def _serve_fetch(mut self, i: Int, var f: Frame) raises:
         if f.kind != KIND_FETCH:
             raise Error("expected a fetch, got frame kind ", Int(f.kind))
+        var part = fetch_part(f.payload)
         if f.object_id in self._objects:
-            self._serving[i].send(
-                KIND_RESULT, f.object_id, 0, self._objects[f.object_id]
+            Self._send_object(
+                self._serving[i], f.object_id, self._objects[f.object_id], part
             )
         elif f.object_id in self._files:
             ref loc = self._files[f.object_id]
             var data = read_shared(loc.path, loc.size)
-            self._serving[i].send(KIND_RESULT, f.object_id, 0, data)
+            Self._send_object(self._serving[i], f.object_id, data, part)
         else:
             var msg = String("object ", f.object_id, " is not on this worker")
             self._serving[i].send(KIND_ERROR, f.object_id, 0, msg.as_bytes())
+
+    @staticmethod
+    def _send_object(
+        mut c: Conn, obj: UInt64, data: Span[UInt8, _], part: Int
+    ) raises:
+        """Answers a fetch: one result frame, or parts of at most `part`
+        bytes if it's larger; an empty fetch (`part` 0) takes no parts."""
+        if part > 0 and len(data) > part:
+            c.send_parts(obj, data, part)
+        elif len(data) > MAX_PAYLOAD:
+            var msg = String(
+                "object ",
+                obj,
+                " is ",
+                len(data),
+                " bytes, too large for one frame, and its fetcher doesn't",
+                " take parts",
+            )
+            c.send(KIND_ERROR, obj, 0, msg.as_bytes())
+        else:
+            c.send(KIND_RESULT, obj, 0, data)
 
     def _unpark(mut self):
         if len(self._parked) == 0:

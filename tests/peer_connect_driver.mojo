@@ -40,21 +40,30 @@ def pid_of(s: String) -> String:
 
 def main() raises:
     var rt = Runtime[Make, Use](workers=2, pipeline=1)
-    # Made at once, so both workers make some.
+    # Made four at a time, so both workers make some; again while the second
+    # worker may not have joined yet, on a loaded machine.
     var made = List[ObjectRef[String]]()
-    for i in range(4):
-        made.append(rt.remote[Make](i))
-    var on_a = made[0]
-    var a = pid_of(rt.get(on_a))
-    var where_a = rt.location(on_a)
-    var on_b = made[0]
     var found = False
-    for r in made:
-        if rt.location(r) != where_a:
-            on_b = r
-            found = True
+    var on_a = rt.remote[Make](0)
+    var a = String()
+    var where_a = String()
+    var on_b = on_a
+    for round in range(50):
+        made.clear()
+        for i in range(4):
+            made.append(rt.remote[Make](round * 4 + i))
+        on_a = made[0]
+        where_a = rt.location(on_a)
+        for r in made:
+            if rt.location(r) != where_a:
+                on_b = r
+                found = True
+        if found:
+            break
+        sleep(0.1)
     if not found:
         raise Error("every result landed on one worker")
+    a = pid_of(rt.get(on_a))
     print("HOLDER", a, where_a, flush=True)
     var go = getenv("PEER_CONNECT_GO")
     while not exists(go):

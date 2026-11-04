@@ -129,8 +129,12 @@ Since phase 2's PR 3, scheduling lives in one place: a head process. Every progr
 | 6 task-after | driver to head | gather byte, count u64, then that many object IDs |
 | 7 stored | worker to head | the result's location: it stayed on the worker |
 | 8 located | head to driver | the result's location |
-| 9 fetch | driver or worker to a worker | none: send that object back as a result frame |
+| 9 fetch | driver or worker to a worker | none, or the largest part it takes, u64: send that object back as a result frame, or as part frames if it's larger |
 | 10 task-inputs | head to worker | gather byte, count u64, then per input a tag: 0 with its bytes, or 1 with a location |
+
+Later kinds are listed in `src/dista/frame.mojo`.
+
+**Results past a frame cross hosts in parts.** A frame's length is a u32, and a receiver takes at most `MAX_FRAME` (1 GiB), so a larger result went over a socket as one frame and the receiver refused it; past 4 GiB the length wrapped and garbled the stream ([#93](https://github.com/magmalake/dista.mojo/issues/93)). Now a fetch carries the largest part the fetcher takes (64 MiB), and a worker sends a result larger than that as part frames (kind 33: the object's size, the part's offset, the bytes), which the fetcher appends into one buffer of the object's size. A result up to 64 MiB still travels as one result frame, as before. The change is compatible both ways: an empty fetch, from a fetcher that predates parts, still gets one result frame, or an error saying the object is too large for one, and a fetcher given a result frame by an older worker takes it as before. Writing any frame that doesn't fit raises at the sender, so a task argument past 1 GiB fails at `remote` instead of garbling the head's connection.
 
 An address is 12 bytes: the IPv4 address, then the port as a u64. A worker's hello carries its own. A location is the holding worker's address, its host name, the node-store path ("" if the result is only in memory) and the size, each string length-prefixed.
 
