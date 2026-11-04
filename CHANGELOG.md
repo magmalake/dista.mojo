@@ -15,6 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   poll it at 100% CPU, or die of the reset itself
   ([#89](https://github.com/magmalake/dista.mojo/issues/89)).
   `tests/peer_loss.sh` kills a worker while two others fetch from it.
+- **Connects time out, and a worker's peer connects don't block it.** A
+  worker connects to the peers it fetches from inside its event loop, and
+  keeps running tasks and serving fetches meanwhile. After
+  `DISTA_PEER_CONNECT_TIMEOUT` seconds (new, default 5) it fails the tasks
+  waiting on that peer, as unreachable. Before, a black-holed address
+  stalled the whole worker for the kernel's two minutes. A driver's fetch
+  waits the same time, `dista status` and the other observers wait
+  `DISTA_CONNECT_TIMEOUT`, and each try of `connect_head` waits only for
+  what is left of that budget
+  ([#94](https://github.com/magmalake/dista.mojo/issues/94)).
+  `tests/peer_connect.sh` fills a stopped worker's backlog and fetches from
+  it.
 
 ## [0.2.1] - 2026-11-03
 

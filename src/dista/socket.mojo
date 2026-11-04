@@ -31,6 +31,8 @@ comptime IPPROTO_TCP: c_int = 6
 comptime TCP_NODELAY: c_int = 1
 comptime SOCKADDR_IN_SIZE = 16
 comptime EAGAIN: c_int = c_int(_pm["EAGAIN", linux=11, macos=35]())
+comptime EINPROGRESS: c_int = c_int(_pm["EINPROGRESS", linux=115, macos=36]())
+comptime SO_ERROR: c_int = c_int(_pm["SO_ERROR", linux=4, macos=0x1007]())
 # Every connected socket is non-blocking (O_NONBLOCK), and the calls that
 # should wait, `write_all` and `read_into`, wait in `poll`. MSG_DONTWAIT alone
 # isn't enough: macOS blocks a send with it once the socket's buffer is full,
@@ -235,6 +237,56 @@ def _refuse_self(fd: c_int) raises:
     raise Error("connect: the socket connected to itself")
 
 
+def socket_error(fd: c_int) -> c_int:
+    """The error pending on `fd` (`SO_ERROR`): how a non-blocking connect
+    ended, 0 if it succeeded."""
+    var err = stack_allocation[1, c_int]()
+    err[] = 0
+    var len = stack_allocation[1, c_uint]()
+    len[] = c_uint(4)
+    if (
+        external_call["getsockopt", c_int](
+            fd, SOL_SOCKET, SO_ERROR, err.unsafe_bitcast[NoneType](), len
+        )
+        != 0
+    ):
+        return get_errno().value
+    return err[]
+
+
+def _connect(
+    addr: Array[UInt8, SOCKADDR_IN_SIZE], what: String, timeout_ms: Int
+) raises -> c_int:
+    """Connects a new socket to `addr`, waiting at most `timeout_ms` (-1:
+    as long as the kernel keeps trying, about two minutes on Linux for an
+    address that drops SYNs). The socket is non-blocking first, so the wait
+    is a `poll` that can end."""
+    var fd = _new_socket()
+    _ = set_nonblocking(fd)
+    if (
+        external_call["connect", c_int](
+            fd,
+            addr.unsafe_ptr().unsafe_bitcast[NoneType](),
+            c_uint(SOCKADDR_IN_SIZE),
+        )
+        != 0
+    ):
+        var e = get_errno().value
+        if e != EINPROGRESS and e != EINTR:
+            _ = external_call["close", c_int](fd)
+            raise Error(what, " failed: errno ", e)
+        var rev = poll([fd], [POLLOUT], timeout_ms)
+        if rev[0] == 0:
+            _ = external_call["close", c_int](fd)
+            raise Error(what, " timed out after ", timeout_ms, " ms")
+        var err = socket_error(fd)
+        if err != 0:
+            _ = external_call["close", c_int](fd)
+            raise Error(what, " failed: errno ", err)
+    _refuse_self(fd)
+    return fd
+
+
 struct Stream(Movable):
     """A connected TCP socket. It's non-blocking, but `write_all` and
     `read_into` wait for it, so to its users it blocks; the head's loop uses
@@ -247,46 +299,46 @@ struct Stream(Movable):
         _ = set_nonblocking(fd)
 
     @staticmethod
-    def connect(port: Int) raises -> Stream:
-        """Connects to 127.0.0.1:`port`."""
-        var fd = _new_socket()
-        var addr = _loopback(port)
-        if (
-            external_call["connect", c_int](
-                fd,
-                addr.unsafe_ptr().unsafe_bitcast[NoneType](),
-                c_uint(SOCKADDR_IN_SIZE),
-            )
-            != 0
-        ):
-            _ = external_call["close", c_int](fd)
-            _fail("connect")
-        _refuse_self(fd)
-        return Stream(fd)
+    def connect(port: Int, timeout_ms: Int = -1) raises -> Stream:
+        """Connects to 127.0.0.1:`port`, waiting at most `timeout_ms` (-1:
+        as long as the kernel tries)."""
+        return Stream(_connect(_loopback(port), String("connect"), timeout_ms))
 
     @staticmethod
-    def connect(host: String, port: Int) raises -> Stream:
-        """Connects to `host`:`port`; `host` is a name or a dotted quad."""
-        var fd = _new_socket()
-        var addr = _sockaddr(resolve_ipv4(host), port)
-        if (
-            external_call["connect", c_int](
-                fd,
-                addr.unsafe_ptr().unsafe_bitcast[NoneType](),
-                c_uint(SOCKADDR_IN_SIZE),
+    def connect(host: String, port: Int, timeout_ms: Int = -1) raises -> Stream:
+        """Connects to `host`:`port`; `host` is a name or a dotted quad.
+        Waits at most `timeout_ms` (-1: as long as the kernel tries)."""
+        return Stream(
+            _connect(
+                _sockaddr(resolve_ipv4(host), port),
+                String("connect to ", host, ":", port),
+                timeout_ms,
             )
-            != 0
-        ):
-            _ = external_call["close", c_int](fd)
-            _fail(String("connect to ", host, ":", port))
-        _refuse_self(fd)
-        return Stream(fd)
+        )
 
     @staticmethod
-    def connect(ip: Array[UInt8, 4], port: Int) raises -> Stream:
-        """Connects to `ip`:`port`."""
-        var fd = _new_socket()
+    def connect(
+        ip: Array[UInt8, 4], port: Int, timeout_ms: Int = -1
+    ) raises -> Stream:
+        """Connects to `ip`:`port`, waiting at most `timeout_ms` (-1: as
+        long as the kernel tries)."""
+        return Stream(
+            _connect(
+                _sockaddr(ip, port),
+                String("connect to ", addr_key(ip, port)),
+                timeout_ms,
+            )
+        )
+
+    @staticmethod
+    def start_connect(ip: Array[UInt8, 4], port: Int) raises -> Stream:
+        """Starts connecting to `ip`:`port` and returns at once. The socket
+        is writable once the connect completes or fails; `finish_connect`
+        then says which. An event loop connects this way, so a peer that
+        never answers doesn't stall it."""
         var addr = _sockaddr(ip, port)
+        var fd = _new_socket()
+        _ = set_nonblocking(fd)
         if (
             external_call["connect", c_int](
                 fd,
@@ -295,23 +347,21 @@ struct Stream(Movable):
             )
             != 0
         ):
-            _ = external_call["close", c_int](fd)
-            _fail(
-                String(
-                    "connect to ",
-                    Int(ip[0]),
-                    ".",
-                    Int(ip[1]),
-                    ".",
-                    Int(ip[2]),
-                    ".",
-                    Int(ip[3]),
-                    ":",
-                    port,
+            var e = get_errno().value
+            if e != EINPROGRESS and e != EINTR:
+                _ = external_call["close", c_int](fd)
+                raise Error(
+                    "connect to ", addr_key(ip, port), " failed: errno ", e
                 )
-            )
-        _refuse_self(fd)
         return Stream(fd)
+
+    def finish_connect(mut self) raises:
+        """Raises if the connect `start_connect` began failed. Call it once
+        the socket polls writable (or failed)."""
+        var e = socket_error(self.fd)
+        if e != 0:
+            raise Error("connect failed: errno ", e)
+        _refuse_self(self.fd)
 
     def local_ip(self) raises -> Array[UInt8, 4]:
         """The local IPv4 address this connection goes out from."""
