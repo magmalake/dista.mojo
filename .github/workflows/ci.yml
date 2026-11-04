@@ -11,6 +11,13 @@ on:
     - cron: '0 6 * * *'
   workflow_dispatch:
 
+# A new push to a PR cancels its runs still going: only the latest commit's
+# results matter, and the old run's jobs held runners the org shares. Pushes
+# to main each run to the end (the group is the commit there).
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     name: ${{ matrix.env == 'default' && 'stable' || matrix.env }} / ${{ matrix.os }}
