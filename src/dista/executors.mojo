@@ -31,7 +31,14 @@ from std.ffi import c_int, external_call
 from std.memory.alloc import unsafe_alloc
 from std.os import getenv
 
-from threads import CondVar, Mutex, OpaquePtr, ThreadHandle, num_cpus
+from threads import (
+    CondVar,
+    Mutex,
+    OpaquePtr,
+    StartFn,
+    ThreadHandle,
+    num_cpus,
+)
 
 from dista.client import TaskContext
 from dista.socket import set_nonblocking, wall_ns
@@ -166,8 +173,22 @@ def _spawn[
         raise Error("pthread_attr_init failed")
     _ = external_call["pthread_attr_setstacksize", c_int](at, STACK_BYTES)
     var tid = UInt64(0)
-    var rc = external_call["pthread_create", c_int](
-        Pointer(to=tid), at, start, arg
+    # Declared exactly as the threads tin declares it: two declarations of
+    # one C function with different signatures don't link.
+    var rc = external_call[
+        "pthread_create",
+        c_int,
+        Pointer[UInt64, MutUntrackedOrigin],  # pthread_t *
+        Int,  # const pthread_attr_t *
+        StartFn,
+        OpaquePtr,
+    ](
+        Pointer[UInt64, MutUntrackedOrigin](
+            unsafe_from_address=Int(Pointer(to=tid))
+        ),
+        Int(at),
+        start,
+        arg,
     )
     _ = external_call["pthread_attr_destroy", c_int](at)
     if rc != 0:
