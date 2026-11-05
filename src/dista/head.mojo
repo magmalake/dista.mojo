@@ -396,6 +396,8 @@ in its socket rather than in the head's buffer."""
 
 comptime LOOKAHEAD = 64
 """How far into its queue a free worker looks for a task to take."""
+comptime MAX_SLOTS = 4096
+"""The most slots a worker's hello may claim."""
 
 
 struct Head(Movable):
@@ -414,6 +416,10 @@ struct Head(Movable):
     var _roles: List[UInt8]
     var _inflight: List[List[UInt64]]
     """For a worker, the objects it is computing, oldest first."""
+    var _slots: List[Int]
+    """For a worker, the tasks it runs at once (`DISTA_WORKER_SLOTS`, from
+    its hello; 1 for a worker from before slots). It's sent its slots plus
+    `pipeline - 1` tasks: with one slot, `pipeline`, as before slots."""
     var _driver_conn: Dict[UInt64, Int]
     var _next_driver: UInt64
     """The next driver number to try. It starts at a random place, so a head
@@ -610,6 +616,7 @@ struct Head(Movable):
         self._conns = List[Conn]()
         self._roles = List[UInt8]()
         self._inflight = List[List[UInt64]]()
+        self._slots = List[Int]()
         self._driver_conn = Dict[UInt64, Int]()
         self._epoch = head_epoch()
         self._next_driver = (self._epoch >> 7) % (MAX_DRIVER - 1) + 1
@@ -780,9 +787,11 @@ struct Head(Movable):
     def _page(self) -> String:
         """The head's `/metrics` page."""
         var workers = 0
+        var slots = 0
         for i in range(len(self._roles)):
             if self._roles[i] == ROLE_WORKER:
                 workers += 1
+                slots += self._slots[i]
         var held = 0
         for entry in self._results.items():
             held += len(entry.value)
@@ -906,6 +915,13 @@ struct Head(Movable):
         )
         write_metric(
             out, "gauge", "dista_workers", "Workers connected.", workers
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_slots",
+            "Task slots across the connected workers (DISTA_WORKER_SLOTS).",
+            slots,
         )
         write_metric(
             out,
@@ -1067,6 +1083,8 @@ struct Head(Movable):
                 "  running ",
                 len(self._inflight[i]),
             )
+            if self._slots[i] != 1:
+                out += String("  slots ", self._slots[i])
             if self._hosting[i] != 0:
                 out += String("  actor ", self._hosting[i])
             if self._draining[i] != _DRAIN_NO:
@@ -1273,6 +1291,8 @@ struct Head(Movable):
                 hex(self._hashes[i]),
                 '","running":',
                 len(self._inflight[i]),
+                ',"slots":',
+                self._slots[i],
                 ',"idle_seconds":',
                 self._idle_seconds(i, now),
                 ',"held_bytes":',
@@ -1299,6 +1319,7 @@ struct Head(Movable):
             self._conns[i] = conn^
             self._roles[i] = _ROLE_NONE
             self._inflight[i] = List[UInt64]()
+            self._slots[i] = 1
             self._worker_addr[i] = List[UInt8]()
             self._node[i] = String()
             self._hosting[i] = 0
@@ -1313,6 +1334,7 @@ struct Head(Movable):
         self._book_of.append(-1)
         self._roles.append(_ROLE_NONE)
         self._inflight.append(List[UInt64]())
+        self._slots.append(1)
         self._worker_addr.append(List[UInt8]())
         self._node.append(String())
         self._hosting.append(0)
@@ -2015,10 +2037,21 @@ struct Head(Movable):
             put_scalar[DType.uint64](body, self._epoch)
             self._conns[i].send(KIND_WELCOME, 0, 0, body)
         elif f.payload[0] == ROLE_WORKER:
-            if len(f.payload) != 9 + ADDR_SIZE:
+            if (
+                len(f.payload) != 9 + ADDR_SIZE
+                and len(f.payload) != 17 + ADDR_SIZE
+            ):
                 raise Error("a worker's hello must carry its address")
+            var slots = 1
+            if len(f.payload) == 17 + ADDR_SIZE:
+                # Its slots, after the address; a worker with one sends none.
+                var p = 9 + ADDR_SIZE
+                slots = Int(get_scalar[DType.uint64](f.payload, p))
+                if slots < 1 or slots > MAX_SLOTS:
+                    raise Error("a worker's slots are out of range: ", slots)
             self._roles[i] = ROLE_WORKER
-            self._worker_addr[i] = List[UInt8](f.payload[9:])
+            self._slots[i] = slots
+            self._worker_addr[i] = List[UInt8](f.payload[9 : 9 + ADDR_SIZE])
             self._book_of[i] = len(self._book)
             self._book.append(self._worker_addr[i].copy())
         else:
@@ -3023,9 +3056,23 @@ struct Head(Movable):
                 and self._draining[j] == _DRAIN_NO
                 and self._node[j] == node
                 and len(self._inflight[j]) <= depth
+                and len(self._inflight[j]) < self._capacity(j)
             ):
                 return True
         return False
+
+    def _capacity(self, i: Int) -> Int:
+        """Tasks worker `i` is sent at once: its slots, and `pipeline - 1`
+        more waiting there, so a slot that frees has the next one at hand."""
+        return self._slots[i] + self._pipeline - 1
+
+    def _rounds(self) -> Int:
+        """Dispatch rounds: the largest worker's capacity."""
+        var n = self._pipeline
+        for i in range(len(self._conns)):
+            if self._roles[i] == ROLE_WORKER:
+                n = max(n, self._capacity(i))
+        return n
 
     def _enqueue(mut self, var t: _Task):
         self._queued_bytes += len(t.args)
@@ -3050,13 +3097,15 @@ struct Head(Movable):
         ):
             self._fail_queued()
             return
-        for depth in range(self._pipeline):
+        for depth in range(self._rounds()):
             for i in range(len(self._conns)):
                 if self._roles[i] != ROLE_WORKER or self._hosting[i] != 0:
                     continue
                 if self._draining[i] != _DRAIN_NO:
                     continue
                 if len(self._inflight[i]) != depth:
+                    continue
+                if depth >= self._capacity(i):
                     continue
                 var h = self._hashes[i]
                 if h not in self._queues:
