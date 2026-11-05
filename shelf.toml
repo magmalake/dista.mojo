@@ -1,5 +1,5 @@
 name = "dista-mojo"
-version = "0.2.2"
+version = "0.3.0"
 description = "Distributed tasks and actors for Mojo: mark a function remote, call it, and it runs across a cluster of processes or Kubernetes pods, with results as Arrow, retries, draining, spilling and backpressure"
 tags = ["distributed", "tasks", "actors", "cluster", "kubernetes", "arrow", "magmalake"]
 # other tins this one depends on; omit if none
