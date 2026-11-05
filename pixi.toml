@@ -28,6 +28,8 @@ test-timeline = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_timeli
 test-cancel = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_cancel.mojo -o build/test-cancel && ./build/test-cancel" }
 test-head-drivers = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_head_drivers.mojo -o build/test-head-drivers && ./build/test-head-drivers" }
 test-scale = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_scale.mojo -o build/test-scale && ./build/test-scale" }
+test-executors = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_executors.mojo -o build/test-executors && ./build/test-executors" }
+test-slots = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_slots.mojo -o build/test-slots && ./build/test-slots" }
 test-cluster = { cmd = "tests/cluster.sh" }
 test-restart = { cmd = "tests/head_restart.sh" }
 test-locality = { cmd = "tests/locality.sh" }
@@ -43,9 +45,10 @@ test-kind = { cmd = "tests/kind.sh" }
 # The test binaries built several at once before the tasks that copy them
 # (scripts/build-tests.sh, scripts/mojo-build.sh).
 build-tests = { cmd = "scripts/build-tests.sh" }
-test = { depends-on = ["build-tests", "test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-take", "test-timeline", "test-scale", "test-head-drivers", "test-actors", "test-arity", "test-shuffle", "test-spill", "test-fetch", "test-admission", "test-head-loop", "test-head-queue", "test-cancel", "test-cluster", "test-restart", "test-locality", "test-compile-fail", "test-metrics", "test-drain", "test-peer-loss", "test-peer-connect", "test-autoscale", "test-cli", "test-chaos"] }
+test = { depends-on = ["build-tests", "test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-take", "test-timeline", "test-scale", "test-executors", "test-slots", "test-head-drivers", "test-actors", "test-arity", "test-shuffle", "test-spill", "test-fetch", "test-admission", "test-head-loop", "test-head-queue", "test-cancel", "test-cluster", "test-restart", "test-locality", "test-compile-fail", "test-metrics", "test-drain", "test-peer-loss", "test-peer-connect", "test-autoscale", "test-cli", "test-chaos"] }
 cli = { cmd = "scripts/mojo-build.sh -I src $DEP_INC cli/main.mojo -o build/dista" }
 bench = { cmd = "scripts/mojo-build.sh -I src $DEP_INC bench/fanout.mojo -o build/bench-fanout && ./build/bench-fanout" }
+bench-slots = { cmd = "scripts/mojo-build.sh -I src $DEP_INC bench/slots.mojo -o build/bench-slots && ./build/bench-slots" }
 bench-fetch = { cmd = "scripts/mojo-build.sh -I src $DEP_INC bench/fetch.mojo -o build/bench-fetch && FETCH_MODE=sockets ./build/bench-fetch && FETCH_MODE=store ./build/bench-fetch" }
 
 [package]
@@ -66,6 +69,7 @@ mojo-compiler = "==1.2.0"
 arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "178aae6e0da0dbe105f9cb02632a51cfd35b9dda" }
 memory-region-mojo = { git = "https://github.com/magmalake/memory-region.mojo", rev = "40068c4f95ea659e9b78aa91ced45420b07e3e6e" }
 objectstore-mojo = { git = "https://github.com/magmalake/objectstore.mojo", rev = "ff66975c095f392695facc1b6dd56823dec914bc" }
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "f45e780a8de77278c140cee36904e46e93e0ca1c" }
 
 [package.build-dependencies]
 mojo-compiler = "==1.2.0"
@@ -75,6 +79,7 @@ mojo-compiler = ">=1.2.0,<2"
 arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev = "178aae6e0da0dbe105f9cb02632a51cfd35b9dda" }
 memory-region-mojo = { git = "https://github.com/magmalake/memory-region.mojo", rev = "40068c4f95ea659e9b78aa91ced45420b07e3e6e" }
 objectstore-mojo = { git = "https://github.com/magmalake/objectstore.mojo", rev = "ff66975c095f392695facc1b6dd56823dec914bc" }
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "f45e780a8de77278c140cee36904e46e93e0ca1c" }
 
 # Stable is the default: dista targets Mojo 1.2.0. The nightly environment
 # tracks 1.3.0.dev so breaking changes show up early.
@@ -92,17 +97,21 @@ arrow-mlake-mojo = { git = "https://github.com/magmalake/arrow-mlake.mojo", rev 
 # directory or s3://. Pinned at the revision mojoshelf published
 # (objectstore-mojo 0.4.0), as the data environment's is.
 objectstore-mojo = { git = "https://github.com/magmalake/objectstore.mojo", rev = "ff66975c095f392695facc1b6dd56823dec914bc" }
+# threads runs a worker's tasks on DISTA_WORKER_SLOTS threads. Pinned at the
+# revision mojoshelf published as threads-mojo 0.6.1, as orca and the data
+# tins pin it.
+threads-mojo = { git = "https://github.com/magmalake/threads.mojo", rev = "f45e780a8de77278c140cee36904e46e93e0ca1c" }
 
 # A precompiled package only loads in the compiler that built it, and this one
-# is 1.2.0's, so the nightly compiles memory-region, arrow-mlake and
-# objectstore from checkouts next door instead (CI lays them out). The packages must not be
+# is 1.2.0's, so the nightly compiles memory-region, arrow-mlake, objectstore
+# and threads from checkouts next door instead (CI lays them out). The packages must not be
 # installed there too: an installed package wins over -I. DEP_INC holds the
 # include flags for whichever way the environment gets them.
 [feature.stable.activation.env]
 DEP_INC = "-I src"
 
 [feature.nightly.activation.env]
-DEP_INC = "-I ../memory-region.mojo/src -I ../arrow-mlake.mojo/src -I ../objectstore.mojo/src"
+DEP_INC = "-I ../memory-region.mojo/src -I ../arrow-mlake.mojo/src -I ../objectstore.mojo/src -I ../threads.mojo/src -I ../threads.mojo/compat"
 
 [feature.nightly.dependencies]
 modular = ">=26.8.0.dev2026102305,<28"

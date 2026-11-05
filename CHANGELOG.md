@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`DISTA_WORKER_SLOTS`: a worker runs several tasks at once**
+  ([#120](https://github.com/magmalake/dista.mojo/issues/120)). With N above
+  1 (0 for one per core) a worker runs up to N tasks on threads of its own
+  while its event loop keeps serving fetches, inputs and results; the head
+  sends it N plus `pipeline - 1` tasks. Default 1: no threads, and the same
+  behaviour and hello as before. A dead worker's running tasks all run
+  again, cancel, timeouts and drain hold per task, and an actor's calls
+  still run one at a time. `/metrics` shows `dista_worker_slots`,
+  `dista_worker_tasks_running` and the head's `dista_slots`;
+  `dista status --json` each worker's `slots`. N slots hold N tasks' inputs.
+  dista now depends on threads-mojo (0.6.1).
+
 ## [0.2.2] - 2026-11-04
 
 The merge trains #106 and #109 (#107 large results in part frames, #108

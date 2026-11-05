@@ -11,8 +11,12 @@ workers fetching from it, and the workers it fetches from. A task whose
 inputs live on other workers waits, parked, until they've all arrived; the
 worker keeps serving fetches meanwhile. No worker ever waits on another one
 synchronously, so two workers that need each other's results can't deadlock.
-Running a task does block the loop, so fetches from this worker wait until
-the current task finishes.
+With one slot (`DISTA_WORKER_SLOTS`, default 1) running a task blocks the
+loop, so fetches from this worker wait until the current task finishes. With
+more, tasks run on that many threads (`executors.mojo`) and the loop keeps
+serving; it still builds each task's arguments and stores and reports each
+result itself, so the store and the connections stay on its thread. Actor
+frames always run on the loop, one at a time.
 
 A result here lives until the head says free, once nothing references it.
 Inputs fetched from peers are copies, kept only until the tasks waiting on
@@ -92,6 +96,7 @@ from dista.checkpoint import (
     write_checkpoint,
 )
 from dista.client import TaskContext, peer_connect_timeout_ms
+from dista.executors import DispatchFn, Executors, Job, worker_slots
 from dista.metrics import (
     Histogram,
     answer_scrape,
@@ -138,12 +143,6 @@ comptime SERVE_CHUNK = 256 * 1024
 comptime LINGER_NS: UInt64 = 1_000_000_000
 """How long a drained worker keeps serving fetches after the head says stop:
 a task sent before its inputs moved may still fetch them from here."""
-
-comptime DispatchFn = def(
-    UInt64, List[UInt8], mut List[UInt8], mut TaskContext
-) thin raises
-"""Runs task `task_id` on encoded arguments, appending the encoded result; a
-`CtxTask` gets the worker's `TaskContext`."""
 
 comptime CreateFn = def(UInt64, List[UInt8]) thin raises -> StatePtr
 """Builds actor type `type_id`'s state from its encoded argument."""
@@ -464,6 +463,14 @@ struct Worker[
     var _adopted: Int
     var stopped: Bool
     """The head said stop, or the worker drained: `run` returned for good."""
+    var _slots: Int
+    """`DISTA_WORKER_SLOTS`: tasks run at once. With 1, on the loop's thread,
+    as before slots; with more, on `_pool`'s threads."""
+    var _pool: Optional[Executors[Self.dispatch]]
+    var _epoch: Int
+    """Head connections so far: a task started under an earlier one is
+    dropped when it ends, since that head's gone and its driver resubmits
+    it."""
 
     def __init__(
         out self,
@@ -480,9 +487,13 @@ struct Worker[
         var advertise = getenv("DISTA_ADVERTISE")
         var ip = resolve_ipv4(advertise) if advertise != "" else head.local_ip()
         self._key = addr_key(ip, listener.port)
+        self._slots = worker_slots()
         self._head = Conn(head^)
         self._head.send(
-            KIND_HELLO, 0, 0, Self._hello(registry_hash, ip, listener.port)
+            KIND_HELLO,
+            0,
+            0,
+            Self._hello(registry_hash, ip, listener.port, self._slots),
         )
         self._listener = listener^
         self._serving = List[Conn]()
@@ -534,19 +545,30 @@ struct Worker[
         self._adopting = Dict[UInt64, Bool]()
         self._adopted = 0
         self.stopped = False
+        self._epoch = 0
+        self._pool = None
+        if self._slots > 1:
+            self._pool = Executors[Self.dispatch](
+                self._slots, head_addr, resume_at, registry_hash
+            )
 
     @staticmethod
     def _hello(
-        registry_hash: UInt64, ip: Array[UInt8, 4], port: Int
+        registry_hash: UInt64, ip: Array[UInt8, 4], port: Int, slots: Int
     ) -> List[UInt8]:
         var hello: List[UInt8] = [ROLE_WORKER]
         put_scalar[DType.uint64](hello, registry_hash)
         hello.extend(encode_addr(ip, port))
+        # Its slots, when not 1: a hello without them is a worker's from
+        # before slots, which a head before them requires.
+        if slots != 1:
+            put_scalar[DType.uint64](hello, UInt64(slots))
         return hello^
 
     def rejoin(mut self, var head: Stream, registry_hash: UInt64) raises:
         """Says hello to a new head and reports the results held here."""
         self._head = Conn(head^)
+        self._epoch += 1  # what's running here now is the old head's
         self._end_actor()
         self._ready.clear()
         self._parked.clear()
@@ -556,7 +578,10 @@ struct Worker[
             _ = self._objects.pop(entry.key, List[UInt8]())
         self._fetched.clear()
         self._head.send(
-            KIND_HELLO, 0, 0, Self._hello(registry_hash, self._ip, self._port)
+            KIND_HELLO,
+            0,
+            0,
+            Self._hello(registry_hash, self._ip, self._port, self._slots),
         )
         var body = List[UInt8]()
         put_scalar[DType.uint64](
@@ -583,7 +608,7 @@ struct Worker[
         """Serves until the head hangs up, or until a drain ends."""
         while True:
             var timeout = -1
-            if len(self._ready) > 0:
+            if self._can_start():
                 timeout = 0
             elif self._draining:
                 timeout = 100  # to notice the deadline, or the linger's end
@@ -609,8 +634,11 @@ struct Worker[
                     self.stopped = True
                 return
             self._unpark()
-            if len(self._ready) > 0:
-                self._run_one()
+            if not self._pool:
+                if len(self._ready) > 0:
+                    self._run_one()
+            else:
+                self._start_some()
 
     def _poll_once(mut self, timeout_ms: Int) raises:
         var fds: List[c_int] = [self._head.fd(), self._listener.fd]
@@ -626,6 +654,9 @@ struct Worker[
             events.append(POLLIN)
         if self._wake_fd >= 0:
             fds.append(self._wake_fd)
+            events.append(POLLIN)
+        if self._pool:
+            fds.append(self._pool.value().wake_fd())
             events.append(POLLIN)
         # Handling frames can accept a fetcher or open a peer connection; only
         # the connections that were polled have results.
@@ -685,6 +716,10 @@ struct Worker[
                     # A second SIGTERM: leave now.
                     external_call["_exit", NoneType](c_int(143))
                 self._start_drain()
+        if self._wake_fd >= 0:
+            k += 1
+        if self._pool and rev[k] != 0:
+            self._reap()
         for j in range(len(dead) - 1, -1, -1):
             _ = self._serving.pop(dead[j])
             _ = self._sends.pop(dead[j])
@@ -1273,6 +1308,20 @@ struct Worker[
         write_metric(
             out,
             "gauge",
+            "dista_worker_slots",
+            "Tasks this worker runs at once (DISTA_WORKER_SLOTS).",
+            self._slots,
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_worker_tasks_running",
+            "Tasks running on this worker's slots now.",
+            self._pool.value().running() if self._pool else 0,
+        )
+        write_metric(
+            out,
+            "gauge",
             "dista_worker_hosts_actor",
             "1 while this worker hosts an actor.",
             1 if self._actor != 0 else 0,
@@ -1501,19 +1550,125 @@ struct Worker[
         except:
             self._head.closed = True
 
+    def _prepare(mut self, mut t: _Ready) raises -> Bool:
+        """Builds a task-inputs task's arguments from its inputs; False, with
+        its results failed, if one can't be read."""
+        if not t.inputs:
+            return True
+        var p = t.inputs.take()
+        var parts = max(p.many, 1)
+        try:
+            t.args = self._assemble(p^)
+        except e:
+            for k in range(parts):
+                self._report_error(
+                    t.object_id + UInt64(k), String("input lost: ", e)
+                )
+            return False
+        return True
+
+    def _can_start(self) -> Bool:
+        """Whether the front of `_ready` can start now: with slots, a task
+        waits for a free one."""
+        if len(self._ready) == 0:
+            return False
+        if not self._pool:
+            return True
+        var kind = self._ready[0].kind
+        if kind != KIND_TASK and kind != KIND_TASK_MANY:
+            return True
+        return self._pool.value().free_slot() >= 0
+
+    def _start_some(mut self) raises:
+        """With slots: starts the tasks at the front of `_ready` on the free
+        ones, in order. An actor frame runs here, on the loop, as with one
+        slot, so an actor's calls still run one at a time, in order; then
+        the loop polls again."""
+        while len(self._ready) > 0:
+            var kind = self._ready[0].kind
+            if kind != KIND_TASK and kind != KIND_TASK_MANY:
+                var t = self._ready.pop(0)
+                if self._prepare(t):
+                    self._run_actor(t^)
+                return
+            var slot = self._pool.value().free_slot()
+            if slot < 0:
+                return
+            var t = self._ready.pop(0)
+            if not self._prepare(t):
+                continue
+            if kind == KIND_TASK and t.object_id in self._files:
+                # As in `_run_one`: a resubmitted task whose result is here.
+                self._to_head(
+                    KIND_STORED, t.object_id, self._files[t.object_id].encode()
+                )
+                continue
+            var many = 0
+            var args = t.args^
+            t.args = List[UInt8]()
+            if kind == KIND_TASK_MANY:
+                if len(args) < 8:
+                    self._report_error(t.object_id, "a truncated TaskMany")
+                    continue
+                var pos = 0
+                many = Int(get_scalar[DType.uint64](args, pos))
+                var rest = List[UInt8](args[8:])
+                args = rest^
+            self._pool.value().start(
+                slot,
+                Job(
+                    t.object_id,
+                    t.task_id,
+                    kind,
+                    t.arrived,
+                    args^,
+                    many,
+                    self._epoch,
+                ),
+            )
+
+    def _reap(mut self):
+        """Stores and reports the tasks the slots finished, as `_run_one`
+        and `_run_many` do theirs."""
+        var done = self._pool.value().take_done()
+        while len(done) > 0:
+            var j = done.pop(0)
+            if j.epoch != self._epoch:
+                continue  # the head it was for is gone
+            if j.kind == KIND_TASK_MANY:
+                var parts = List[List[UInt8]]()
+                var why = j.error.copy()
+                if j.ok:
+                    try:
+                        parts = split_parts(j.out)
+                        if len(parts) != j.many:
+                            raise Error(
+                                "the task returned ",
+                                len(parts),
+                                " results, not ",
+                                j.many,
+                            )
+                    except e:
+                        why = String(e)
+                for k in range(j.many - 1, -1, -1):
+                    var obj = j.object_id + UInt64(k)
+                    if why:
+                        self._span(obj, j.arrived, j.started)
+                        self._report_error(obj, why)
+                    else:
+                        self._finish(obj, j.arrived, j.started, parts[k].copy())
+            elif j.ok:
+                var out = List[UInt8]()
+                swap(out, j.out)
+                self._finish(j.object_id, j.arrived, j.started, out^)
+            else:
+                self._span(j.object_id, j.arrived, j.started)
+                self._report_error(j.object_id, j.error)
+
     def _run_one(mut self) raises:
         var t = self._ready.pop(0)
-        if t.inputs:
-            var p = t.inputs.take()
-            var parts = max(p.many, 1)
-            try:
-                t.args = self._assemble(p^)
-            except e:
-                for k in range(parts):
-                    self._report_error(
-                        t.object_id + UInt64(k), String("input lost: ", e)
-                    )
-                return
+        if not self._prepare(t):
+            return
         if t.kind == KIND_TASK_MANY:
             self._run_many(t^)
             return
