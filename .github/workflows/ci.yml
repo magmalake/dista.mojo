@@ -19,6 +19,33 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # A release PR (only versions, CHANGELOG.md, revs and locks change; see
+  # tools/release_only.py in magmalake/.github) skips the nightly leg, kind,
+  # fuzz and the data shards below, and runs a consumer build of the PR head
+  # instead. The verdict is its own fast job because the jobs below wait for
+  # it; the build is the next one.
+  release:
+    if: github.event_name == 'pull_request'
+    uses: magmalake/.github/.github/workflows/release-check.yml@release-check
+    permissions:
+      contents: read
+      pull-requests: read
+    with:
+      classify-only: true
+      tools-ref: "release-check"
+
+  release-check:
+    needs: release
+    if: needs.release.outputs.release_only == 'true'
+    uses: magmalake/.github/.github/workflows/release-check.yml@release-check
+    permissions:
+      contents: read
+      pull-requests: read
+    with:
+      # The unit tests run in the stable jobs below.
+      task: ""
+      tools-ref: "release-check"
+
   # Whether the PR changes anything but prose (*.md, docs/, the licence
   # files), which no test, build or check reads. Pushes, the nightly, runs by
   # hand, and a failure here all count as code.
@@ -42,7 +69,7 @@ jobs:
 
   test:
     name: ${{ matrix.env == 'default' && 'stable' || matrix.env }} / ${{ matrix.os }}
-    needs: changes
+    needs: [changes, release]
     # Runs even if `changes` failed: then everything does.
     if: ${{ !cancelled() }}
     runs-on: ${{ matrix.os }}
@@ -51,7 +78,7 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
-        env: [default, nightly]
+        env: ${{ fromJSON(needs.release.outputs.release_only == 'true' && '["default"]' || '["default", "nightly"]') }}
     defaults:
       run:
         working-directory: dista.mojo
@@ -136,8 +163,8 @@ jobs:
   # lets it share a binary with the standard library's file seek. See the
   # data environment in pixi.toml.
   data:
-    needs: changes
-    if: ${{ !cancelled() && github.event_name != 'schedule' && needs.changes.outputs.code != 'false' }}
+    needs: [changes, release]
+    if: ${{ !cancelled() && github.event_name != 'schedule' && needs.changes.outputs.code != 'false' && needs.release.outputs.release_only != 'true' }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -211,8 +238,8 @@ jobs:
   # The image builds the program with pixi itself, so this job needs only
   # docker, kubectl (both on the runner) and kind.
   kind:
-    needs: changes
-    if: ${{ !cancelled() && github.event_name != 'schedule' && needs.changes.outputs.code != 'false' }}
+    needs: [changes, release]
+    if: ${{ !cancelled() && github.event_name != 'schedule' && needs.changes.outputs.code != 'false' && needs.release.outputs.release_only != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -225,8 +252,8 @@ jobs:
   # Every fuzz harness under fuzz/, for a short session each, with all bounds
   # checks on. Longer sessions are a FUZZ_RUNS away locally.
   fuzz:
-    needs: changes
-    if: ${{ !cancelled() && github.event_name != 'schedule' && needs.changes.outputs.code != 'false' }}
+    needs: [changes, release]
+    if: ${{ !cancelled() && github.event_name != 'schedule' && needs.changes.outputs.code != 'false' && needs.release.outputs.release_only != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -275,15 +302,26 @@ jobs:
   # (macOS runs only on the nightly, which this gate doesn't cover.)
   ci:
     if: ${{ always() && github.event_name != 'schedule' }}
-    needs: [changes, test, data, kind, fuzz, format]
+    needs: [release, release-check, changes, test, data, kind, fuzz, format]
     runs-on: ubuntu-latest
     steps:
       - env:
-          RESULTS: ${{ toJSON(needs.*.result) }}
-          CODE: ${{ needs.changes.outputs.code }}
+          NEEDS: ${{ toJSON(needs) }}
         run: |
-          echo "results: $RESULTS (code: $CODE)"
-          ok='"success"'
-          [ "$CODE" = false ] && ok='"success"|"skipped"'
-          bad=$(printf '%s\n' "$RESULTS" | tr -d '[] \n' | tr ',' '\n' | grep -cvE "^($ok)$" || true)
-          [ "$bad" -eq 0 ] || { echo "$bad job(s) didn't succeed"; exit 1; }
+          python3 - <<'PY'
+          import json, os, sys
+          needs = json.loads(os.environ["NEEDS"])
+          release = needs.pop("release")
+          build = needs.pop("release-check")
+          release_only = release["outputs"].get("release_only") == "true"
+          prose_only = needs["changes"]["outputs"].get("code") == "false"
+          ok = {"success", "skipped"} if release_only or prose_only else {"success"}
+          bad = {k: v["result"] for k, v in needs.items() if v["result"] not in ok}
+          for k, v in (("release", release), ("release-check", build)):
+              if v["result"] not in ("success", "skipped"):
+                  bad[k] = v["result"]
+          print("release-only:", release_only, "prose-only:", prose_only,
+                "results:", {k: v["result"] for k, v in needs.items()})
+          if bad:
+              sys.exit(f"did not succeed: {bad}")
+          PY
