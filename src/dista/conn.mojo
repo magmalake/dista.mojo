@@ -22,9 +22,11 @@ from dista.frame import (
     Frame,
     append_frame,
     append_parts,
+    KIND_AUTH,
     frame_length,
     parse_body,
 )
+from dista.auth import PRE_AUTH_BYTES, cluster_token, token_matches
 from dista.socket import Stream, recv_some, send_some
 
 comptime _READ_CHUNK = 64 * 1024
@@ -56,6 +58,10 @@ struct Conn(Movable):
     """Its length; 0 when no large frame is arriving."""
     var _big_at: Int
     """Where in `_in` it goes: the frames before that come out first."""
+    var gate: String
+    """The cluster token a peer must send first (`dista.auth`); empty for
+    none, and for a connection this process opened."""
+    var authed: Bool
     var _big_kind: UInt8
     var _big_object: UInt64
     var _big_task: UInt64
@@ -77,6 +83,8 @@ struct Conn(Movable):
         self._big_kind = 0
         self._big_object = 0
         self._big_task = 0
+        self.gate = String()
+        self.authed = True
 
     def fd(self) -> c_int:
         return self.stream.fd
@@ -148,6 +156,9 @@ struct Conn(Movable):
             self._scan = pos
             if n - HEADER < BIG_FRAME or len(self._in) - pos < 4 + HEADER:
                 return
+            if not self.authed:
+                # No buffer of its own for a peer not yet known.
+                return
             var f = parse_body(Span(self._in)[pos + 4 : pos + 4 + HEADER])
             self._big_kind = f.kind
             self._big_object = f.object_id
@@ -160,7 +171,52 @@ struct Conn(Movable):
             return
         self._scan = pos
 
+    def send_auth(mut self) raises:
+        """Queues this process's cluster token (`dista.auth`), if it has
+        one, first on a connection it opened."""
+        var t = cluster_token()
+        if t:
+            self.send(KIND_AUTH, 0, 0, t.as_bytes())
+
+    def require_token(mut self, token: String):
+        """An accepted connection: with `token`, it hands out nothing until
+        an `auth` frame carrying it has arrived, and is closed otherwise."""
+        self.gate = token
+        self.authed = token.byte_length() == 0
+
+    def _refuse(mut self):
+        self.closed = True
+        self.why = "refused: no or a wrong cluster token (DISTA_TOKEN)"
+        self._in = List[UInt8]()
+        self._in_pos = 0
+
     def next_frame(mut self) raises -> Optional[Frame]:
+        """The next complete frame, if there is one. With a token to ask
+        for, the first must be `auth` with it; an `auth` frame otherwise is
+        dropped."""
+        while True:
+            if not self.authed and (
+                len(self._in) - self._in_pos > PRE_AUTH_BYTES
+                or self._big_need > 0
+            ):
+                self._refuse()
+                return None
+            var f = self._next_raw()
+            if not f:
+                return None
+            if f.value().kind == KIND_AUTH:
+                if not self.authed:
+                    if not token_matches(Span(f.value().payload), self.gate):
+                        self._refuse()
+                        return None
+                    self.authed = True
+                continue
+            if not self.authed:
+                self._refuse()
+                return None
+            return f^
+
+    def _next_raw(mut self) raises -> Optional[Frame]:
         """The next complete frame, if there is one."""
         if self._big_need > 0:
             if self._in_pos < self._big_at:

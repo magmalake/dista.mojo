@@ -48,6 +48,7 @@ checkpoints stay.
 from std.ffi import c_int, external_call
 from std.os import getenv
 
+from dista.auth import cluster_token
 from dista.codec import get_scalar, put_scalar
 from dista.conn import Conn
 from dista.frame import (
@@ -738,7 +739,9 @@ struct Worker[
             if self._peers[j].closed:
                 self._lose_peer(j)
         if rev[1] & POLLIN:
-            self._serving.append(Conn(self._listener.accept()))
+            var c = Conn(self._listener.accept())
+            c.require_token(cluster_token())
+            self._serving.append(c^)
             self._sends.append(List[_Outgoing]())
 
     @staticmethod
@@ -873,6 +876,7 @@ struct Worker[
             try:
                 var c = Conn(Stream.start_connect(ip, port))
                 c.connecting = True
+                c.send_auth()
                 if self._connect_ms > 0:
                     c.deadline = (
                         wall_ns() + UInt64(self._connect_ms) * 1_000_000

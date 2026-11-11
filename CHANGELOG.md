@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A cluster token** ([#124](https://github.com/magmalake/dista.mojo/issues/124)):
+  with `DISTA_TOKEN` (or `DISTA_TOKEN_FILE`) set, the head and every worker
+  refuse a connection that doesn't open with it. Unset, nothing changes.
+
 ## [0.3.0] - 2026-11-05
 
 ### Added

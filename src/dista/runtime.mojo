@@ -40,6 +40,7 @@ an `ObjectRef` like a task does; `checkpoint` saves its state to
 from std.os import getenv
 from std.time import perf_counter_ns, sleep
 
+from dista.auth import send_auth
 from dista.client import (
     ActorHandle,
     Client,
@@ -141,15 +142,16 @@ struct Runtime[*Ts: TaskLike](Movable):
                 if pid == 0:
                     var code = 0
                     try:
-                        Self._work(
-                            Stream.connect(port), "", String("127.0.0.1:", port)
-                        )
+                        var s = Stream.connect(port)
+                        send_auth(s)
+                        Self._work(s^, "", String("127.0.0.1:", port))
                     except e:
                         print("dista worker:", e)
                         code = 1
                     exit_now(code)
                 pids.append(pid)
             stream = Stream.connect(port)
+            send_auth(stream)
         self._c = Client(stream^, head_addr, Self._registry_hash())
         self._pids = pids^
 

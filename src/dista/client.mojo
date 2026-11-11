@@ -17,6 +17,7 @@ from std.os import getenv
 from std.reflection import reflect_fn
 from std.time import perf_counter_ns, sleep
 
+from dista.auth import send_auth
 from dista.codec import decode, encode, get_scalar, put_scalar
 from dista.frame import (
     message,
@@ -267,6 +268,7 @@ struct Observer(Movable):
         self._head = Stream.connect(
             hp[0], hp[1], timeout_ms=_connect_timeout_s() * 1000
         )
+        send_auth(self._head)
         _ = _hello(self._head, ROLE_OBSERVER, 0)
 
     def _ask(
@@ -447,7 +449,9 @@ def connect_head(addr: String) raises -> Stream:
         # SYNs would otherwise hold one try for the kernel's two minutes.
         var left = max((deadline - Int(perf_counter_ns())) // 1_000_000, 100)
         try:
-            return Stream.connect(hp[0], hp[1], timeout_ms=left)
+            var s = Stream.connect(hp[0], hp[1], timeout_ms=left)
+            send_auth(s)
+            return s^
         except e:
             if Int(perf_counter_ns()) >= deadline:
                 raise e^
@@ -1282,11 +1286,11 @@ struct Client(Movable):
         """Copies a result from the worker holding it, over a socket."""
         var key = addr_key(loc.ip, loc.port)
         if key not in self._fetcher_index:
-            self._fetchers.append(
-                Stream.connect(
-                    loc.ip, loc.port, timeout_ms=peer_connect_timeout_ms()
-                )
+            var s = Stream.connect(
+                loc.ip, loc.port, timeout_ms=peer_connect_timeout_ms()
             )
+            send_auth(s)
+            self._fetchers.append(s^)
             self._fetcher_index[key] = len(self._fetchers) - 1
         var i = self._fetcher_index.get(key, -1)
         write_frame(self._fetchers[i], KIND_FETCH, id, 0, fetch_payload())
