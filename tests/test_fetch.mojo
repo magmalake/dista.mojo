@@ -259,6 +259,17 @@ def test_large_results_over_sockets() raises:
     _ = unsetenv("DISTA_SHM")
 
 
+def test_large_results_over_sockets_with_a_token() raises:
+    """The same with a cluster token (#124): every fetch, a worker's of
+    another's result for a task's inputs and the driver's, opens with it,
+    and every worker's object server asks for it."""
+    _ = setenv("DISTA_SHM", "0")
+    _ = setenv("DISTA_TOKEN", "fetch-token-124")
+    _end_to_end()
+    _ = unsetenv("DISTA_TOKEN")
+    _ = unsetenv("DISTA_SHM")
+
+
 def test_large_results_through_the_node_store() raises:
     _end_to_end()
 
