@@ -1,18 +1,17 @@
 """The driver tests/peer_connect.sh runs: a worker connecting to a peer that
 never answers keeps working meanwhile.
 
-Two workers, one task in flight each. One result stays on worker A, another
-on worker B; the driver prints A's process ID and address as HOLDER and
-waits for the file named in `PEER_CONNECT_GO`. By then the script has
-stopped A and filled its listener's backlog, so a connect to A gets no
-answer, as with a vanished node. Two tasks then take A's result: one goes to
-B, which starts connecting to A. While it waits, the driver reads B's own
-result from B, which must answer at once; and with
-`DISTA_PEER_CONNECT_TIMEOUT` at 2 s, B's task must fail as unreachable soon
-after.
+Two workers, one task in flight each. Worker A advertises 192.0.2.1
+(TEST-NET-1, never routed), so nothing answers a connect to it, as with a
+vanished node or a firewall dropping SYNs (#126). One result stays on A,
+another on B; the driver prints A's address as HOLDER and waits for the
+file named in `PEER_CONNECT_GO`. By then the script has stopped A, so A
+runs no task either. Two tasks then take A's result: one goes to B, which
+starts connecting to A. While it waits, the driver reads B's own result
+from B, which must answer at once; and with `DISTA_PEER_CONNECT_TIMEOUT` at
+2 s, B's task must fail as unreachable soon after.
 """
 
-from std.ffi import c_int, external_call
 from std.os import getenv
 from std.os.path import exists
 from std.time import perf_counter_ns, sleep
@@ -21,9 +20,8 @@ from dista import ObjectRef, Runtime, Task
 
 
 def make(i: Int) -> String:
-    """A result too large to go through the head, ending with this worker's
-    process ID."""
-    return String("x") * 200_000 + String(external_call["getpid", c_int]())
+    """A result too large to go through the head."""
+    return String("x") * 200_000 + String(i)
 
 
 def use(s: String) -> Int:
@@ -34,37 +32,37 @@ comptime Make = Task[Int, String, make]
 comptime Use = Task[String, Int, use]
 
 
-def pid_of(s: String) -> String:
-    return String(s[byte=200_000:])
-
-
 def main() raises:
     var rt = Runtime[Make, Use](workers=2, pipeline=1)
-    # Made four at a time, so both workers make some; again while the second
-    # worker may not have joined yet, on a loaded machine.
+    # Made four at a time, until one result is on A (192.0.2.1) and one on
+    # B; again while the second worker may not have joined yet, on a loaded
+    # machine.
     var made = List[ObjectRef[String]]()
-    var found = False
     var on_a = rt.remote[Make](0)
-    var a = String()
-    var where_a = String()
     var on_b = on_a
+    var where_a = String()
+    var a_found = False
+    var b_found = False
     for round in range(50):
         made.clear()
         for i in range(4):
             made.append(rt.remote[Make](round * 4 + i))
-        on_a = made[0]
-        where_a = rt.location(on_a)
         for r in made:
-            if rt.location(r) != where_a:
+            var place = rt.location(r)
+            if place.startswith("192.0.2.1:"):
+                if not a_found:
+                    on_a = r
+                    where_a = place
+                    a_found = True
+            elif not b_found:
                 on_b = r
-                found = True
-        if found:
+                b_found = True
+        if a_found and b_found:
             break
         sleep(0.1)
-    if not found:
+    if not (a_found and b_found):
         raise Error("every result landed on one worker")
-    a = pid_of(rt.get(on_a))
-    print("HOLDER", a, where_a, flush=True)
+    print("HOLDER", where_a, flush=True)
     var go = getenv("PEER_CONNECT_GO")
     while not exists(go):
         sleep(0.05)
