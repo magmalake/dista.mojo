@@ -44,6 +44,7 @@ Every frame is a 4-byte little-endian length, then that many bytes:
 | 31 adopted | worker to head | 1 and the object's new location, or 0 and why not |
 | 32 cancel | driver to head | none: fail this object's task with "cancelled", and drop it if it hasn't run |
 | 33 part | worker to a driver or worker that fetched | the object's size u64, this part's offset u64, then its bytes; parts come in order, and the object is whole when they reach its size |
+| 34 auth | any process to a head or a worker's object server, first on the connection | the cluster token's bytes (`dista.auth`, only with `DISTA_TOKEN` set) |
 
 A frame holds at most `MAX_FRAME` bytes, so a result larger than that
 crosses hosts in parts. A fetcher says it takes parts by putting the largest
@@ -153,6 +154,8 @@ waiting for inputs never runs; one running finishes, and its result is
 dropped. Either way the object fails with "cancelled"."""
 comptime KIND_PART: UInt8 = 33
 """Worker to a fetcher: one part of an object too large for one frame."""
+comptime KIND_AUTH: UInt8 = 34
+"""The cluster token, first on a connection (`dista.auth`)."""
 comptime GATHER: UInt8 = 1
 """Task-after and task-inputs flag: the inputs gather into a `Seq`."""
 comptime WITH_VALUE: UInt8 = 2

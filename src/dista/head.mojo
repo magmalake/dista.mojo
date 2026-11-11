@@ -101,6 +101,7 @@ from std.ffi import c_int, external_call
 from std.os import getenv
 from std.time import perf_counter_ns
 
+from dista.auth import cluster_token
 from dista.codec import get_scalar, put_scalar
 from dista.conn import Conn
 from dista.frame import (
@@ -1308,7 +1309,9 @@ struct Head(Movable):
         return out^
 
     def _accept(mut self) raises:
-        _ = self._add_conn(Conn(self._listener.accept()))
+        var c = Conn(self._listener.accept())
+        c.require_token(cluster_token())
+        _ = self._add_conn(c^)
 
     def _add_conn(mut self, var conn: Conn) -> Int:
         """A new connection, with an entry in every per-connection list; its

@@ -12,6 +12,7 @@ platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
 [tasks]
 test-codec = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_codec.mojo -o build/test-codec && ./build/test-codec" }
 test-frame = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_frame.mojo -o build/test-frame && ./build/test-frame" }
+test-auth = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_auth.mojo -o build/test-auth && ./build/test-auth" }
 test-runtime = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_runtime.mojo -o build/test-runtime && ./build/test-runtime" }
 test-batches = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_batches.mojo -o build/test-batches && ./build/test-batches" }
 test-free = { cmd = "scripts/mojo-build.sh -I src $DEP_INC tests/test_free.mojo -o build/test-free && ./build/test-free" }
@@ -45,7 +46,7 @@ test-kind = { cmd = "tests/kind.sh" }
 # The test binaries built several at once before the tasks that copy them
 # (scripts/build-tests.sh, scripts/mojo-build.sh).
 build-tests = { cmd = "scripts/build-tests.sh" }
-test = { depends-on = ["build-tests", "test-codec", "test-frame", "test-runtime", "test-batches", "test-free", "test-take", "test-timeline", "test-scale", "test-executors", "test-slots", "test-head-drivers", "test-actors", "test-arity", "test-shuffle", "test-spill", "test-fetch", "test-admission", "test-head-loop", "test-head-queue", "test-cancel", "test-cluster", "test-restart", "test-locality", "test-compile-fail", "test-metrics", "test-drain", "test-peer-loss", "test-peer-connect", "test-autoscale", "test-cli", "test-chaos"] }
+test = { depends-on = ["build-tests", "test-codec", "test-frame", "test-auth", "test-runtime", "test-batches", "test-free", "test-take", "test-timeline", "test-scale", "test-executors", "test-slots", "test-head-drivers", "test-actors", "test-arity", "test-shuffle", "test-spill", "test-fetch", "test-admission", "test-head-loop", "test-head-queue", "test-cancel", "test-cluster", "test-restart", "test-locality", "test-compile-fail", "test-metrics", "test-drain", "test-peer-loss", "test-peer-connect", "test-autoscale", "test-cli", "test-chaos"] }
 cli = { cmd = "scripts/mojo-build.sh -I src $DEP_INC cli/main.mojo -o build/dista" }
 bench = { cmd = "scripts/mojo-build.sh -I src $DEP_INC bench/fanout.mojo -o build/bench-fanout && ./build/bench-fanout" }
 bench-slots = { cmd = "scripts/mojo-build.sh -I src $DEP_INC bench/slots.mojo -o build/bench-slots && ./build/bench-slots" }
