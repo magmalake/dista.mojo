@@ -144,24 +144,27 @@ def test_a_full_socket_doesnt_block_a_send() raises:
 
 
 def test_connect_to_a_silent_address_times_out() raises:
-    """A listener whose backlog is full drops new SYNs, as a vanished node or
-    a firewall does: a connect to it would wait the kernel's two minutes.
-    With a timeout it raises once that passes. A connect that waits for the
-    kernel hangs this test."""
-    var l = Listener(backlog=1)
-    var held = List[Stream]()
-    var timed_out = False
-    var took = 0
-    for _ in range(64):
-        var t0 = perf_counter_ns()
-        try:
-            held.append(Stream.connect(l.port, timeout_ms=200))
-        except e:
-            took = Int(perf_counter_ns() - t0) // 1_000_000
-            assert_true("timed out" in String(e), String(e))
-            timed_out = True
-            break
-    assert_true(timed_out, "the backlog never filled")
+    """Nothing answers a connect to 192.0.2.1 (TEST-NET-1, RFC 5737, never
+    routed), as with a vanished node or a firewall dropping SYNs: it would
+    wait the kernel's two minutes. With a timeout it raises once that
+    passes. A connect that waits for the kernel hangs this test. (A full
+    listen backlog stood in for this until macOS 27, which resets those
+    connects: #126.)"""
+    var t0 = perf_counter_ns()
+    var error = String()
+    try:
+        _ = Stream.connect(String("192.0.2.1"), 9, timeout_ms=200)
+    except e:
+        error = String(e)
+    var took = Int(perf_counter_ns() - t0) // 1_000_000
+    assert_true(
+        "timed out" in error,
+        String(
+            "a connect to 192.0.2.1 should time out, not: '",
+            error,
+            "' (a network without a default route can't run this test)",
+        ),
+    )
     assert_true(took >= 150 and took < 2000, String("took ", took, " ms"))
 
 

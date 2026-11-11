@@ -1,9 +1,11 @@
 #!/bin/bash
 # A connect to a peer that never answers doesn't stall a worker: a head, two
 # workers and tests/peer_connect_driver.mojo, with the node store off
-# (DISTA_SHM=0) so inputs travel over sockets. The worker holding a result is
-# stopped and its listener's backlog filled, so new connects to it get no
-# answer, as with a node that vanished or a firewall dropping SYNs. The other
+# (DISTA_SHM=0) so inputs travel over sockets. One worker advertises
+# 192.0.2.1 (TEST-NET-1, RFC 5737, never routed), so connects to it get no
+# answer, as with a node that vanished or a firewall dropping SYNs; it's
+# stopped once it holds a result. (A full listen backlog stood in for this
+# until macOS 27, which resets those connects: #126.) The other
 # worker, asked to fetch from it, must keep serving meanwhile, and fail the
 # task once DISTA_PEER_CONNECT_TIMEOUT (2 s here) passes, not after the
 # kernel's two minutes.
@@ -27,10 +29,10 @@ for _ in $(seq 100); do
   sleep 0.1
 done
 [ -n "$port" ] || { echo "head never started"; cat "$log-head.log"; exit 1; }
-for w in 1 2; do
-  DISTA_ROLE=worker DISTA_HEAD=localhost:$port ./build/peer-connect-driver > "$log-worker$w.log" 2>&1 &
-  pids+=($!)
-done
+DISTA_ADVERTISE=192.0.2.1 DISTA_ROLE=worker DISTA_HEAD=localhost:$port ./build/peer-connect-driver > "$log-worker1.log" 2>&1 &
+silent=$!; pids+=($silent)
+DISTA_ROLE=worker DISTA_HEAD=localhost:$port ./build/peer-connect-driver > "$log-worker2.log" 2>&1 &
+pids+=($!)
 PEER_CONNECT_GO="$log.go" DISTA_HEAD=localhost:$port ./build/peer-connect-driver > "$log-driver.log" 2>&1 &
 driver=$!; pids+=($driver)
 
@@ -41,26 +43,7 @@ for _ in $(seq 300); do
   sleep 0.1
 done
 [ -n "$holder" ] || { echo "FAIL: the driver never said where its result is"; cat "$log-driver.log"; exit 1; }
-pid=${holder%% *}
-peer_port=${holder##*:}
-kill -STOP "$pid"
-# Connect to the stopped worker until its backlog is full: the kernel then
-# drops further SYNs. The sockets stay open while the test runs.
-python3 -c '
-import socket, sys, time
-port = int(sys.argv[1])
-held = []
-for _ in range(1024):
-    s = socket.socket()
-    s.setblocking(False)
-    s.connect_ex(("127.0.0.1", port))
-    held.append(s)
-print("stuffed", flush=True)
-time.sleep(120)
-' "$peer_port" > "$log-stuff.log" 2>&1 &
-pids+=($!)
-for _ in $(seq 50); do grep -q stuffed "$log-stuff.log" && break; sleep 0.1; done
-sleep 0.5
+kill -STOP "$silent"
 touch "$log.go"
 for _ in $(seq 200); do kill -0 "$driver" 2>/dev/null || break; sleep 0.1; done
 if kill -0 "$driver" 2>/dev/null; then
