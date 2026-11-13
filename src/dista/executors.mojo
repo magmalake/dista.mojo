@@ -41,6 +41,7 @@ from threads import (
 )
 
 from dista.client import TaskContext
+from dista.sizing import AUTO, Sizing
 from dista.socket import set_nonblocking, wall_ns
 
 comptime DispatchFn = def(
@@ -60,12 +61,15 @@ The stack is reserved, not committed: only the pages a task touches cost
 memory."""
 
 
-def worker_slots() raises -> Int:
+def worker_slots(sharing: Int = 1) raises -> Int:
     """`DISTA_WORKER_SLOTS`: tasks a worker runs at once (default 1; 0, one
-    per core)."""
+    per core; `auto`, from the run's grant, shared by `sharing` workers: see
+    `sizing.mojo`)."""
     var text = getenv("DISTA_WORKER_SLOTS", "1")
     if text == "":
         return 1
+    if text == AUTO:
+        return Sizing.from_env(sharing).slots
     var n: Int
     try:
         n = Int(text)

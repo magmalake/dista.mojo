@@ -419,6 +419,21 @@ A worker ran one task at a time: `pipeline` only sent the next one ahead. On AWS
 
 Gates: `tests/test_executors.mojo` (the hand-off alone: concurrency, errors, 2,000 jobs through 3 slots each back once, leaving with a job running), `tests/test_slots.mojo` (local mode: one slot runs one at a time; 8 naps of 0.5 s on 4 slots take about 1 s; CPU-bound tasks speed up; mixed small and stored results across workers stay straight; a worker killed with 4 running has all 4 run again on the other, once each, and the other's 4 once; cancelling 2 of 4 running; SIGTERM with 4 running finishes them, none again, and the worker exits 0; an actor's calls never overlap). The other suites run unchanged with one slot. `bench/slots.mojo` (`pixi run bench-slots`) measures a CPU-bound fan-out.
 
+### Sizing from the grant
+
+A hand-set `DISTA_WORKER_SLOTS` is right for one machine and one task mix, and wrong after a rescale: too high and the worker spills or meets the OOM killer, too low and cores sit idle ([#123](https://github.com/morca-dev/dista/issues/123)). With `DISTA_WORKER_SLOTS=auto` a worker sizes itself from the grant morca gives the run (`sizing.mojo`):
+
+- **Slots** are the grant's CPUs (`MORCA_GRANT_CPUS`), at most its memory over `DISTA_TASK_MEMORY_MB` when a task's size is given, at least 1. A local-mode `Runtime` divides the grant among the workers it forks; a worker started on its own (`DISTA_ROLE=worker`) takes the whole grant. Without a grant, a slot per core and no budget.
+- **A memory budget.** The grant's memory (`MORCA_GRANT_MEMORY_MB`, divided the same way) caps the worker's resident memory: it starts another task only while what's resident, or the running tasks' estimates if more (one just started isn't resident yet), plus one task's estimate fits. One task always may run, so a task larger than the budget runs alone rather than never.
+- **Tasks wait at the head.** The worker tells the head how many tasks it has room for (`KIND_CAPACITY`, between 1 and its slots), whenever that changes; the head sends it that plus `pipeline - 1`, so the rest stay queued where another worker with room takes them, and admission control upstream works as before.
+- **The store** keeps to half the budget when `DISTA_STORE_BYTES` is unset, so results spill only once the grant's memory is in use.
+- **Mixed versions.** Head and workers may differ mid-deploy, and either side drops a peer for a frame kind it doesn't know. So a head says it reads `KIND_CAPACITY` with a `KIND_FREE` of object 0 on each worker's hello, which names no object: a worker from before frees nothing. A worker sends `KIND_CAPACITY` only after that, and again only after a rejoined head says so; under an older head it still holds tasks past its budget, though they wait at the worker.
+- **Visible.** A worker's `/metrics` adds `dista_worker_admit`, `dista_worker_memory_budget_bytes`, `dista_worker_resident_bytes` and `dista_worker_memory_holds_total`; the head's adds `dista_slots_admitted`.
+
+A number in `DISTA_WORKER_SLOTS` works exactly as before. Still to come: raising and lowering the tasks in flight from measured throughput, latency and memory pressure, and learning each task's memory instead of `DISTA_TASK_MEMORY_MB`.
+
+Gates: `tests/test_sizing.mojo` (the sizing's arithmetic; the head sends only what a worker has room for; a worker tells only a head that announced it reads that, a rejoined one included, and a worker with a number of slots takes the announcement as nothing; four naps on a worker over its budget run one at a time, and on one whose grant fits two, two at a time).
+
 ### Autoscaling
 
 A running job's workers grow while tasks wait and shrink once they're idle ([#76](https://github.com/magmalake/dista.mojo/issues/76)). dista still creates nothing ([VISION.md](VISION.md), "Not a cluster manager"): it says how many workers it wants and which ones may go, and whatever owns the machines starts and stops them. Under orca that's the scheduler, which already holds the permissions, the budget and the cleanup; for a long-lived cluster without orca, it's a small loop around `dista status --json` or a HorizontalPodAutoscaler on the head's metrics, as now. orca's first use is its `ec2` runner on on-demand instances, where an idle worker is money, so scaling down matters as much as up.

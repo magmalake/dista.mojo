@@ -59,6 +59,7 @@ from dista.frame import (
     KIND_ACTOR_RESTORE,
     KIND_ADOPT,
     KIND_ADOPTED,
+    KIND_CAPACITY,
     KIND_CHECKPOINT,
     KIND_CHECKPOINTED,
     KIND_DRAIN,
@@ -109,6 +110,7 @@ from dista.head import owner_of
 from memory_region import SharedMapping
 from dista.signals import take_wakes, wake_on_sigterm
 from dista.task import StatePtr, split_parts
+from dista.sizing import CAPACITY_ANNOUNCE, Resident, Sizing, wants_auto
 from dista.store import (
     Location,
     node_name,
@@ -468,6 +470,18 @@ struct Worker[
     """`DISTA_WORKER_SLOTS`: tasks run at once. With 1, on the loop's thread,
     as before slots; with more, on `_pool`'s threads."""
     var _pool: Optional[Executors[Self.dispatch]]
+    var _sizing: Optional[Sizing]
+    """With `DISTA_WORKER_SLOTS=auto`, the slots and memory budget from the
+    run's grant (`sizing.mojo`)."""
+    var _resident: Resident
+    var _head_reads_capacity: Bool
+    """The head announced it reads `KIND_CAPACITY`."""
+    var _admit: Int
+    """The room last told the head; 0 before it's told any."""
+    var _held: Int
+    """Times a task waited here for memory, not for a slot."""
+    var _holding: Bool
+    """A task is waiting for memory now: `_held` counts each wait once."""
     var _epoch: Int
     """Head connections so far: a task started under an earlier one is
     dropped when it ends, since that head's gone and its driver resubmits
@@ -479,16 +493,18 @@ struct Worker[
         registry_hash: UInt64,
         head_addr: String = "",
         resume_at: String = "",
+        sharing: Int = 1,
     ) raises:
         """Starts the object server and says hello to the head on `head`.
 
         `head_addr` is where a task's client connects, and `resume_at` where
-        it reconnects after a head restart ("" in local mode)."""
+        it reconnects after a head restart ("" in local mode). `sharing`
+        workers share the run's grant (`DISTA_WORKER_SLOTS=auto`)."""
         var listener = Listener(0, any_interface=True)
         var advertise = getenv("DISTA_ADVERTISE")
         var ip = resolve_ipv4(advertise) if advertise != "" else head.local_ip()
         self._key = addr_key(ip, listener.port)
-        self._slots = worker_slots()
+        self._slots = worker_slots(sharing)
         self._head = Conn(head^)
         self._head.send(
             KIND_HELLO,
@@ -516,6 +532,17 @@ struct Worker[
         self._files = Dict[UInt64, Location]()
         self._spill = spill_dir()
         self._store_limit = store_limit()
+        self._sizing = None
+        if wants_auto():
+            var sizing = Sizing.from_env(sharing)
+            if getenv("DISTA_STORE_BYTES") == "":
+                self._store_limit = sizing.store_limit()
+            self._sizing = sizing^
+        self._resident = Resident()
+        self._head_reads_capacity = False
+        self._admit = 0
+        self._held = 0
+        self._holding = False
         self._store_used = 0
         self._spilled = 0
         self._token = worker_token()
@@ -570,6 +597,8 @@ struct Worker[
         """Says hello to a new head and reports the results held here."""
         self._head = Conn(head^)
         self._epoch += 1  # what's running here now is the old head's
+        self._head_reads_capacity = False  # until this head says so
+        self._admit = 0
         self._end_actor()
         self._ready.clear()
         self._parked.clear()
@@ -640,6 +669,7 @@ struct Worker[
                     self._run_one()
             else:
                 self._start_some()
+                self._tell_room()
 
     def _poll_once(mut self, timeout_ms: Int) raises:
         var fds: List[c_int] = [self._head.fd(), self._listener.fd]
@@ -721,6 +751,7 @@ struct Worker[
             k += 1
         if self._pool and rev[k] != 0:
             self._reap()
+            self._tell_room()
         for j in range(len(dead) - 1, -1, -1):
             _ = self._serving.pop(dead[j])
             _ = self._sends.pop(dead[j])
@@ -846,6 +877,10 @@ struct Worker[
             var pos = 0
             var loc = Location.decode(f.payload, pos)
             self._adopt(f.object_id, loc)
+        elif f.kind == KIND_FREE and f.object_id == CAPACITY_ANNOUNCE:
+            # Object 0 names nothing: the head reads `KIND_CAPACITY`.
+            self._head_reads_capacity = True
+            self._tell_room()
         elif f.kind == KIND_FREE:
             _ = self._objects.pop(f.object_id, List[UInt8]())
             if f.object_id in self._files:
@@ -1216,7 +1251,7 @@ struct Worker[
                     return True
         return False
 
-    def _page(self) -> String:
+    def _page(mut self) -> String:
         """This worker's `/metrics` page."""
         var held = 0
         for entry in self._files.items():
@@ -1322,6 +1357,41 @@ struct Worker[
             "dista_worker_tasks_running",
             "Tasks running on this worker's slots now.",
             self._pool.value().running() if self._pool else 0,
+        )
+        var budget = self._sizing.value().budget if self._sizing else 0
+        write_metric(
+            out,
+            "gauge",
+            "dista_worker_admit",
+            (
+                "Tasks this worker has memory to run now, out of its slots"
+                " (DISTA_WORKER_SLOTS=auto)."
+            ),
+            self._room(),
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_worker_memory_budget_bytes",
+            (
+                "The resident memory this worker keeps to, from the run's"
+                " grant; 0, none."
+            ),
+            budget,
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_worker_resident_bytes",
+            "This worker's resident memory.",
+            self._resident.now() if self._sizing else 0,
+        )
+        write_metric(
+            out,
+            "counter",
+            "dista_worker_memory_holds_total",
+            "Times a task waited to start for memory, not for a slot.",
+            self._held,
         )
         write_metric(
             out,
@@ -1571,7 +1641,7 @@ struct Worker[
             return False
         return True
 
-    def _can_start(self) -> Bool:
+    def _can_start(mut self) -> Bool:
         """Whether the front of `_ready` can start now: with slots, a task
         waits for a free one."""
         if len(self._ready) == 0:
@@ -1581,7 +1651,42 @@ struct Worker[
         var kind = self._ready[0].kind
         if kind != KIND_TASK and kind != KIND_TASK_MANY:
             return True
-        return self._pool.value().free_slot() >= 0
+        return self._pool.value().free_slot() >= 0 and self._fits()
+
+    def _fits(mut self) -> Bool:
+        """Whether memory has room for one more task to start
+        (`DISTA_WORKER_SLOTS=auto`); without a budget, always."""
+        if not self._sizing or not self._pool:
+            return True
+        var running = self._pool.value().running()
+        var ok = self._sizing.value().fits(running, self._resident.now())
+        if ok:
+            self._holding = False
+        elif not self._holding:
+            self._holding = True
+            self._held += 1
+        return ok
+
+    def _room(mut self) -> Int:
+        """The tasks this worker has room to run now: its slots, or with a
+        budget, what fits it."""
+        if not self._sizing or not self._pool:
+            return self._slots
+        return self._sizing.value().room(
+            self._pool.value().running(), self._resident.now()
+        )
+
+    def _tell_room(mut self):
+        """Tells a head that reads it the worker's room, when it changed."""
+        if not self._sizing or not self._head_reads_capacity:
+            return
+        var n = self._room()
+        if n == self._admit:
+            return
+        self._admit = n
+        var body = List[UInt8]()
+        put_scalar[DType.uint64](body, UInt64(n))
+        self._to_head(KIND_CAPACITY, 0, body)
 
     def _start_some(mut self) raises:
         """With slots: starts the tasks at the front of `_ready` on the free
@@ -1596,7 +1701,8 @@ struct Worker[
                     self._run_actor(t^)
                 return
             var slot = self._pool.value().free_slot()
-            if slot < 0:
+            if slot < 0 or not self._fits():
+                self._tell_room()
                 return
             var t = self._ready.pop(0)
             if not self._prepare(t):
