@@ -114,6 +114,7 @@ from dista.frame import (
     KIND_ADOPT,
     KIND_ADOPTED,
     KIND_CANCEL,
+    KIND_CAPACITY,
     KIND_CHECKPOINT,
     KIND_CHECKPOINTED,
     KIND_CLAIM,
@@ -166,6 +167,7 @@ from dista.metrics import (
     write_metric,
     write_outcomes,
 )
+from dista.sizing import CAPACITY_ANNOUNCE
 from dista.store import Location
 
 comptime DRIVER_SHIFT = 40
@@ -421,6 +423,9 @@ struct Head(Movable):
     """For a worker, the tasks it runs at once (`DISTA_WORKER_SLOTS`, from
     its hello; 1 for a worker from before slots). It's sent its slots plus
     `pipeline - 1` tasks: with one slot, `pipeline`, as before slots."""
+    var _admit: List[Int]
+    """For a worker, the slots it has room to fill now: its slots, unless it
+    said fewer (`KIND_CAPACITY`, from a worker sized by `auto`)."""
     var _driver_conn: Dict[UInt64, Int]
     var _next_driver: UInt64
     """The next driver number to try. It starts at a random place, so a head
@@ -618,6 +623,7 @@ struct Head(Movable):
         self._roles = List[UInt8]()
         self._inflight = List[List[UInt64]]()
         self._slots = List[Int]()
+        self._admit = List[Int]()
         self._driver_conn = Dict[UInt64, Int]()
         self._epoch = head_epoch()
         self._next_driver = (self._epoch >> 7) % (MAX_DRIVER - 1) + 1
@@ -789,10 +795,12 @@ struct Head(Movable):
         """The head's `/metrics` page."""
         var workers = 0
         var slots = 0
+        var admitted = 0
         for i in range(len(self._roles)):
             if self._roles[i] == ROLE_WORKER:
                 workers += 1
                 slots += self._slots[i]
+                admitted += self._admit[i]
         var held = 0
         for entry in self._results.items():
             held += len(entry.value)
@@ -923,6 +931,16 @@ struct Head(Movable):
             "dista_slots",
             "Task slots across the connected workers (DISTA_WORKER_SLOTS).",
             slots,
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_slots_admitted",
+            (
+                "Of those, the slots workers have memory to fill now"
+                " (DISTA_WORKER_SLOTS=auto)."
+            ),
+            admitted,
         )
         write_metric(
             out,
@@ -1323,6 +1341,7 @@ struct Head(Movable):
             self._roles[i] = _ROLE_NONE
             self._inflight[i] = List[UInt64]()
             self._slots[i] = 1
+            self._admit[i] = 1
             self._worker_addr[i] = List[UInt8]()
             self._node[i] = String()
             self._hosting[i] = 0
@@ -1338,6 +1357,7 @@ struct Head(Movable):
         self._roles.append(_ROLE_NONE)
         self._inflight.append(List[UInt64]())
         self._slots.append(1)
+        self._admit.append(1)
         self._worker_addr.append(List[UInt8]())
         self._node.append(String())
         self._hosting.append(0)
@@ -1522,6 +1542,13 @@ struct Head(Movable):
                 return
             if f.kind == KIND_DRAIN:
                 self._start_drain(i)
+                return
+            if f.kind == KIND_CAPACITY:
+                if len(f.payload) != 8:
+                    raise Error("a worker's capacity must be one u64")
+                var pos = 0
+                var n = Int(get_scalar[DType.uint64](f.payload, pos))
+                self._admit[i] = max(min(n, self._slots[i]), 1)
                 return
             if f.kind == KIND_ADOPTED:
                 self._adopted(i, f^)
@@ -2054,6 +2081,10 @@ struct Head(Movable):
                     raise Error("a worker's slots are out of range: ", slots)
             self._roles[i] = ROLE_WORKER
             self._slots[i] = slots
+            self._admit[i] = slots
+            # This head reads `KIND_CAPACITY`: a free of object 0, which
+            # names nothing, so a worker from before ignores it.
+            self._conns[i].send(KIND_FREE, CAPACITY_ANNOUNCE, 0, List[UInt8]())
             self._worker_addr[i] = List[UInt8](f.payload[9 : 9 + ADDR_SIZE])
             self._book_of[i] = len(self._book)
             self._book.append(self._worker_addr[i].copy())
@@ -3065,9 +3096,10 @@ struct Head(Movable):
         return False
 
     def _capacity(self, i: Int) -> Int:
-        """Tasks worker `i` is sent at once: its slots, and `pipeline - 1`
-        more waiting there, so a slot that frees has the next one at hand."""
-        return self._slots[i] + self._pipeline - 1
+        """Tasks worker `i` is sent at once: the slots it has room for, and
+        `pipeline - 1` more waiting there, so a slot that frees has the next
+        one at hand."""
+        return self._admit[i] + self._pipeline - 1
 
     def _rounds(self) -> Int:
         """Dispatch rounds: the largest worker's capacity."""

@@ -156,6 +156,10 @@ comptime KIND_PART: UInt8 = 33
 """Worker to a fetcher: one part of an object too large for one frame."""
 comptime KIND_AUTH: UInt8 = 34
 """The cluster token, first on a connection (`dista.auth`)."""
+comptime KIND_CAPACITY: UInt8 = 35
+"""Worker to head: the tasks it has room to run now, a u64 between 1 and its
+slots (`DISTA_WORKER_SLOTS=auto`, see `sizing.mojo`). Sent only to a head
+that announced it reads it, with a `KIND_FREE` of object 0."""
 comptime GATHER: UInt8 = 1
 """Task-after and task-inputs flag: the inputs gather into a `Seq`."""
 comptime WITH_VALUE: UInt8 = 2

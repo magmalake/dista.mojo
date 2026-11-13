@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`DISTA_WORKER_SLOTS=auto`** ([#123](https://github.com/morca-dev/dista/issues/123)):
+  slots and a memory budget from the run's grant (`MORCA_GRANT_CPUS`,
+  `MORCA_GRANT_MEMORY_MB`); past the budget, tasks wait at the head.
+
 ## [0.4.0] - 2026-11-11
 
 ### Added

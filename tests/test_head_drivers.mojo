@@ -59,6 +59,11 @@ def _worker(mut head: Head, mut peers: List[Stream]) raises -> Int:
     put_scalar[DType.uint64](hello, HASH)
     hello.extend(encode_addr([127, 0, 0, 1], 7000))
     head._handle(i, Frame(KIND_HELLO, 0, 0, hello^))
+    # First, the head says it reads KIND_CAPACITY: a free of object 0.
+    head._conns[i].flush()
+    var f = _frame(peers[len(peers) - 1])
+    assert_equal(f.kind, KIND_FREE)
+    assert_equal(f.object_id, 0)
     return i
 
 

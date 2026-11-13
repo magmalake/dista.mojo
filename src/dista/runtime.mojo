@@ -144,7 +144,12 @@ struct Runtime[*Ts: TaskLike](Movable):
                     try:
                         var s = Stream.connect(port)
                         send_auth(s)
-                        Self._work(s^, "", String("127.0.0.1:", port))
+                        Self._work(
+                            s^,
+                            "",
+                            String("127.0.0.1:", port),
+                            sharing=workers,
+                        )
                     except e:
                         print("dista worker:", e)
                         code = 1
@@ -266,7 +271,10 @@ struct Runtime[*Ts: TaskLike](Movable):
 
     @staticmethod
     def _work(
-        var head: Stream, rejoin_at: String = "", head_addr: String = ""
+        var head: Stream,
+        rejoin_at: String = "",
+        head_addr: String = "",
+        sharing: Int = 1,
     ) raises:
         """A worker: run tasks and serve results until the head hangs up.
 
@@ -282,7 +290,7 @@ struct Runtime[*Ts: TaskLike](Movable):
             Self._destroy,
             Self._save,
             Self._restore,
-        ](head^, Self._registry_hash(), head_addr, rejoin_at)
+        ](head^, Self._registry_hash(), head_addr, rejoin_at, sharing)
         while True:
             w.run()
             if rejoin_at == "" or w.stopped:
