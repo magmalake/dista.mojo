@@ -423,8 +423,6 @@ struct Head(Movable):
     """For a worker, the tasks it runs at once (`DISTA_WORKER_SLOTS`, from
     its hello; 1 for a worker from before slots). It's sent its slots plus
     `pipeline - 1` tasks: with one slot, `pipeline`, as before slots."""
-    var _turn: Int
-    """Dispatch calls so far: where a round's ties start (`_order`)."""
     var _admit: List[Int]
     """For a worker, the slots it has room to fill now: its slots, unless it
     said fewer (`KIND_CAPACITY`, from a worker sized by `auto`)."""
@@ -626,7 +624,6 @@ struct Head(Movable):
         self._inflight = List[List[UInt64]]()
         self._slots = List[Int]()
         self._admit = List[Int]()
-        self._turn = 0
         self._driver_conn = Dict[UInt64, Int]()
         self._epoch = head_epoch()
         self._next_driver = (self._epoch >> 7) % (MAX_DRIVER - 1) + 1
@@ -3107,18 +3104,14 @@ struct Head(Movable):
     def _order(self, depth: Int) -> List[Int]:
         """The workers with `depth` tasks in flight, in the order a round
         offers them tasks: the most room first (`_capacity` less what's in
-        flight), and among equals, starting one further along each call, so
-        ties don't always go to the earliest connection."""
-        var at = List[Int]()
+        flight), and among equals, in connection order, as before."""
+        var order = List[Int]()
         for i in range(len(self._conns)):
             if (
                 self._roles[i] == ROLE_WORKER
                 and len(self._inflight[i]) == depth
             ):
-                at.append(i)
-        var order = List[Int](capacity=len(at))
-        for k in range(len(at)):
-            order.append(at[(self._turn + k) % len(at)])
+                order.append(i)
         # Stable insertion sort by room, most first: workers are few.
         for a in range(1, len(order)):
             var i = order[a]
@@ -3161,7 +3154,6 @@ struct Head(Movable):
         ):
             self._fail_queued()
             return
-        self._turn += 1
         for depth in range(self._rounds()):
             for i in self._order(depth):
                 if self._roles[i] != ROLE_WORKER or self._hosting[i] != 0:

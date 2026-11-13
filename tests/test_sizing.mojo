@@ -359,27 +359,6 @@ def test_a_tie_goes_to_the_worker_with_the_most_room() raises:
     _ = len(ends)
 
 
-def test_ties_rotate_between_dispatches() raises:
-    var head = Head(Listener(0), HASH, 1, False)
-    var ends = List[Conn]()
-    var made = _head_with_workers(head, ends, [1, 1, 1])
-    var driver = made[0]
-    var w = made[1].copy()
-    # Three equal workers, a task per dispatch, each settled before the
-    # next: they don't all go to the first.
-    var took = List[Int](length=3, fill=0)
-    for n in range(1, 7):
-        _submit(head, driver, n)
-        head._dispatch()
-        for k in range(3):
-            if len(head._inflight[w[k]]) > 0:
-                took[k] += 1
-                head._inflight[w[k]].clear()
-    for k in range(3):
-        assert_equal(took[k], 2)
-    _ = len(ends)
-
-
 # A worker with no tasks, to see what it tells its head.
 def _dispatch(
     t: UInt64, a: List[UInt8], mut o: List[UInt8], mut c: TaskContext
