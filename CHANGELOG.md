@@ -9,9 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Adaptive in flight under `DISTA_WORKER_SLOTS=auto`** ([#123](https://github.com/morca-dev/dista/issues/123)):
+  a slow start from one task, back-off on PSI memory pressure, spills or
+  slower tasks, and task sizes learned from tasks run alone.
 - **`DISTA_WORKER_SLOTS=auto`** ([#123](https://github.com/morca-dev/dista/issues/123)):
   slots and a memory budget from the run's grant (`MORCA_GRANT_CPUS`,
   `MORCA_GRANT_MEMORY_MB`); past the budget, tasks wait at the head.
+
+### Changed
+
+- The head breaks dispatch ties by the most room, then by turns.
 
 ## [0.4.0] - 2026-11-11
 
