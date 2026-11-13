@@ -112,8 +112,11 @@ from dista.signals import take_wakes, wake_on_sigterm
 from dista.task import StatePtr, split_parts
 from dista.sizing import (
     CAPACITY_ANNOUNCE,
+    InFlight,
+    Learned,
     Resident,
     Sizing,
+    memory_pressure,
     resident_bytes,
     wants_auto,
 )
@@ -152,6 +155,8 @@ comptime SERVE_CHUNK = 256 * 1024
 comptime LINGER_NS: UInt64 = 1_000_000_000
 """How long a drained worker keeps serving fetches after the head says stop:
 a task sent before its inputs moved may still fetch them from here."""
+comptime SAMPLE_MS = 20
+"""With `auto`, how often the loop samples memory while tasks run."""
 
 comptime CreateFn = def(UInt64, List[UInt8]) thin raises -> StatePtr
 """Builds actor type `type_id`'s state from its encoded argument."""
@@ -486,6 +491,9 @@ struct Worker[
     """The room last told the head; 0 before it's told any."""
     var _held: Int
     """Times a task waited here for memory, not for a slot."""
+    var _inflight: Optional[InFlight]
+    """With `auto` and slots, how many tasks to keep in flight."""
+    var _learned: Learned
     var _holding: Bool
     """A task is waiting for memory now: `_held` counts each wait once."""
     var _epoch: Int
@@ -585,10 +593,14 @@ struct Worker[
             self._pool = Executors[Self.dispatch](
                 self._slots, head_addr, resume_at, registry_hash
             )
+        self._inflight = None
+        self._learned = Learned()
         if self._sizing:
             # The worker's own memory, its executors started: what the
             # budget holds besides its tasks.
             self._sizing.value().base = resident_bytes()
+            if self._pool:
+                self._inflight = InFlight(self._slots)
 
     @staticmethod
     def _hello(
@@ -652,6 +664,12 @@ struct Worker[
                 timeout = 0
             elif self._draining:
                 timeout = 100  # to notice the deadline, or the linger's end
+            if (
+                self._inflight
+                and self._pool.value().running() > 0
+                and (timeout < 0 or timeout > SAMPLE_MS)
+            ):
+                timeout = SAMPLE_MS  # to sample memory as tasks run
             var wait = self._connect_wait_ms()
             if wait >= 0 and (timeout < 0 or wait < timeout):
                 timeout = wait
@@ -679,6 +697,7 @@ struct Worker[
                     self._run_one()
             else:
                 self._start_some()
+                self._adapt()
                 self._tell_room()
 
     def _poll_once(mut self, timeout_ms: Int) raises:
@@ -1396,6 +1415,37 @@ struct Worker[
             "This worker's resident memory.",
             self._resident.now() if self._sizing else 0,
         )
+        var limit = self._slots
+        var changes = 0
+        if self._inflight:
+            limit = self._inflight.value().limit
+            changes = self._inflight.value().changes
+        write_metric(
+            out,
+            "gauge",
+            "dista_worker_inflight_limit",
+            (
+                "Tasks this worker keeps in flight, adapted to throughput and"
+                " memory (DISTA_WORKER_SLOTS=auto)."
+            ),
+            limit,
+        )
+        write_metric(
+            out,
+            "counter",
+            "dista_worker_inflight_changes_total",
+            "Times the tasks kept in flight changed; each is logged.",
+            changes,
+        )
+        write_metric(
+            out,
+            "gauge",
+            "dista_worker_task_memory_estimate_bytes",
+            "The memory a task is taken to need, given or learned.",
+            self._sizing.value().estimate(
+                self._resident.now()
+            ) if self._sizing else 0,
+        )
         write_metric(
             out,
             "counter",
@@ -1669,7 +1719,7 @@ struct Worker[
         if not self._sizing or not self._pool:
             return True
         var running = self._pool.value().running()
-        var ok = self._sizing.value().fits(running, self._resident.now())
+        var ok = running == 0 or running < self._room()
         if ok:
             self._holding = False
         elif not self._holding:
@@ -1682,9 +1732,40 @@ struct Worker[
         budget, what fits it."""
         if not self._sizing or not self._pool:
             return self._slots
-        return self._sizing.value().room(
+        var n = self._sizing.value().room(
             self._pool.value().running(), self._resident.now()
         )
+        if self._inflight:
+            n = min(n, self._inflight.value().limit)
+        return n
+
+    def _adapt(mut self):
+        """Samples memory for the running tasks and, window by window, sets
+        how many tasks to keep in flight (`InFlight`), telling the head when
+        that changes."""
+        if not self._inflight:
+            return
+        var now = wall_ns()
+        var running = self._pool.value().running()
+        var rss = self._resident.now()
+        self._learned.sample(rss)
+        var old = self._inflight.value().limit
+        self._inflight.value().saw(running, now, self._spilled)
+        var fit = self._sizing.value().room(running, rss)
+        var changed = self._inflight.value().cap(fit)
+        if not changed and self._inflight.value().due(now):
+            changed = self._inflight.value().close(
+                now, self._spilled, memory_pressure(), fit
+            )
+        if changed:
+            print(
+                "dista worker: tasks in flight",
+                old,
+                "->",
+                self._inflight.value().limit,
+                "(" + self._inflight.value().why + ")",
+            )
+            self._tell_room()
 
     def _tell_room(mut self):
         """Tells a head that reads it the worker's room, when it changed."""
@@ -1734,6 +1815,10 @@ struct Worker[
                 many = Int(get_scalar[DType.uint64](args, pos))
                 var rest = List[UInt8](args[8:])
                 args = rest^
+            if self._inflight:
+                self._learned.started(
+                    t.object_id, t.task_id, self._resident.now()
+                )
             self._pool.value().start(
                 slot,
                 Job(
@@ -1757,6 +1842,11 @@ struct Worker[
             self._sizing.value().finished()
         while len(done) > 0:
             var j = done.pop(0)
+            if self._inflight:
+                self._learned.finished(j.object_id, resident_bytes())
+                self._sizing.value().learned = self._learned.most()
+                if j.ended > j.started:
+                    self._inflight.value().finished(j.ended - j.started)
             if j.epoch != self._epoch:
                 continue  # the head it was for is gone
             if j.kind == KIND_TASK_MANY:

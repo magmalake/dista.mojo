@@ -3101,6 +3101,28 @@ struct Head(Movable):
         one at hand."""
         return self._admit[i] + self._pipeline - 1
 
+    def _order(self, depth: Int) -> List[Int]:
+        """The workers with `depth` tasks in flight, in the order a round
+        offers them tasks: the most room first (`_capacity` less what's in
+        flight), and among equals, in connection order, as before."""
+        var order = List[Int]()
+        for i in range(len(self._conns)):
+            if (
+                self._roles[i] == ROLE_WORKER
+                and len(self._inflight[i]) == depth
+            ):
+                order.append(i)
+        # Stable insertion sort by room, most first: workers are few.
+        for a in range(1, len(order)):
+            var i = order[a]
+            var room = self._capacity(i) - depth
+            var b = a
+            while b > 0 and self._capacity(order[b - 1]) - depth < room:
+                order[b] = order[b - 1]
+                b -= 1
+            order[b] = i
+        return order^
+
     def _rounds(self) -> Int:
         """Dispatch rounds: the largest worker's capacity."""
         var n = self._pipeline
@@ -3133,7 +3155,7 @@ struct Head(Movable):
             self._fail_queued()
             return
         for depth in range(self._rounds()):
-            for i in range(len(self._conns)):
+            for i in self._order(depth):
                 if self._roles[i] != ROLE_WORKER or self._hosting[i] != 0:
                     continue
                 if self._draining[i] != _DRAIN_NO:
