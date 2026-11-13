@@ -8,11 +8,12 @@ and no budget.
 
   - **Slots**: the grant's CPUs, at most its memory over
     `DISTA_TASK_MEMORY_MB` (what one task may use) when that's set; at least 1.
-  - **Budget**: the grant's memory. With `DISTA_TASK_MEMORY_MB`, the worker
-    runs as many tasks as fit it beside its own memory; without, it starts
-    one more at a time while its resident memory is under it. Past it, none
-    more start; one task always may run, so a task bigger than the budget
-    still runs, alone. The rest wait at
+  - **Budget**: the grant's memory. The worker runs as many tasks as fit it
+    beside its own memory, each taken at `DISTA_TASK_MEMORY_MB`, or at what
+    its footprint shows if more: its resident memory past its own over the
+    most tasks it ran at once. Without a size, the first task runs alone
+    and its footprint sizes the rest. One task always may run, so a task
+    bigger than the budget still runs, alone. The rest wait at
     the head: the worker tells it how many tasks it has room for (its
     *admit*, `KIND_CAPACITY`), and the head sends it no more than that plus
     `pipeline - 1`, so another worker with room takes them.
@@ -76,6 +77,10 @@ struct Sizing(Copyable, Movable):
     """Bytes one task is taken to use; 0, unknown."""
     var base: Int
     """The worker's own resident bytes, before any task ran."""
+    var peak_running: Int
+    """The most tasks the worker has run at once."""
+    var seen: Bool
+    """A task has finished, so the footprint counts."""
 
     @staticmethod
     def of(
@@ -91,7 +96,7 @@ struct Sizing(Copyable, Movable):
         var task = task_memory_mb << 20
         if budget > 0 and task > 0:
             slots = min(slots, budget // task)
-        return Sizing(max(slots, 1), budget, task, 0)
+        return Sizing(max(slots, 1), budget, task, 0, 0, False)
 
     @staticmethod
     def from_env(sharing: Int = 1) raises -> Sizing:
@@ -107,25 +112,35 @@ struct Sizing(Copyable, Movable):
         without one."""
         return self.budget // 2
 
-    def room(self, running: Int, rss: Int) -> Int:
-        """Tasks the worker has room for, `running` of them started, at
-        `rss` bytes resident: its admit, between 1 and `slots`.
+    def started(mut self, running: Int):
+        """A task started, `running` of them now."""
+        self.peak_running = max(self.peak_running, running)
 
-        With a task's size known, as many as fit the budget on top of the
-        worker's own memory (`base`), whatever is resident: an allocator
-        keeps memory a task freed, so what's resident stays near its peak
-        and the next task reuses it. What's resident only stops more tasks
-        once it's past the budget, a task having taken more than its size.
-        Without a size, one more at a time while it's under the budget."""
+    def finished(mut self):
+        """A task finished: the footprint now says what tasks take."""
+        self.seen = True
+
+    def estimate(self, rss: Int) -> Int:
+        """Bytes one task takes: its size, or more if the worker's footprint
+        says so, its resident memory past its own over the most tasks it ran
+        at once; 0 while nothing says. An allocator keeps memory a task freed
+        (`malloc_trim` doesn't return it), so what's resident is the
+        footprint at the peak, which later tasks reuse."""
+        var seen = 0
+        if self.seen and self.peak_running > 0 and rss > self.base:
+            seen = (rss - self.base) // self.peak_running
+        return max(self.task_memory, seen)
+
+    def room(self, running: Int, rss: Int) -> Int:
+        """Tasks the worker has room for at `rss` bytes resident: as many as
+        fit the budget beside its own memory, between 1 and `slots`. Until
+        something says what a task takes, one at a time."""
         if self.budget == 0:
             return self.slots
-        var n: Int
-        if rss > self.budget:
-            n = running
-        elif self.task_memory == 0:
-            n = running + 1
-        else:
-            n = (self.budget - self.base) // self.task_memory
+        var each = self.estimate(rss)
+        if each == 0:
+            return 1
+        var n = (self.budget - self.base) // each
         return max(min(n, self.slots), 1)
 
     def fits(self, running: Int, rss: Int) -> Bool:

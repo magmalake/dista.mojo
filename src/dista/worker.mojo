@@ -1746,11 +1746,15 @@ struct Worker[
                     self._epoch,
                 ),
             )
+            if self._sizing:
+                self._sizing.value().started(self._pool.value().running())
 
     def _reap(mut self):
         """Stores and reports the tasks the slots finished, as `_run_one`
         and `_run_many` do theirs."""
         var done = self._pool.value().take_done()
+        if self._sizing and len(done) > 0:
+            self._sizing.value().finished()
         while len(done) > 0:
             var j = done.pop(0)
             if j.epoch != self._epoch:

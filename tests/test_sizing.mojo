@@ -82,23 +82,30 @@ def test_worker_slots_reads_auto() raises:
 
 def test_the_room_a_budget_leaves() raises:
     # A budget of 1000, 100 of it the worker's own, tasks of 300: three.
-    var s = Sizing(4, 1000, 300, 100)
+    var s = Sizing(4, 1000, 300, 100, 0, False)
     assert_equal(s.room(0, 100), 3)
-    # Memory freed tasks left resident doesn't count against them.
-    assert_equal(s.room(2, 900), 3)
-    assert_true(s.fits(2, 900))
-    assert_false(s.fits(3, 900))
-    # Past the budget, none more; one task always may run.
-    assert_equal(s.room(2, 5000), 2)
-    assert_false(s.fits(2, 5000))
-    assert_true(s.fits(0, 5000))
-    assert_equal(s.room(0, 5000), 1)
-    # No size: one more at a time while memory is under the budget.
-    var open = Sizing(4, 1000, 0, 0)
-    assert_equal(open.room(1, 500), 2)
-    assert_equal(open.room(1, 1001), 1)
+    assert_true(s.fits(2, 100))
+    assert_false(s.fits(3, 100))
+    # Three ran at once and left 1000 resident: 300 each, as said, so
+    # memory they freed and the allocator kept doesn't count against them.
+    s.started(3)
+    s.finished()
+    assert_equal(s.room(0, 1000), 3)
+    # A footprint of 1300 says 400 each: two fit.
+    assert_equal(s.room(2, 1300), 2)
+    assert_false(s.fits(2, 1300))
+    # One task always may run.
+    assert_true(s.fits(0, 1 << 40))
+    assert_equal(s.room(0, 1 << 40), 1)
+    # No size: one at a time until one has finished, then by its footprint.
+    var open = Sizing(4, 1000, 0, 100, 0, False)
+    assert_equal(open.room(0, 100), 1)
+    open.started(1)
+    assert_equal(open.room(1, 400), 1)
+    open.finished()
+    assert_equal(open.room(0, 400), 3)
     # No budget: every slot.
-    assert_equal(Sizing(4, 0, 0, 0).room(1, 1 << 40), 4)
+    assert_equal(Sizing(4, 0, 0, 0, 0, False).room(1, 1 << 40), 4)
 
 
 def test_resident_memory_is_read() raises:
