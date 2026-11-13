@@ -57,8 +57,8 @@ learned estimate may fill."""
 comptime WINDOW_NS: UInt64 = 200_000_000
 """The shortest window the in-flight count is judged over."""
 comptime WINDOW_TASKS = 3
-"""The fewest tasks a window ends with: twice the count in flight, and at
-least this, so the window sees the mix turn over."""
+"""The fewest tasks a window ends with: the count in flight, and at least
+this, so the window sees the mix turn over."""
 comptime GAIN = 1.05
 """Throughput must rise this much for the count to grow again."""
 comptime SLOWER = 1.5
@@ -227,7 +227,7 @@ struct InFlight(Copyable, Movable):
         """Whether the window has run long enough to judge."""
         return (
             self._start != 0
-            and self._done >= max(WINDOW_TASKS, 2 * self.limit)
+            and self._done >= max(WINDOW_TASKS, self.limit)
             and now - self._start >= WINDOW_NS
         )
 
