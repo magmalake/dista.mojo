@@ -81,23 +81,24 @@ def test_worker_slots_reads_auto() raises:
 
 
 def test_the_room_a_budget_leaves() raises:
-    var s = Sizing(4, 1000, 300)
+    # A budget of 1000, 100 of it the worker's own, tasks of 300: three.
+    var s = Sizing(4, 1000, 300, 100)
     assert_equal(s.room(0, 100), 3)
-    # Running tasks count at their estimate until they're resident.
-    assert_equal(s.room(2, 100), 3)
-    assert_true(s.fits(2, 100))
-    assert_false(s.fits(3, 100))
-    # One task may always run, however full memory is.
+    # Memory freed tasks left resident doesn't count against them.
+    assert_equal(s.room(2, 900), 3)
+    assert_true(s.fits(2, 900))
+    assert_false(s.fits(3, 900))
+    # Past the budget, none more; one task always may run.
+    assert_equal(s.room(2, 5000), 2)
+    assert_false(s.fits(2, 5000))
     assert_true(s.fits(0, 5000))
     assert_equal(s.room(0, 5000), 1)
-    # Over the budget with tasks running: no room past them.
-    assert_equal(s.room(2, 5000), 2)
-    # No estimate: one more at a time while memory is under the budget.
-    var open = Sizing(4, 1000, 0)
+    # No size: one more at a time while memory is under the budget.
+    var open = Sizing(4, 1000, 0, 0)
     assert_equal(open.room(1, 500), 2)
-    assert_equal(open.room(1, 1000), 1)
+    assert_equal(open.room(1, 1001), 1)
     # No budget: every slot.
-    assert_equal(Sizing(4, 0, 0).room(1, 1 << 40), 4)
+    assert_equal(Sizing(4, 0, 0, 0).room(1, 1 << 40), 4)
 
 
 def test_resident_memory_is_read() raises:
@@ -300,8 +301,9 @@ def test_a_worker_over_its_budget_runs_one_task_at_a_time() raises:
 
 
 def test_a_worker_runs_what_the_grants_memory_fits() raises:
-    # 8 GB and 4 GB a task: two at a time, though there are four CPUs.
-    _grant(4, 8192)
+    # 8.5 GB, 4 GB a task and the worker's own memory: two at a time,
+    # though there are four CPUs.
+    _grant(4, 8704)
     _ = setenv("DISTA_TASK_MEMORY_MB", "4096")
     var took = _four_naps(Runtime[Nap](workers=1, pipeline=2))
     _unset_all()

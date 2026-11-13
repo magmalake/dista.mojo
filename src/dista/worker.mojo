@@ -110,7 +110,13 @@ from dista.head import owner_of
 from memory_region import SharedMapping
 from dista.signals import take_wakes, wake_on_sigterm
 from dista.task import StatePtr, split_parts
-from dista.sizing import CAPACITY_ANNOUNCE, Resident, Sizing, wants_auto
+from dista.sizing import (
+    CAPACITY_ANNOUNCE,
+    Resident,
+    Sizing,
+    resident_bytes,
+    wants_auto,
+)
 from dista.store import (
     Location,
     node_name,
@@ -579,6 +585,10 @@ struct Worker[
             self._pool = Executors[Self.dispatch](
                 self._slots, head_addr, resume_at, registry_hash
             )
+        if self._sizing:
+            # The worker's own memory, its executors started: what the
+            # budget holds besides its tasks.
+            self._sizing.value().base = resident_bytes()
 
     @staticmethod
     def _hello(
