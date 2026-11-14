@@ -102,7 +102,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: magmalake/arrow-mlake.mojo
-          ref: 178aae6e0da0dbe105f9cb02632a51cfd35b9dda
+          ref: d2fc48903dc4c6d7c0a251a9efb1337e138c8908
           path: arrow-mlake.mojo
       - if: needs.changes.outputs.code != 'false' && (matrix.env == 'nightly')
         uses: actions/checkout@v4
@@ -181,7 +181,7 @@ jobs:
       - uses: actions/checkout@v4
         with: {repository: magmalake/memory-region.mojo, ref: 40068c4f95ea659e9b78aa91ced45420b07e3e6e, path: memory-region.mojo}
       - uses: actions/checkout@v4
-        with: {repository: magmalake/arrow-mlake.mojo, ref: 178aae6e0da0dbe105f9cb02632a51cfd35b9dda, path: arrow-mlake.mojo}
+        with: {repository: magmalake/arrow-mlake.mojo, ref: d2fc48903dc4c6d7c0a251a9efb1337e138c8908, path: arrow-mlake.mojo}
       - uses: actions/checkout@v4
         with: {repository: magmalake/parquet.mojo, ref: 9a596283d3612d1ebeca199f9e48f1c1a7eaab51, path: parquet.mojo}
       - uses: actions/checkout@v4

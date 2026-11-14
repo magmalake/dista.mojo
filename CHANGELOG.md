@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- arrow-mlake-mojo 0.3.0 (was 0.2.1).
+
 ## [0.5.0] - 2026-11-13
 
 ### Added
